@@ -21,6 +21,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   revokes the part's file reasoning; severe findings and
   peer-audit failures still evict, and review gates match only
   passed entries (#35; `openspec/changes/repair-trace-check-pipeline`).
+- The tool guard's path tokenizer now recognizes wildcard- and
+  variable-bearing tokens as patterns. `kb/topics/*.md` previously
+  tokenized to nothing — a silent bypass that let routed batches
+  through the trace check unexamined — `"$bdir/$id.md"` produced a
+  phantom demand for `id.md`, and `.js` matched inside `.json`. A
+  pattern token (glob metacharacters or shell variables) now passes
+  when the verified trace references a satisfying path or the pattern
+  spelling itself, and otherwise blocks naming the pattern with the
+  corrective action; extension matches carry a trailing boundary so
+  `config.json` tokenizes whole. The shared grammar lives in the new
+  `src/path-tokens.ts` leaf module, so the guard and the stripper
+  recognize the same tokens (#36; FR-066).
 
 ## [2.5.0] - 2026-10-30
 

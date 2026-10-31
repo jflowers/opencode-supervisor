@@ -14,7 +14,8 @@ import {
   type AuditConfig,
   type InvokeModel,
 } from '../src/auditor.ts';
-import { verifyToolIntent } from '../src/tool-guard.ts';
+import { extractArgPaths, verifyToolIntent } from '../src/tool-guard.ts';
+import { extractPathTokens, hasPathToken, isPatternToken } from '../src/path-tokens.ts';
 import { DEFAULT_MEMO_LIMITS } from '../src/memo.ts';
 import { silentPluginLogger } from '../src/plugin-log.ts';
 
@@ -385,6 +386,91 @@ test('verifyToolIntent counts a basename match as referenced', () => {
     baseAuditConfig
   );
   assert.equal(argsHaveFullPath.allowed, true);
+});
+
+test('extractArgPaths tokenizes extension matches whole with a trailing boundary (FR-066)', () => {
+  // The #36 phantom-prefix bug: `config.json` used to yield `config.js`.
+  assert.deepEqual(extractArgPaths({ command: 'cat config.json' }), ['config.json']);
+  assert.deepEqual(extractArgPaths({ command: 'prettier src/a.tsx' }), ['src/a.tsx']);
+  // A sentence-final period after a path does not swallow the token.
+  assert.deepEqual(extractArgPaths({ command: 'see src/a.ts.' }), ['src/a.ts']);
+});
+
+test('extractArgPaths recognizes wildcard- and variable-bearing pattern tokens (FR-066)', () => {
+  // The #36 field bypass: this spelling previously tokenized to nothing,
+  // so ~8 routed batches sailed past the trace check unexamined.
+  assert.deepEqual(extractArgPaths({ command: 'cat kb/topics/*.md' }), ['kb/topics/*.md']);
+  // The #36 phantom demand: this spelling previously yielded `id.md`.
+  assert.deepEqual(extractArgPaths({ command: 'cp "$bdir/$id.md" out/' }), ['$bdir/$id.md']);
+  assert.ok(isPatternToken('kb/topics/*.md'));
+  assert.ok(isPatternToken('$bdir/$id.md'));
+  assert.ok(!isPatternToken('src/a.ts'));
+  // The shared grammar sees the same tokens in free text (design D3):
+  // the stripper's survival predicate and the guard's trace check
+  // recognize the same X.
+  assert.deepEqual(extractPathTokens('read the batch at kb/topics/gov-ci.md today'), ['kb/topics/gov-ci.md']);
+  assert.ok(hasPathToken('update kb/topics/gov-ci.md with the result'));
+  assert.ok(!hasPathToken('nothing formal here at all'));
+});
+
+test('verifyToolIntent satisfies a wildcard pattern from a trace reference (FR-066)', () => {
+  const satisfied = verifyToolIntent(
+    { name: 'bash', arguments: { command: 'cat kb/topics/*.md' } },
+    ['Index the batch at kb/topics/gov-ci.md for review.'],
+    baseAuditConfig
+  );
+  assert.equal(satisfied.allowed, true);
+
+  // The pattern spelling itself, reasoned verbatim, also satisfies —
+  // the self-consistency path.
+  const verbatim = verifyToolIntent(
+    { name: 'bash', arguments: { command: 'cp "$bdir/$id.md" out/' } },
+    ['Read each note from $bdir/$id.md into the index.'],
+    baseAuditConfig
+  );
+  assert.equal(verbatim.allowed, true);
+
+  // A concrete path the variable pattern matches satisfies it — the
+  // runtime expansion is unknown, so a structural match is the
+  // auditable evidence (design D5).
+  const expanded = verifyToolIntent(
+    { name: 'bash', arguments: { command: 'cp "$bdir/$id.md" out/' } },
+    ['Read each note from notes/entry.md into the index.'],
+    baseAuditConfig
+  );
+  assert.equal(expanded.allowed, true);
+});
+
+test('verifyToolIntent blocks an unsatisfied pattern naming the pattern itself (FR-066)', () => {
+  const blocked = verifyToolIntent(
+    { name: 'bash', arguments: { command: 'cat kb/topics/*.md' } },
+    ['Edit src/a.ts to export the helper.'],
+    baseAuditConfig
+  );
+  assert.equal(blocked.allowed, false);
+  assert.ok(blocked.reason.includes('file-path trace check'));
+  assert.ok(blocked.reason.includes('pattern'));
+  assert.ok(blocked.reason.includes('kb/topics/*.md'));
+
+  // The reason demands the pattern as spelled, never a phantom
+  // expansion like the literal `id.md`.
+  const phantom = verifyToolIntent(
+    { name: 'bash', arguments: { command: 'cp "$bdir/$id.md" out/' } },
+    ['Edit src/a.ts to export the helper.'],
+    baseAuditConfig
+  );
+  assert.equal(phantom.allowed, false);
+  assert.ok(phantom.reason.includes("'$bdir/$id.md'"));
+  assert.ok(phantom.reason.includes('pattern'));
+});
+
+test('verifyToolIntent still allows pattern tokens on an empty trace (FR-011, FR-066)', () => {
+  const result = verifyToolIntent(
+    { name: 'bash', arguments: { command: 'cat kb/topics/*.md' } },
+    [],
+    baseAuditConfig
+  );
+  assert.equal(result.allowed, true);
 });
 
 // ── Hook layer (task 3.1): entry shape, config precedence, adapter ──
@@ -2028,6 +2114,33 @@ test('tool.execute.before honors disabled guard checks via configuration', async
         filePath: 'src/never-referenced.ts',
         content: 'export const z = 3;',
       })
+    );
+  });
+});
+
+test('tool.execute.before satisfies a wildcard from a trace reference end to end (FR-066)', async () => {
+  await withCleanAuditEnv(async () => {
+    const hooks = await plugin.server(silentPluginInput());
+
+    // The #36 field scenario, end to end: the trace names a concrete
+    // file the batch pattern expands to, so the routed batch proceeds.
+    const sessionID = 'guard-pattern-satisfied';
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'index the batch at kb/topics/gov-ci.md', passed: true });
+    await assert.doesNotReject(() => dispatchToolBefore(hooks, sessionID, 'bash', { command: 'cat kb/topics/*.md' }));
+
+    // Without a satisfying reference the same call blocks, and the
+    // reason names the pattern with its corrective action.
+    const bare = 'guard-pattern-blocked';
+    sessionState.get(bare).verifiedSteps.push({ text: 'edit src/a.ts to export the helper', passed: true });
+    await assert.rejects(
+      () => dispatchToolBefore(hooks, bare, 'bash', { command: 'cat kb/topics/*.md' }),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.ok(message.includes('file-path trace check'), message);
+        assert.ok(message.includes('kb/topics/*.md'), message);
+        assert.ok(message.includes('pattern'), message);
+        return true;
+      }
     );
   });
 });
