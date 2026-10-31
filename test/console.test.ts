@@ -454,7 +454,7 @@ test('request_audit records a passing focus in the verified trace', async () => 
     );
     // FR-037: passed focus joins the verified trace in stripped form.
     assert.equal(result, 'Audit passed — the focus is recorded in the verified trace:\nthe rate = 24 * 15 = 360');
-    assert.deepEqual(sessionState.get('console-audit-pass').verifiedSteps, ['the rate = 24 * 15 = 360']);
+    assert.deepEqual(sessionState.get('console-audit-pass').verifiedSteps, [{ text: 'the rate = 24 * 15 = 360', passed: true }]);
     // The audit ran through one side session, cleaned up after itself.
     assert.equal(calls.create.length, 1);
     assert.equal(calls.delete.length, 1);
@@ -490,7 +490,7 @@ test('request_audit names the assurance level when no auditor model resolved', a
       result,
       'Audit passed on deterministic invariants only (no auditor model configured) — the focus is recorded in the verified trace:\nthe rate = 24 * 15 = 360'
     );
-    assert.deepEqual(sessionState.get('console-audit-invariants').verifiedSteps, ['the rate = 24 * 15 = 360']);
+    assert.deepEqual(sessionState.get('console-audit-invariants').verifiedSteps, [{ text: 'the rate = 24 * 15 = 360', passed: true }]);
   });
 });
 
@@ -523,7 +523,7 @@ test('request_audit names the assurance level when the audit infrastructure fail
       result,
       'Audit infrastructure failed open — the focus is recorded as passed without LLM review:\nthe rate = 24 * 15 = 360'
     );
-    assert.deepEqual(sessionState.get('console-audit-fail-open').verifiedSteps, ['the rate = 24 * 15 = 360']);
+    assert.deepEqual(sessionState.get('console-audit-fail-open').verifiedSteps, [{ text: 'the rate = 24 * 15 = 360', passed: true }]);
   });
 });
 

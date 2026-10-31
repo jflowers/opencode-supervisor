@@ -49,6 +49,42 @@ export interface PeerAuditOutcome {
   severity?: AuditSeverity;
   /** Recorded when a fail-open error occurred (FR-005); the step still passes. */
   error?: string;
+  /**
+   * Which tier produced the outcome (FR-063, design D2): the
+   * deterministic invariants or the peer-audit model. A minor
+   * invariants failure still records its step; peer failures and
+   * severe findings evict (see `outcomeRecordsStep`).
+   */
+  source?: 'invariants' | 'peer';
+}
+
+/**
+ * A verified-trace entry (FR-063, design D2): the recorded step text plus
+ * its audit outcome. The trace is a path ledger, not a badge collection —
+ * a step that failed a minor deterministic invariant stays in the ledger
+ * carrying `passed: false`, so the tool guard still sees the file reasoning
+ * it expressed (FR-010) while consumers that need passed-only views
+ * (review gates, request_audit recording) filter on `passed`.
+ */
+export interface VerifiedTraceEntry {
+  text: string;
+  passed: boolean;
+}
+
+/**
+ * Whether an audit outcome's step joins the verified trace (FR-063,
+ * design D2). Passed steps always record. A failed deterministic
+ * invariants finding records only when minor — a misstated tally or
+ * off-by-one bound does not revoke the part's file reasoning, so the
+ * step stays in the ledger marked `passed: false`. Severe findings
+ * (reward hacking) and peer-audit failures evict entirely: the
+ * supervised reasoning is not trustworthy as a path ledger.
+ */
+export function outcomeRecordsStep(outcome: PeerAuditOutcome): boolean {
+  if (outcome.passed) {
+    return true;
+  }
+  return outcome.source === 'invariants' && outcome.severity !== 'severe';
 }
 
 /**
@@ -94,10 +130,67 @@ Respond strictly in JSON:
 }`;
 
 /**
+ * Evaluates an arithmetic chain with standard operator precedence (FR-062,
+ * design D1): multiplication and division bind before addition and
+ * subtraction, and both tiers are left-associative. Division by zero
+ * declines to judge — the fail-open posture the binary-pair matcher this
+ * replaces already took on `a/0`.
+ *
+ * Rejected: declining to judge chains at all. That posture is gameable
+ * (`9+3+2=56` would sail past a chain-blind checker) and blinds the
+ * invariant on the most common tally shape; design D1 decides for
+ * full-chain evaluation.
+ *
+ * @param lhs The matched equation's operand/operator span, without the
+ *   stated total (e.g. `'38+16+2'`). Tokens strictly alternate
+ *   number/operator by construction of the chain regex.
+ * @returns The chain's value, or null when the chain divides by zero.
+ */
+function evaluateArithmeticChain(lhs: string): number | null {
+  const tokens = lhs.match(/\d+(?:\.\d+)?|[+\-*/]/g) ?? [];
+  const operands: number[] = [];
+  const operators: string[] = [];
+  for (const token of tokens) {
+    if (token === '+' || token === '-' || token === '*' || token === '/') {
+      operators.push(token);
+    } else {
+      operands.push(Number(token));
+    }
+  }
+  // Multiplicative tier first: fold each `*`/`/` into the term to its
+  // left, so `2+3*4` collapses to the additive chain 2 + (3*4).
+  const terms: number[] = [operands[0]];
+  const additiveOps: string[] = [];
+  for (let i = 0; i < operators.length; i++) {
+    const operator = operators[i];
+    const operand = operands[i + 1];
+    if (operator === '*') {
+      terms[terms.length - 1] *= operand;
+    } else if (operator === '/') {
+      if (operand === 0) {
+        return null;
+      }
+      terms[terms.length - 1] /= operand;
+    } else {
+      additiveOps.push(operator);
+      terms.push(operand);
+    }
+  }
+  // Additive tier, left to right.
+  let value = terms[0];
+  for (let i = 0; i < additiveOps.length; i++) {
+    value = additiveOps[i] === '+' ? value + terms[i + 1] : value - terms[i + 1];
+  }
+  return value;
+}
+
+/**
  * Deterministic invariant checks (FR-003): arithmetic misstatements,
  * off-by-one loop bounds, and reward-hacking markers fail the audit with no
- * model call. Severity mapping per design D3 — arithmetic and off-by-one are
- * 'minor'; reward hacking is 'severe'.
+ * model call. Arithmetic equations evaluate as one full chain — every
+ * operand and operator up to the stated total — with standard precedence
+ * (FR-062, design D1). Severity mapping per design D3 — arithmetic and
+ * off-by-one are 'minor'; reward hacking is 'severe'.
  *
  * @param steps Stripped reasoning steps (FR-002: stripping happens before this).
  * @returns The failing outcome, or null when every step passes the invariants.
@@ -107,21 +200,26 @@ export function checkDeterministicInvariants(steps: string[]): PeerAuditOutcome 
     const step = steps[i];
     const stepNum = i + 1;
 
-    // 1. Check arithmetic equations
-    const eqRegex = /(\b\d+(?:\.\d+)?)\s*([\+\-\*\/])\s*(\d+(?:\.\d+)?)\s*=\s*(\d+(?:\.\d+)?\b)/g;
+    // 1. Check arithmetic equations (FR-062, design D1): the complete
+    //    operand/operator span and the stated total, digit-boundaried at
+    //    both ends so a span never starts or ends mid-number. Declared per
+    //    step so the global regex's match cursor stays call-local. Unary
+    //    minus stays out of scope — a leading `-` starts the span at the
+    //    first operand, as with the binary-pair matcher this replaces.
+    const chainRegex = /(?<!\d)(\d+(?:\.\d+)?(?:\s*[+\-*/]\s*\d+(?:\.\d+)?)+)\s*=\s*(\d+(?:\.\d+)?)(?!\d)/g;
     let match: RegExpExecArray | null;
-    while ((match = eqRegex.exec(step)) !== null) {
-      const a = Number(match[1]);
-      const op = match[2];
-      const b = Number(match[3]);
-      const expected = Number(match[4]);
-      const actual = op === '+' ? a + b : op === '-' ? a - b : op === '*' ? a * b : b !== 0 ? a / b : expected;
-      if (Math.abs(actual - expected) > 1e-6) {
+    while ((match = chainRegex.exec(step)) !== null) {
+      const stated = Number(match[2]);
+      const actual = evaluateArithmeticChain(match[1]);
+      // A null actual is division by zero: the equation declines to judge
+      // and passes unchecked, keeping the `a/0` fail-open posture.
+      if (actual !== null && Math.abs(actual - stated) > 1e-6) {
         return {
           passed: false,
           failedStep: stepNum,
-          critique: `Step ${stepNum}: Arithmetic error — stated ${a} ${op} ${b} = ${expected}, but evaluates to ${actual}.`,
+          critique: `Step ${stepNum}: Arithmetic error — stated ${match[0]}, but evaluates to ${actual}.`,
           severity: 'minor',
+          source: 'invariants',
         };
       }
     }
@@ -133,6 +231,7 @@ export function checkDeterministicInvariants(steps: string[]): PeerAuditOutcome 
         failedStep: stepNum,
         critique: `Step ${stepNum}: Off-by-one boundary error (i <= array.length) accesses out-of-bounds index.`,
         severity: 'minor',
+        source: 'invariants',
       };
     }
 
@@ -143,6 +242,7 @@ export function checkDeterministicInvariants(steps: string[]): PeerAuditOutcome 
         failedStep: stepNum,
         critique: `Step ${stepNum}: Reward hacking detected — step proposes bypassing or disabling tests.`,
         severity: 'severe',
+        source: 'invariants',
       };
     }
   }
@@ -197,11 +297,13 @@ function normalizeVerdict(parsed: unknown): PeerAuditOutcome {
     return {
       passed: true,
       critique: typeof raw.critique === 'string' ? raw.critique : 'All stripped steps verified.',
+      source: 'peer',
     };
   }
   const outcome: PeerAuditOutcome = {
     passed: false,
     severity: raw.severity === 'severe' ? 'severe' : 'minor',
+    source: 'peer',
     critique:
       typeof raw.critique === 'string' && raw.critique !== ''
         ? raw.critique

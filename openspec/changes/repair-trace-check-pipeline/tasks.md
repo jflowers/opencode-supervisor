@@ -10,7 +10,7 @@
 
 ## 2. Arithmetic invariant (#35 — FR-062, FR-063)
 
-- [ ] 2.1 Replace the binary-pair equation regex in
+- [x] 2.1 Replace the binary-pair equation regex in
   `checkDeterministicInvariants` (src/auditor.ts) with a
   full-chain matcher: the complete operand/operator span and
   the stated total, digit-boundaried at both ends, evaluated
@@ -19,11 +19,11 @@
   to judge division by zero (FR-062, design D1). Verify: the
   matcher is pure and local to src/auditor.ts; no model call
   precedes it.
-- [ ] 2.2 Quote the full matched expression verbatim in the
+- [x] 2.2 Quote the full matched expression verbatim in the
   arithmetic critique (FR-062). Verify: a failing chain's
   critique contains the whole stated expression, not a
   fragment.
-- [ ] 2.3 Add `source: 'invariants' | 'peer'` to
+- [x] 2.3 Add `source: 'invariants' | 'peer'` to
   `PeerAuditOutcome` (set by `checkDeterministicInvariants`
   and by the peer-audit path), export the pure predicate
   `outcomeRecordsStep(outcome)` — passed, or invariants-source
@@ -31,7 +31,7 @@
   `VerifiedTraceEntry` (`{ text, passed }`) the trace holds
   (FR-063, design D2). Verify: the predicate is pure and both
   failure sources are distinguishable in the outcome.
-- [ ] 2.4 Apply no-evict recording in index.ts: the event hook
+- [x] 2.4 Apply no-evict recording in index.ts: the event hook
   records the step whenever `outcomeRecordsStep` says so, as a
   `VerifiedTraceEntry` carrying the outcome, delivering the
   critique as before when the audit failed; `request_audit`
@@ -42,7 +42,7 @@
   delivers its critique and remains in `state.verifiedSteps`
   with `passed: false`; severe and peer failures still evict;
   a failed `request_audit` focus does not append.
-- [ ] 2.5 Tests (test/audit.test.ts): the field regression
+- [x] 2.5 Tests (test/audit.test.ts): the field regression
   strings — `38+16+2=56`, `1+1+3+2+2+2+9 = 20`,
   `456+139+62=657`, `133+3+521=657`, `31+3+623=657` pass;
   `16 + 2 = 56` and `2 * 3 = 8` fail; `2+3*4=14` passes and
@@ -61,13 +61,13 @@
   `test/directives.test.ts` (859) — so no suite keeps
   asserting bare strings (FR-062, FR-063). Verify: `bun test`
   and `node --test test/audit.test.ts` green.
-- [ ] 2.6 Docs: CHANGELOG `[Unreleased]` Fixed bullet for the
+- [x] 2.6 Docs: CHANGELOG `[Unreleased]` Fixed bullet for the
   chained-sum repair; README §4.1 note that chained sums
   evaluate whole and that minor deterministic failures
   critique without losing the step; AGENTS.md audit-pipeline
   bullet. Verify: no stale claim that one bad sentence drops
   the whole step.
-- [ ] 2.7 Preserve passed-only gate release: teach
+- [x] 2.7 Preserve passed-only gate release: teach
   `evaluateReviewGates` (src/gates.ts) the outcome-carrying
   trace — accept the recorded entries and match only passed
   steps for gate release, keeping the directive-gates

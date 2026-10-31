@@ -415,7 +415,7 @@ test('a failed derived lookup is retried on the next resolution (FR-058)', async
       assert.ok(
         harness.logEntries.some((entry) => entry.level === 'warn' && entry.message.includes('host model lookup failed'))
       );
-      assert.deepEqual(sessionState.get('config-retry-session').verifiedSteps, ['the rate = 24 * 15 = 360']);
+      assert.deepEqual(sessionState.get('config-retry-session').verifiedSteps, [{ text: 'the rate = 24 * 15 = 360', passed: true }]);
 
       // Second resolution: the retry succeeds and the audit runs.
       await dispatchPart(hooks, completedReasoningPart({ sessionID: 'config-retry-session', id: 'part-r2', messageID: 'msg-2' }));

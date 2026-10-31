@@ -32,11 +32,13 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { tool, type Hooks, type PluginInput, type PluginModule, type PluginOptions } from '@opencode-ai/plugin';
 import {
+  outcomeRecordsStep,
   resolveAuditorConfig,
   runPeerAudit,
   type AuditConfig,
   type AuditSeverity,
   type InvokeModel,
+  type VerifiedTraceEntry,
 } from './src/auditor.ts';
 import { stripNarrative } from './src/stripper.ts';
 import { checkProtectedState, verifyToolIntent, type ToolVerificationResult } from './src/tool-guard.ts';
@@ -326,8 +328,14 @@ export function resolveHookConfig(
 export interface SessionState {
   /** Session goal — the first user message (FR-013; captured by `chat.message`). */
   goal: string | undefined;
-  /** Reasoning steps that passed audit — the verified trace (FR-006; recorded in 3.2). */
-  verifiedSteps: string[];
+  /**
+   * Verified trace (FR-006, FR-063): recorded step text plus its audit
+   * outcome. Passed steps join (recorded in 3.2); a step that failed a
+   * minor deterministic invariant stays too, marked `passed: false` —
+   * the trace is a path ledger (FR-010), and a misstated tally does not
+   * revoke the part's file reasoning.
+   */
+  verifiedSteps: VerifiedTraceEntry[];
   /** Steer critiques delivered this session, bounded by maxRegenerations (FR-007). */
   critiqueCount: number;
   /** Bounded solved-items log (FR-014; appended by `tool.execute.after`). */
@@ -1455,21 +1463,25 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         // present, and the engineer directives (FR-031) add violation
         // criteria whenever configured.
         const outcome = await runPeerAudit([stepText], config, invokeModel, state.goal, directivesAdvisory ?? undefined);
-        if (outcome.passed) {
-          // FR-006: only passed steps enter the verified trace, in
-          // stripped form (FR-002) — the tool guard matches file paths
-          // against exactly this text. Fail-open outcomes pass (FR-005),
-          // so a degraded auditor never fences the session's tools.
-          state.verifiedSteps.push(stepText);
+        // FR-006/FR-063: the step joins the verified trace whenever the
+        // outcome records — passed steps and minor deterministic-invariant
+        // failures alike (the latter marked `passed: false`, since the
+        // trace is a path ledger and a misstated tally does not revoke the
+        // part's file reasoning). Severe findings and peer failures evict
+        // (`outcomeRecordsStep`); fail-open outcomes pass (FR-005), so a
+        // degraded auditor never fences the session's tools.
+        if (outcomeRecordsStep(outcome)) {
+          state.verifiedSteps.push({ text: stepText, passed: outcome.passed });
           if (outcome.error !== undefined) {
             logger.warn(`peer audit failed open; step recorded as passed: ${outcome.error}`);
           }
-        } else {
-          // Task 3.3 — critique delivery (FR-007/FR-008; spike 1.2). The
-          // failed step stays out of the verified trace (FR-006) while
-          // the auditor's critique steers the supervised session. An
-          // absent severity defaults to minor (design D3, fail-open
-          // conservatism: the bounded steer, never the interrupt).
+        }
+        if (!outcome.passed) {
+          // Task 3.3 — critique delivery (FR-007/FR-008; spike 1.2). A
+          // minor invariants failure that stayed in the trace still gets
+          // its steering critique. An absent severity defaults to minor
+          // (design D3, fail-open conservatism: the bounded steer, never
+          // the interrupt).
           await deliverCritique({
             sessionID: part.sessionID,
             critique: outcome.critique,
@@ -1559,7 +1571,11 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         }
         verification = verifyToolIntent(
           { name: hookInput.tool, arguments: output.args },
-          state.verifiedSteps,
+          // FR-010 path ledger: the guard matches against recorded step
+          // text. Entries map to text here — a minor-failed entry keeps
+          // its file reasoning visible to the guard (FR-063) — keeping
+          // verifyToolIntent's pure-module signature on plain strings.
+          state.verifiedSteps.map((entry) => entry.text),
           await buildConfig(),
           enforcement
         );
@@ -1907,7 +1923,11 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
             if (outcome.passed) {
               // Passed focus joins the verified trace in stripped form —
               // the same trust class as passed reasoning steps (FR-037).
-              state.verifiedSteps.push(stripped);
+              // Failed focuses never join: unlike the event hook's
+              // no-evict recording (FR-063), a solicited audit's failure
+              // means the agent's claim itself did not verify, so there
+              // is no file reasoning to ledger.
+              state.verifiedSteps.push({ text: stripped, passed: true });
               // Review round 5: surface the assurance level so a passed
               // on-demand audit never overclaims LLM review.
               if (outcome.error !== undefined) {
