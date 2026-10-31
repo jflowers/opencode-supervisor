@@ -85,7 +85,7 @@
 
 ## 3. Path tokenizer (#36 — FR-066)
 
-- [ ] 3.1 Create `src/path-tokens.ts` as a pure leaf module
+- [x] 3.1 Create `src/path-tokens.ts` as a pure leaf module
   owning the shared grammar: the token pattern (path characters
   plus `*`, `?`, `[`, `$`, with a trailing boundary so an
   extension match ends at a non-path character),
@@ -93,10 +93,10 @@
   (design D3). Verify: the module imports nothing;
   `config.json` tokenizes whole (no `.js` prefix token);
   `kb/topics/*.md` yields one pattern token.
-- [ ] 3.2 Rebase `extractArgPaths` (src/tool-guard.ts) on the
+- [x] 3.2 Rebase `extractArgPaths` (src/tool-guard.ts) on the
   shared grammar (FR-066). Verify: existing tool-guard tests
   stay green; extraction of non-pattern tokens is unchanged.
-- [ ] 3.3 Teach `findUnreferencedPath` pattern semantics:
+- [x] 3.3 Teach `findUnreferencedPath` pattern semantics:
   translate `$name` spans to within-segment wildcards, compile
   pattern tokens with `globSegmentToRegExp`, and satisfy a
   pattern when the trace contains it verbatim or any
@@ -104,7 +104,7 @@
   tokens keep full-path/basename matching (FR-066, design
   D4/D5). Verify: block reasons name patterns, never phantom
   tokens like `id.md`.
-- [ ] 3.4 Tests (test/audit.test.ts): `kb/topics/*.md` passes
+- [x] 3.4 Tests (test/audit.test.ts): `kb/topics/*.md` passes
   with a `kb/topics/gov-ci.md` trace reference and blocks
   naming the pattern without one; `"$bdir/$id.md"` never
   demands `id.md` and passes on a verbatim pattern mention;
@@ -112,7 +112,7 @@
   empty-trace allow and the FR-010 concrete positive block are
   unchanged (FR-066). Verify: `bun test` and
   `node --test test/audit.test.ts` green.
-- [ ] 3.5 Docs: CHANGELOG Fixed bullet for the tokenizer;
+- [x] 3.5 Docs: CHANGELOG Fixed bullet for the tokenizer;
   README §4.2 pattern-token behavior; AGENTS.md tool-guard
   bullet and the Project Structure tree entry for
   `src/path-tokens.ts`. Verify: README no longer implies

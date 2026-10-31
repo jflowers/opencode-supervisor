@@ -169,7 +169,14 @@ touches on the supervisor's engineer-authored state (the approvals
 file, the supervisor config files, the directives directory, and the
 whole `.opencode/supervisor` directory — FR-061) are blocked. A
 block throws, so the model receives the reason as a tool
-error it can act on. `approve` gates hold matching calls for engineer
+error it can act on. Path tokens carry pattern semantics: a
+wildcard- or variable-bearing argument (`kb/topics/*.md`,
+`"$bdir/$id.md"`) is a pattern whose runtime expansion is unknown —
+it passes when the verified trace references a satisfying path or
+the pattern spelling itself, and otherwise blocks naming the
+pattern (never a phantom expansion like `id.md`); extension matches
+carry a trailing boundary, so `config.json` tokenizes whole.
+`approve` gates hold matching calls for engineer
 approval; `review` gates hold calls until a passed peer audit
 references the path (Section 6). An empty trace or rule set never
 blocks, and agent-console tools are exempt so `request_audit` stays

@@ -14,6 +14,7 @@
 
 import { evaluateEnforcement, extractPolicyPaths, type CompiledEnforcement } from './directives.ts';
 import type { AuditConfig } from './auditor.ts';
+import { extractPathTokens, isPatternToken } from './path-tokens.ts';
 
 export interface ToolVerificationResult {
   allowed: boolean;
@@ -48,31 +49,57 @@ function matchRewardHackingMarker(rawArgs: string, lowerArgs: string): string | 
   return null;
 }
 
-/** File-path token in tool arguments (FR-010): path characters ending in a known source/config extension. */
-const FILE_PATH_PATTERN = /[a-zA-Z0-9_.\-\/]+\.(?:ts|tsx|js|json|py|md|sql|sh)/g;
-
 /**
- * Extracts every file-path token from the tool arguments (FR-010):
- * top-level string values scanned for path characters ending in a
- * known source/config extension. Feeds the trace check.
- * Engineer-directive enforcement and triggers (FR-028, FR-029) use
- * the broader `extractPolicyPaths` instead — this extension
- * allowlist cannot see `.env` or extensionless paths.
+ * Extracts every file-path token from the tool arguments (FR-010,
+ * FR-066): top-level string values scanned with the shared path-token
+ * grammar — which since FR-066 recognizes wildcard- and
+ * variable-bearing spans as pattern tokens, tokenizes `config.json`
+ * whole (no `.js` prefix), and produces no phantom `id.md` from
+ * `"$bdir/$id.md"`. Feeds the trace check. Engineer-directive
+ * enforcement and triggers (FR-028, FR-029) use the broader
+ * `extractPolicyPaths` instead — this extension allowlist cannot see
+ * `.env` or extensionless paths.
  */
 export function extractArgPaths(args: Record<string, unknown> | undefined): string[] {
   return Object.values(args || {})
     .filter((v): v is string => typeof v === 'string')
-    .flatMap((v) => v.match(FILE_PATH_PATTERN) || []);
+    .flatMap((v) => extractPathTokens(v));
 }
 
 /**
+ * Compiles a pattern token into an anchored full-path regular
+ * expression (FR-066, design D4/D5): `$name` spans translate to a
+ * within-segment wildcard first — the runtime value is unknown, and
+ * the token must never demand the phantom literal it spells — then
+ * each segment compiles through `globSegmentToRegExp` and the
+ * segments join on literal slashes. Cross-segment `**` for variables
+ * was rejected (any `.md` mention would satisfy any `$var/*.md`
+ * call, dissolving the filename-level check).
+ */
+const globPathToRegExp = (token: string): RegExp => {
+  const devaried = token.replace(/\$[a-zA-Z0-9_]+/g, '*');
+  const segments = devaried
+    .split('/')
+    .map((segment) => globSegmentToRegExp(segment).source.replace(/^\^/, '').replace(/\$$/, ''));
+  return new RegExp(`^${segments.join('\\/')}$`);
+};
+
+/**
  * Finds the first file path in the tool arguments that is absent from the
- * verified trace (FR-010). A path counts as referenced when the trace
- * contains either the full token or its basename, case-insensitively.
+ * verified trace (FR-010, FR-066). A concrete token counts as referenced
+ * when the trace contains either the full token or its basename,
+ * case-insensitively. A pattern token (glob metacharacters or `$var`
+ * spans — its runtime expansion is unknown) counts as referenced when
+ * the trace contains the pattern verbatim (the model reasoned in the
+ * same spelling) or names a path the compiled pattern matches; the
+ * trace side extracts tokens with the same grammar (design D3), so
+ * "reason about X" and "the guard checks X" recognize the same X.
  *
  * @param args The tool call's arguments; only top-level string values carry paths.
  * @param verifiedSteps The session's verified reasoning trace (non-empty).
- * @returns The unmatched path for the block reason (FR-012), or null when every path is referenced.
+ * @returns The unmatched token — a pattern names itself, never a phantom
+ *   expansion like `id.md` — for the block reason (FR-012), or null when
+ *   every token is referenced.
  */
 function findUnreferencedPath(
   args: Record<string, unknown> | undefined,
@@ -80,8 +107,25 @@ function findUnreferencedPath(
 ): string | null {
   const combinedSteps = verifiedSteps.join(' ').toLowerCase();
   const argPaths = extractArgPaths(args);
+  // Trace-side tokens, extracted lazily: only pattern satisfaction
+  // needs them, and most calls carry none.
+  let traceTokens: string[] | null = null;
 
   for (const fileToken of argPaths) {
+    if (isPatternToken(fileToken)) {
+      const lowered = fileToken.toLowerCase();
+      if (combinedSteps.includes(lowered)) {
+        continue;
+      }
+      traceTokens ??= verifiedSteps
+        .flatMap((step) => extractPathTokens(step))
+        .map((token) => token.toLowerCase());
+      const pattern = globPathToRegExp(lowered);
+      if (traceTokens.some((token) => pattern.test(token))) {
+        continue;
+      }
+      return fileToken;
+    }
     const base = fileToken.split('/').pop()?.toLowerCase() || fileToken.toLowerCase();
     if (!combinedSteps.includes(base) && !combinedSteps.includes(fileToken.toLowerCase())) {
       return fileToken;
@@ -155,9 +199,16 @@ export function verifyToolIntent(
 
     const unmatchedPath = findUnreferencedPath(toolCall.arguments, verifiedSteps);
     if (unmatchedPath) {
+      // FR-012 / FR-066: the reason names the token as it was spelled.
+      // A pattern token names itself — never a phantom expansion like
+      // `id.md` — and points at the corrective action: reason about the
+      // files it expands to, or name them concretely.
+      const reason = isPatternToken(unmatchedPath)
+        ? `Tool '${toolCall.name}' blocked by the file-path trace check: pattern '${unmatchedPath}' is not satisfied by the verified reasoning trace. Reason about the files the pattern expands to, or name them concretely, in verified steps, then retry.`
+        : `Tool '${toolCall.name}' blocked by the file-path trace check: '${unmatchedPath}' is absent from the verified reasoning trace (no full-path or basename match). Reason about the file in verified steps, then retry.`;
       return {
         allowed: false,
-        reason: `Tool '${toolCall.name}' blocked by the file-path trace check: '${unmatchedPath}' is absent from the verified reasoning trace (no full-path or basename match). Reason about the file in verified steps, then retry.`,
+        reason,
       };
     }
   }
