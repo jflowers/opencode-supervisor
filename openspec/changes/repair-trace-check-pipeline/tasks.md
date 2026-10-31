@@ -152,7 +152,7 @@ FR-065)
 
 ## 5. Audit coordination and stripper (#34 — FR-067, FR-068)
 
-- [ ] 5.1 Track in-flight audits: `SessionState` gains
+- [x] 5.1 Track in-flight audits: `SessionState` gains
   `pendingAudits` (a Set of promises resolving only after the
   trace mutation), registered and deregistered by the event
   hook's audit continuation, plus the per-session
@@ -161,7 +161,7 @@ FR-065)
   `clearAll` cover both fields, the counter starting at
   zero; a registered promise settles only after
   `verifiedSteps` is updated.
-- [ ] 5.2 Implement await-on-miss in `tool.execute.before`:
+- [x] 5.2 Implement await-on-miss in `tool.execute.before`:
   first give `ToolVerificationResult` a structured
   `blockedCheck?: 'reward-hacking' | 'directives' | 'trace'`
   cause, set on every blocked return, so block attribution
@@ -186,13 +186,13 @@ FR-065)
   imposes no wait; a rejected continuation never escapes
   the hook; `maxTimeoutFailOpens` resolves from project and
   global config files.
-- [ ] 5.3 [P] Stripper survival: add `hasPathToken(step)` to
+- [x] 5.3 [P] Stripper survival: add `hasPathToken(step)` to
   the `code_and_math` and `balanced` survival disjunctions in
   src/stripper.ts; `strict` unchanged; narrative-prefix
   removal still applies (FR-068, design D9). Verify: prose
   mentioning `notes.md` survives in `code_and_math` and
   `balanced` and drops in `strict`.
-- [ ] 5.4 Tests (test/audit.test.ts): the delayed-audit race —
+- [x] 5.4 Tests (test/audit.test.ts): the delayed-audit race —
   a reasoning part naming path P with a slow audit and a
   same-turn tool call on P passes once the audit lands within
   the bound, with no first-attempt block; a rejected audit
@@ -207,7 +207,7 @@ FR-065)
   scenario — block, prose re-statement, audit pass, retried
   call passes (FR-067, FR-068). Verify: `bun test` and
   `node --test test/audit.test.ts` green.
-- [ ] 5.5 Docs: CHANGELOG Fixed bullets for the race and the
+- [x] 5.5 Docs: CHANGELOG Fixed bullets for the race and the
   stripper; README §4.1 (audit-to-guard coordination), §4.2
   (bounded wait), §4.4 hook-map rows (the `event` row
   describes outcome-carrying verified-trace entries; the

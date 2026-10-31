@@ -23,15 +23,22 @@
 const TOKEN_CHARS = 'a-zA-Z0-9_.*?$\\[\\]\\/-';
 
 /**
- * File-path token (FR-010/FR-066): a path-character run ending in a
- * known source/config extension, digit- and pattern-bounded on both
- * ends. Declared per call site (module-level `g` regexes share a
- * match cursor across calls).
+ * File-path token source (FR-010/FR-066): a path-character run ending
+ * in a known source/config extension, digit- and pattern-bounded on
+ * both ends. Compiled per call site, never held module-level with the
+ * `g` flag — a shared global regex carries `lastIndex` across calls
+ * (`matchAll` copies it into its iterator; `.test` advances it), so
+ * one consumer's match silently shifts every later consumer's start
+ * offset. FR-068's stripper consumer (`hasPathToken`) exposed exactly
+ * that hazard: a step stripped in the event hook left the cursor
+ * mid-pattern and the next guard `extractPathTokens` call skipped the
+ * leading tokens it was built to see. The extension allowlist is
+ * unchanged from the round-1 grammar; its boundary is a
+ * requirement-scope decision already documented in the
+ * spec-accuracy learning, and widening it is not part of these
+ * repairs.
  */
-const PATH_TOKEN_PATTERN = new RegExp(
-  `[${TOKEN_CHARS}]+\\.(?:ts|tsx|js|json|py|md|sql|sh)(?![a-zA-Z0-9_*?$\\[\\]\\/-])`,
-  'g'
-);
+const PATH_TOKEN_SOURCE = `[${TOKEN_CHARS}]+\\.(?:ts|tsx|js|json|py|md|sql|sh)(?![a-zA-Z0-9_*?$\\[\\]\\/-])`;
 
 /** Glob metacharacters and the shell-variable marker (FR-066, design D4/D5). */
 const PATTERN_CHARS = /[*?$\[]/;
@@ -46,7 +53,10 @@ const PATTERN_CHARS = /[*?$\[]/;
  */
 export function extractPathTokens(text: string): string[] {
   const tokens: string[] = [];
-  for (const match of text.matchAll(PATH_TOKEN_PATTERN)) {
+  // Fresh `g` instance per call: the iterator starts at offset 0 no
+  // matter what any earlier consumer left behind (see the source
+  // constant's comment on the shared-cursor hazard).
+  for (const match of text.matchAll(new RegExp(PATH_TOKEN_SOURCE, 'g'))) {
     if (!tokens.includes(match[0])) {
       tokens.push(match[0]);
     }
@@ -63,8 +73,10 @@ export function extractPathTokens(text: string): string[] {
  * @param text The reasoning step text.
  */
 export function hasPathToken(text: string): boolean {
-  PATH_TOKEN_PATTERN.lastIndex = 0;
-  return PATH_TOKEN_PATTERN.test(text);
+  // Non-global instance: `.test` cannot advance a cursor it does not
+  // share, so the stripper's survival probe leaves no state behind
+  // for the guard's extractors.
+  return new RegExp(PATH_TOKEN_SOURCE).test(text);
 }
 
 /**

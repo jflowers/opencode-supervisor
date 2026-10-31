@@ -16,10 +16,20 @@ import { evaluateEnforcement, extractPolicyPaths, type CompiledEnforcement } fro
 import type { AuditConfig } from './auditor.ts';
 import { extractPathTokens, isPatternToken } from './path-tokens.ts';
 
+/** Structured block cause (FR-067, design D8): which check blocked the call. */
+export type BlockedCheck = 'reward-hacking' | 'directives' | 'trace';
+
 export interface ToolVerificationResult {
   allowed: boolean;
   /** Corrective signal surfaced to the model on block (FR-012); informational when allowed. */
   reason: string;
+  /**
+   * Which check blocked the call (FR-067, design D8): set on every
+   * blocked return, so block attribution is structured — never
+   * prose-matched against free-form reasons (the `PeerAuditOutcome.source`
+   * idiom). Absent when allowed.
+   */
+  blockedCheck?: BlockedCheck;
 }
 
 /**
@@ -202,6 +212,7 @@ export function verifyToolIntent(
       return {
         allowed: false,
         reason: `Tool '${toolCall.name}' blocked by the reward-hacking check: arguments contain '${marker}'. Fix the underlying defect instead of weakening or bypassing tests.`,
+        blockedCheck: 'reward-hacking',
       };
     }
   }
@@ -221,6 +232,7 @@ export function verifyToolIntent(
       return {
         allowed: false,
         reason: directiveVerdict.reason,
+        blockedCheck: 'directives',
       };
     }
   }
@@ -261,6 +273,7 @@ export function verifyToolIntent(
       return {
         allowed: false,
         reason,
+        blockedCheck: 'trace',
       };
     }
   }

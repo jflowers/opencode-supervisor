@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Hooks, PluginInput } from '@opencode-ai/plugin';
-import plugin, { createInvokeModel, PLUGIN_VERSION, resolveHookConfig, sessionState } from '../index.ts';
+import plugin, { createInvokeModel, PLUGIN_VERSION, resolveHookConfig, sessionState, traceAwaitState } from '../index.ts';
 import { recordingPluginInput, silentClientSurface, silentPluginInput } from './mocks.ts';
 import { stripNarrative } from '../src/stripper.ts';
 import {
@@ -27,6 +27,20 @@ test('stripNarrative isolates code and math steps', () => {
   ];
   const cleaned = stripNarrative(steps, 'code_and_math');
   assert.equal(cleaned.length, 2);
+});
+
+test('stripNarrative keeps path-bearing prose in code_and_math and balanced, drops it in strict (FR-068)', () => {
+  // The corrective loop's premise: a step naming a file in plain prose
+  // must reach the audit and the trace, or the guard's block reason
+  // can never be satisfied (design D9).
+  const steps = ['I will update notes.md with the session summary.'];
+  assert.equal(stripNarrative(steps, 'code_and_math').length, 1);
+  assert.equal(stripNarrative(steps, 'balanced').length, 1);
+  // Strict is unchanged: zero natural language is its contract.
+  assert.equal(stripNarrative(steps, 'strict').length, 0);
+  // Narrative-prefix removal still applies to the surviving step —
+  // survival and prefix stripping are independent clauses.
+  assert.equal(stripNarrative(steps, 'code_and_math')[0], 'update notes.md with the session summary.');
 });
 
 test('resolveAuditorConfig respects session model slug and variant overrides', () => {
@@ -411,6 +425,27 @@ test('extractArgPaths recognizes wildcard- and variable-bearing pattern tokens (
   assert.deepEqual(extractPathTokens('read the batch at kb/topics/gov-ci.md today'), ['kb/topics/gov-ci.md']);
   assert.ok(hasPathToken('update kb/topics/gov-ci.md with the result'));
   assert.ok(!hasPathToken('nothing formal here at all'));
+});
+
+test('path-token extraction is immune to cursor bleed from earlier probes (FR-066/FR-068 regression)', () => {
+  // The FR-068 wiring exposed a latent hazard: a module-level global
+  // regex shares `lastIndex` across consumers — `matchAll` copies it
+  // into its iterator and `.test` advances it — so the stripper's
+  // survival probe on one text silently shifted the start offset of
+  // the guard's next extraction, skipping leading tokens. The grammar
+  // now compiles per call site; interleaved consumers cannot shift
+  // each other's offsets.
+  const longStep = 'first consider src/alpha.ts then src/beta.ts and finally src/gamma.ts last';
+  assert.ok(hasPathToken(longStep));
+  // Extraction after a probe that matched deep in a longer text still
+  // sees the token at offset 0 of the next string.
+  assert.deepEqual(extractPathTokens('src/unrelated.ts'), ['src/unrelated.ts']);
+  assert.deepEqual(extractArgPaths({ command: 'cat src/never/seen.ts' }), ['src/never/seen.ts']);
+  // Repeated probes do not accumulate state either.
+  assert.ok(hasPathToken('see notes.md'));
+  assert.deepEqual(extractPathTokens('see notes.md'), ['notes.md']);
+  assert.ok(!hasPathToken('nothing formal here at all'));
+  assert.deepEqual(extractPathTokens('src/leading.ts and src/trailing.ts'), ['src/leading.ts', 'src/trailing.ts']);
 });
 
 test('verifyToolIntent satisfies a wildcard pattern from a trace reference (FR-066)', () => {
@@ -870,6 +905,7 @@ const AUDIT_ENV_NAMES = [
   'OPENCODE_SUPERVISOR_MEMO_MAX_SOLVED_ITEMS',
   'OPENCODE_SUPERVISOR_MEMO_MAX_CRITIQUES',
   'OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS',
+  'OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS',
 ];
 
 /** Saves/deletes the auditor env knobs and isolates XDG_CONFIG_HOME around `run`, restoring after. */
@@ -2359,5 +2395,310 @@ test("hooks ignore the plugin's own auditor side sessions (self-suppression)", a
     assert.equal(calls.create.length, 1);
     assert.equal(calls.delete.length, 1);
     assert.deepEqual(sessionState.peek(supervisedID)?.verifiedSteps, [{ text: 'the rate = 24 * 15 = 360', passed: true }]);
+  });
+});
+
+// ── Audit coordination (task 5.4): FR-067 bounded wait, FR-068 loop ──
+
+/**
+ * FR-067 race harness: a plugin input whose side-session prompt parks
+ * until the test releases it — the in-flight audit the bounded trace
+ * wait consumes — while app.log records entries for the timeout and
+ * rejection assertions. Fresh mock client per test — no network.
+ */
+function raceHarness(): {
+  input: PluginInput;
+  logEntries: Array<{ level: string; message: string }>;
+  parkedResolvers: Array<(text: string) => void>;
+} {
+  const logEntries: Array<{ level: string; message: string }> = [];
+  const parkedResolvers: Array<(text: string) => void> = [];
+  const input = {
+    client: {
+      session: {
+        create: async () => ({ data: { id: 'auditor-side-race' } }),
+        // Parking prompt: the audit continuation suspends here until
+        // the test hands back a verdict, so `pendingAudits` stays
+        // non-empty for as long as the test chooses.
+        prompt: () =>
+          new Promise<{ data: { info: unknown; parts: Array<{ type: 'text'; text: string }> } }>((resolve) => {
+            parkedResolvers.push((text: string) => resolve({ data: { info: {}, parts: [{ type: 'text', text }] } }));
+          }),
+        promptAsync: async () => ({}),
+        abort: async () => ({}),
+        delete: async () => ({}),
+      },
+      app: {
+        log: async (options: unknown) => {
+          const body = (options as { body?: { level?: string; message?: string } }).body;
+          logEntries.push({ level: body?.level ?? '', message: body?.message ?? '' });
+          return {};
+        },
+      },
+      config: { get: async () => ({ data: { small_model: 'mock/derived-model' } }) },
+    },
+    directory: '/tmp/supervisor-race-test',
+  };
+  return { input: input as unknown as PluginInput, logEntries, parkedResolvers };
+}
+
+/** The queued passing verdict every battery cleanup path releases the parked audit with. */
+const PASSED_VERDICT = '{"passed":true,"failedStep":null,"severity":null,"critique":"Verified."}';
+
+test('tool.execute.before waits for an in-flight audit and allows once the step lands (FR-067)', async () => {
+  await withCleanAuditEnv(async () => {
+    const harness = raceHarness();
+    const hooks = await plugin.server(harness.input);
+    const sessionID = 'race-settled';
+
+    // GIVEN: the trace already holds an earlier verified step.
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
+
+    // ...and a reasoning part naming notes.md is still being audited:
+    // the dispatch is fire-and-forget, parked on the harness prompt.
+    const dispatch = dispatchPart(
+      hooks,
+      completedReasoningPart({ sessionID, id: 'part-race', text: 'I will record the outcome in notes.md.' })
+    );
+    // The continuation registers synchronously with the dispatch.
+    assert.equal(sessionState.get(sessionID).pendingAudits.size, 1);
+
+    // WHEN: a tool call on the path arrives before the audit completes.
+    const call = dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'notes.md', content: 'session summary' });
+    // One macrotask boundary: the call has entered its bounded wait
+    // (the only await ahead of it — config resolution — is resolved).
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    // THEN: the audit resolves within the bound and the single attempt
+    // passes — no first-attempt block, no timeout charged.
+    harness.parkedResolvers[0](PASSED_VERDICT);
+    await assert.doesNotReject(() => call);
+    await dispatch;
+
+    const state = sessionState.get(sessionID);
+    assert.deepEqual(state.verifiedSteps, [
+      { text: 'Edit src/a.ts to export the helper.', passed: true },
+      { text: 'record the outcome in notes.md.', passed: true },
+    ]);
+    assert.equal(state.pendingAudits.size, 0); // deregistered in the finally
+    assert.equal(state.timeoutFailOpens, 0);
+    assert.ok(!harness.logEntries.some((entry) => entry.message.includes('trace-check wait timed out')));
+  });
+});
+
+test('a rejected in-flight audit settles the trace-check wait without throwing into the hook (FR-067)', async () => {
+  await withCleanAuditEnv(async () => {
+    const harness = raceHarness();
+    const hooks = await plugin.server(harness.input);
+    const sessionID = 'race-rejected';
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
+
+    // Every public continuation layer is fail-open by FR-005 (the peer
+    // audit, critique delivery, and the derived-model lookup all
+    // catch), so no public vector produces a rejected continuation
+    // without also degrading this hook's own config resolution. The
+    // rejection is injected at the state seam the wait consumes — the
+    // same `pendingAudits` registration the event hook owns. A no-op
+    // catch marks the promise handled up front (the wait's allSettled
+    // does the real observation), so no unhandled-rejection window.
+    const poisoned = Promise.reject(new Error('audit continuation crashed'));
+    poisoned.catch(() => {});
+    sessionState.get(sessionID).pendingAudits.add(poisoned);
+
+    // The call blocks with the trace reason — the live trace is
+    // unchanged by the rejection — and the rejection never escapes
+    // into the hook: the wait settles, logs it once, and the guard
+    // re-checks the trace.
+    await assert.rejects(
+      () => dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'src/b.ts', content: 'export const y = 2;' }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.ok(error.message.includes('file-path trace check'));
+        assert.ok(error.message.includes('src/b.ts'));
+        return true;
+      }
+    );
+    const rejections = harness.logEntries.filter((entry) => entry.message.includes('in-flight audit continuation rejected'));
+    assert.equal(rejections.length, 1);
+    assert.ok(rejections[0].message.includes('audit continuation crashed'));
+    assert.equal(sessionState.get(sessionID).timeoutFailOpens, 0);
+  });
+});
+
+test('a trace-check wait that times out fails open within the per-session cap (FR-067)', async () => {
+  await withCleanAuditEnv(async () => {
+    const harness = raceHarness();
+    const hooks = await plugin.server(harness.input);
+    const sessionID = 'race-timeout';
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
+
+    // The bound is shrunk from the 10 s default so the timeout fires
+    // in milliseconds; the default is restored in the finally.
+    const savedTimeoutMs = traceAwaitState.timeoutMs;
+    traceAwaitState.timeoutMs = 15;
+    let dispatch: Promise<void> | undefined;
+    try {
+      dispatch = dispatchPart(
+        hooks,
+        completedReasoningPart({ sessionID, id: 'part-timeout', text: 'I will record the outcome in notes.md.' })
+      );
+      // The call is allowed (fail-open, FR-005's conservatism: the
+      // live agent's progress outranks one unverified call)...
+      await assert.doesNotReject(() =>
+        dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'notes.md', content: 'session summary' })
+      );
+      // ...and exactly one warning names the delay and the budget.
+      const warnings = harness.logEntries.filter(
+        (entry) => entry.level === 'warn' && entry.message.includes('trace-check wait timed out')
+      );
+      assert.equal(warnings.length, 1);
+      assert.ok(warnings[0].message.includes('failing open (1/3)'));
+      assert.equal(sessionState.get(sessionID).timeoutFailOpens, 1);
+    } finally {
+      // Release the parked audit and settle the fire-and-forget hook so
+      // nothing leaks past the test.
+      harness.parkedResolvers[0]?.(PASSED_VERDICT);
+      await dispatch;
+      traceAwaitState.timeoutMs = savedTimeoutMs;
+    }
+  });
+});
+
+test('repeated trace-check timeouts block at the per-session fail-open cap (FR-067)', async () => {
+  await withCleanAuditEnv(async () => {
+    // Cap 1 through the env tier: the first timeout fails open
+    // (below the cap), the second blocks (past it).
+    process.env.OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS = '1';
+    const harness = raceHarness();
+    const hooks = await plugin.server(harness.input);
+    const sessionID = 'race-cap';
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
+
+    const savedTimeoutMs = traceAwaitState.timeoutMs;
+    traceAwaitState.timeoutMs = 15;
+    let dispatch: Promise<void> | undefined;
+    try {
+      dispatch = dispatchPart(
+        hooks,
+        completedReasoningPart({ sessionID, id: 'part-cap', text: 'I will record the outcome in notes.md.' })
+      );
+      // First timeout — below the cap: allowed, one warning logged.
+      await assert.doesNotReject(() =>
+        dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'notes.md', content: 'session summary' })
+      );
+      assert.ok(
+        harness.logEntries.some(
+          (entry) => entry.level === 'warn' && entry.message.includes('trace-check wait timed out') && entry.message.includes('failing open (1/1)')
+        )
+      );
+      // Second timeout — past the cap: the call blocks, the reason
+      // names the still-unsettled audit and the corrective action.
+      await assert.rejects(
+        () => dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'notes.md', content: 'retry summary' }),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.ok(error.message.includes('still unsettled'));
+          assert.ok(error.message.includes('timeout fail-open cap (1)'));
+          assert.ok(error.message.includes('Wait for the audit to settle'));
+          return true;
+        }
+      );
+      // Every timeout is logged: the blocked one rides the block's
+      // error entry, which names the unsettled audit.
+      assert.ok(
+        harness.logEntries.some(
+          (entry) =>
+            entry.level === 'error' && entry.message.includes('blocked tool') && entry.message.includes('still unsettled')
+        )
+      );
+      assert.equal(sessionState.get(sessionID).timeoutFailOpens, 2);
+    } finally {
+      harness.parkedResolvers[0]?.(PASSED_VERDICT);
+      await dispatch;
+      traceAwaitState.timeoutMs = savedTimeoutMs;
+    }
+  });
+});
+
+test('a settled trace with no in-flight audits still blocks absent paths (FR-067 teeth)', async () => {
+  await withCleanAuditEnv(async () => {
+    const hooks = await plugin.server(silentPluginInput());
+    const sessionID = 'race-teeth';
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
+    assert.equal(sessionState.get(sessionID).pendingAudits.size, 0);
+
+    // The wait exists only for trace races: with nothing in flight the
+    // block is immediate and no fail-open budget is spent.
+    await assert.rejects(
+      () => dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'src/b.ts', content: 'export const y = 2;' }),
+      /file-path trace check/
+    );
+    assert.equal(sessionState.get(sessionID).timeoutFailOpens, 0);
+  });
+});
+
+test('the empty-trace allow imposes no wait even with an audit in flight (FR-011, FR-067)', async () => {
+  await withCleanAuditEnv(async () => {
+    const harness = raceHarness();
+    const hooks = await plugin.server(harness.input);
+    const sessionID = 'race-empty-trace';
+
+    // No verified steps at all — only the in-flight audit exists.
+    const dispatch = dispatchPart(
+      hooks,
+      completedReasoningPart({ sessionID, id: 'part-empty', text: 'I will record the outcome in notes.md.' })
+    );
+    assert.equal(sessionState.get(sessionID).pendingAudits.size, 1);
+
+    // FR-011: the call proceeds immediately — while the audit is still
+    // parked on the harness prompt, which only this test can release —
+    // and no wait or fail-open budget is charged.
+    await assert.doesNotReject(() =>
+      dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'src/never-audited.ts', content: 'export const z = 3;' })
+    );
+    assert.equal(sessionState.get(sessionID).timeoutFailOpens, 0);
+    assert.ok(!harness.logEntries.some((entry) => entry.message.includes('trace-check wait')));
+
+    harness.parkedResolvers[0](PASSED_VERDICT);
+    await dispatch;
+  });
+});
+
+test('the corrective instruction loop closes end to end: block, prose re-statement, retry (FR-068)', async () => {
+  await withCleanAuditEnv(async () => {
+    const { input, calls } = auditHarness([PASSED_VERDICT]);
+    const hooks = await plugin.server(input);
+    const sessionID = 'corrective-e2e';
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
+
+    // First attempt: the block reason instructs the model to reason
+    // about the file in verified steps, then retry (FR-012).
+    await assert.rejects(
+      () => dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'notes.md', content: 'session summary' }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.ok(error.message.includes('notes.md'));
+        assert.ok(error.message.includes('Reason about the file in verified steps'));
+        return true;
+      }
+    );
+
+    // The model re-states its plan in plain prose naming the file — no
+    // code ticks, no operators — and the audit passes it: FR-068's
+    // survival is what lets the re-statement reach the audit at all.
+    await dispatchPart(
+      hooks,
+      completedReasoningPart({ sessionID, id: 'part-corrective', text: 'I will update notes.md with the session summary.' })
+    );
+    assert.equal(calls.create.length, 1); // the re-statement really was audited
+    assert.deepEqual(sessionState.get(sessionID).verifiedSteps, [
+      { text: 'Edit src/a.ts to export the helper.', passed: true },
+      { text: 'update notes.md with the session summary.', passed: true },
+    ]);
+
+    // The retried call passes: the prose mention reached the trace.
+    await assert.doesNotReject(() =>
+      dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'notes.md', content: 'session summary' })
+    );
   });
 });

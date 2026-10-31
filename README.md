@@ -150,7 +150,10 @@ flowchart TD
    critiques without losing its place — the entry stays, marked
    unpassed, so the file reasoning the tool guard matches against
    survives one misstated tally. Severe findings and peer-audit
-   failures still evict.
+   failures still evict. While an audit runs it is registered as
+   in-flight for the session: a tool call that would block on the
+   trace check waits for the settled trace instead of seeing the
+   partial one (Section 4.2).
 4. **Intervene.** A `minor` failure (arithmetic, off-by-one, scope
    drift) arrives as a `[supervisor]`-prefixed user message the agent
    incorporates at its next step; a `severe` failure (reward hacking)
@@ -183,8 +186,19 @@ wildcard- or variable-bearing argument (`kb/topics/*.md`,
 it passes when the verified trace references a satisfying path or
 the pattern spelling itself, and otherwise blocks naming the
 pattern (never a phantom expansion like `id.md`); extension matches
-carry a trailing boundary, so `config.json` tokenizes whole.
-`approve` gates hold matching calls for engineer
+carry a trailing boundary, so `config.json` tokenizes whole. A
+trace block never fires on a partial trace while the session's
+audit is still in flight: the guard waits for the audit
+continuation to settle — bounded at 10 seconds, one wait per call —
+then re-checks the settled trace before blocking or allowing. A
+rejected continuation counts as settled (logged once, never thrown
+into the guard). On timeout the call fails open — the live agent's
+progress outranks one unverified call — up to `maxTimeoutFailOpens`
+per session (default 3, Section 7); past the cap a timed-out wait
+blocks naming the still-unsettled audit, so the model can wait and
+retry. Passing calls, the empty-trace allow, and reward-hacking or
+directive blocks never charge the wait — their causes are not trace
+races. `approve` gates hold matching calls for engineer
 approval; `review` gates hold calls until a passed peer audit
 references the path (Section 6). An empty trace or rule set never
 blocks, and the plugin's own console tools are exempt from the
@@ -215,7 +229,7 @@ tuple registration — Section 6):
 | :--- | :--- |
 | `event` | Observes completed reasoning parts (`message.part.updated`), deduplicates them, strips narrative, runs the invariants and the side-session peer audit, records steps in the verified trace (passed, or minor deterministic findings marked unpassed), and routes failures to critique delivery. |
 | `chat.message` | Captures the first user message of the session as the goal. The goal is never replaced. |
-| `tool.execute.before` | Tool guard: blocks reward-hacking tool calls, engineer-directive violations, and file paths absent from the verified trace (never blocks when the trace is empty); holds approve-gated calls for engineer approval and review-gated calls for a passed peer audit (agent-console tools are exempt so `request_audit` stays reachable); records directive triggers. |
+| `tool.execute.before` | Tool guard: blocks reward-hacking tool calls, engineer-directive violations, and file paths absent from the verified trace (never blocks when the trace is empty; a trace block with an audit in flight waits up to 10 s for the settled trace, failing open up to the per-session `maxTimeoutFailOpens` cap — Section 4.2); holds approve-gated calls for engineer approval and review-gated calls for a passed peer audit (agent-console tools are exempt so `request_audit` stays reachable); records directive triggers. |
 | `tool.execute.after` | Appends a solved item (tool name + short outcome) to a bounded log. |
 | `tool` | Agent console: registers `remind_me` / `forget_reminder` (durable reminders), `recall` (full retained state), `report` (self-reported events), and `request_audit` (on-demand peer audit) (Section 5). |
 | `experimental.chat.messages.transform` | Appends the supervisor memo to the conversation as one trailing user message per user prompt. Degrades gracefully (memo-less operation) when the hook is absent. |
@@ -402,6 +416,7 @@ omits it.
 | `memoLimits.maxReminders` | `OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS` | `10` | Cap on reminders kept in state and shown in the memo (the most recent are kept). |
 | `memoLimits.maxReports` | `OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS` | `5` | Cap on agent reports kept in state and shown in the memo (the most recent are kept). |
 | `maxOnDemandAudits` | `OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS` | `8` | Per-session cap on audits requested through the `request_audit` tool. The automatic audit loop is unaffected. |
+| `maxTimeoutFailOpens` | `OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS` | `3` | Per-session cap on trace-check waits that time out and fail open (the wait itself is bounded at 10 seconds). Past the cap a timed-out wait blocks naming the still-unsettled audit. |
 
 Gate approvals are not a knob: `approve` rules read the approvals file
 fresh at each gated call, so approving or revoking takes effect on
@@ -425,11 +440,14 @@ at the first hook invocation.
 ### 7.1 Understanding `stripMode`
 
 - **`code_and_math` (default)** — retains steps containing code
-  blocks, math operators, SQL keywords, or variable assignments;
-  removes pure prose. For general coding and math tasks.
+  blocks, math operators, SQL keywords, variable assignments, or a
+  file-path token: plain prose naming a file (*"I will update
+  notes.md"*) survives so the tool guard's corrective instruction
+  stays followable (Section 4.2); removes other pure prose. For
+  general coding and math tasks.
 - **`balanced`** — everything in `code_and_math`, plus prose stating
-  formal specifications, complexity, preconditions, invariants, or
-  file paths. For architecture and security reviews.
+  formal specifications, complexity, preconditions, or invariants.
+  For architecture and security reviews.
 - **`strict`** — only fenced code blocks and explicit equations.
   Zero natural language.
 
@@ -482,10 +500,23 @@ cp skills/reasoning-auditor/skill.md ~/.config/opencode/skills/reasoning-auditor
   `client.config.get` with a 5s timeout; while it keeps failing,
   hook-blocking paths absorb up to 5s per lookup and ~25s
   cumulatively before the 60s backoff engages (FR-058 residual).
-- The verified-trace path check is best-effort: a tool call racing an
-  in-flight audit sees the partial trace (an empty trace never
-  blocks). Directive globs are root-anchored and case-insensitive;
+- The verified-trace path check is best-effort: a tool call racing
+  an in-flight audit waits up to 10 seconds for the audit to
+  settle, then fails open — up to `maxTimeoutFailOpens` (default 3)
+  timed-out waits per session, past which the call blocks naming
+  the still-unsettled audit. An empty trace never blocks. Directive
+  globs are root-anchored and case-insensitive;
   `**/`-prefixed globs cover deeper spellings.
+- Path-bearing survival (Section 7.1) is mode-scoped and
+  content-blind: a step that names a file *and* argues in prose
+  survives `code_and_math` and `balanced` whole, so persuasion
+  riding path-bearing prose reaches the auditor — deterministic
+  tiers do not judge narrative, and under a no-`auditorModel`
+  install only the deterministic markers filter it (FR-060). In
+  `strict` the step still drops. A timed-out trace wait that fails
+  open can execute a path the settled trace never verified — the
+  bounded fail-open trades one unverified call for a live agent
+  (FR-067 residual).
 - A blocked tool surfaces as an error tool result, so the model may
   retry the call (bounded by OpenCode's doom-loop check). Agent
   reports are self-reported and unaudited; recall is read-only.

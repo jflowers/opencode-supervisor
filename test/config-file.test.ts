@@ -25,6 +25,7 @@ test('validateSupervisorConfig accepts a full valid config', () => {
     requireStepReferenceInTools: false,
     memoLimits: { maxSolvedItems: 10, maxCritiques: 4, maxReminders: 6, maxReports: 3 },
     maxOnDemandAudits: 5,
+    maxTimeoutFailOpens: 5,
   });
   assert.equal(parsed.error, null);
   assert.equal(parsed.config.auditorModel, 'enmaas/rits/deepseek-ai/DeepSeek-V4.1-Flash-1017');
@@ -35,6 +36,7 @@ test('validateSupervisorConfig accepts a full valid config', () => {
   assert.equal(parsed.config.requireStepReferenceInTools, false);
   assert.deepEqual(parsed.config.memoLimits, { maxSolvedItems: 10, maxCritiques: 4, maxReminders: 6, maxReports: 3 });
   assert.equal(parsed.config.maxOnDemandAudits, 5);
+  assert.equal(parsed.config.maxTimeoutFailOpens, 5);
 });
 
 test('validateSupervisorConfig accepts any subset and ignores unknown keys', () => {
@@ -66,6 +68,8 @@ test('validateSupervisorConfig rejects wrong-typed known keys wholesale', () => 
     [{ maxRegenerations: 2.5 }, /"maxRegenerations" must be a non-negative integer/],
     [{ maxOnDemandAudits: Number.NaN }, /"maxOnDemandAudits" must be a non-negative integer/],
     [{ maxOnDemandAudits: Number.POSITIVE_INFINITY }, /"maxOnDemandAudits" must be a non-negative integer/],
+    [{ maxTimeoutFailOpens: Number.NaN }, /"maxTimeoutFailOpens" must be a non-negative integer/],
+    [{ maxTimeoutFailOpens: Number.POSITIVE_INFINITY }, /"maxTimeoutFailOpens" must be a non-negative integer/],
     [{ blockRewardHacking: 'yes' }, /"blockRewardHacking" must be a boolean/],
     [{ requireStepReferenceInTools: 1 }, /"requireStepReferenceInTools" must be a boolean/],
     [{ memoLimits: [] }, /"memoLimits" must be an object/],
@@ -115,6 +119,7 @@ const CONFIG_ENV_NAMES = [
   'OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS',
   'OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS',
   'OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS',
+  'OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS',
 ];
 
 /** Cleans every supervisor env knob and log-identity flag, isolating XDG_CONFIG_HOME, around one tier test. */
@@ -162,6 +167,7 @@ test('resolveHookConfig tiers the auditor model project → options → global �
       auditorVariant: 'low',
       maxRegenerations: 5,
       memoLimits: { maxReminders: 3 },
+      maxTimeoutFailOpens: 6,
     };
     const sources = {
       project: all,
@@ -195,6 +201,16 @@ test('resolveHookConfig tiers the auditor model project → options → global �
     assert.equal(tiered.maxRegenerations, 5);
     assert.equal(tiered.memoLimits.maxReminders, 3);
     assert.equal(tiered.memoLimits.maxSolvedItems, DEFAULT_MEMO_LIMITS.maxSolvedItems);
+    // FR-067's fail-open cap is a full per-knob tier citizen (task 5.2):
+    // the project file's value wins, the global file applies when the
+    // project tier is absent, and with neither file tier set the
+    // pluginConfig default (3) holds.
+    assert.equal(tiered.maxTimeoutFailOpens, 6);
+    assert.equal(
+      resolveHookConfig(undefined, { ...sources, project: undefined, global: { maxTimeoutFailOpens: 7 } as SupervisorFileConfig }).maxTimeoutFailOpens,
+      7
+    );
+    assert.equal(resolveHookConfig(undefined, { ...sources, project: undefined, options: undefined, global: undefined }).maxTimeoutFailOpens, 3);
   });
 });
 
@@ -202,11 +218,13 @@ test('resolveHookConfig keeps the environment above the file tiers', async () =>
   await withCleanConfigEnv(async () => {
     process.env.OPENCODE_SUPERVISOR_MODEL = 'env/model';
     process.env.OPENCODE_SUPERVISOR_MAX_REGENERATIONS = '9';
+    process.env.OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS = '7';
     const config = resolveHookConfig(undefined, {
-      project: { auditorModel: 'project/model', maxRegenerations: 5 },
+      project: { auditorModel: 'project/model', maxRegenerations: 5, maxTimeoutFailOpens: 5 },
     });
     assert.equal(config.auditorModel, 'env/model');
     assert.equal(config.maxRegenerations, 9);
+    assert.equal(config.maxTimeoutFailOpens, 7);
   });
 });
 
