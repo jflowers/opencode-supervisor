@@ -45,6 +45,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   automatically — `request_audit` can no longer fence its own
   channel, and the reward-hacking check still applies to it (#33;
   FR-064, FR-065).
+- The tool guard now waits for in-flight audits before blocking on
+  the trace check. A same-turn tool call used to race the audit of
+  the very reasoning that named its paths — the call saw the
+  partial trace and blocked with a corrective instruction the agent
+  had already followed. A trace block with an audit in flight now
+  waits up to 10 seconds (`Promise.allSettled` raced against a
+  timer cleared on every path; a rejected continuation counts as
+  settled, is logged once, and never throws into the hook), then
+  re-checks the settled trace; on timeout the call fails open —
+  the live agent's progress outranks one unverified call — up to
+  `maxTimeoutFailOpens` per session (default 3, env
+  `OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS`), past which a
+  timed-out wait blocks naming the still-unsettled audit. Passing
+  calls, settled traces, the empty-trace allow, and reward-hacking
+  and directive blocks never charge the wait (#34; FR-067).
+- Path-bearing steps survive narrative stripping in `code_and_math`
+  and `balanced`. Prose naming a file (*"I will update notes.md"*)
+  was stripped before the audit, so the path never reached the
+  verified trace and the guard's corrective instruction could not
+  be followed — the loop was unclosable. A step carrying a
+  path-like token (the shared `src/path-tokens.ts` grammar) now
+  survives both modes with narrative-prefix removal intact;
+  `strict` is unchanged. Wiring the stripper to the shared grammar
+  also exposed and fixed a latent cursor-sharing hazard there: a
+  module-level global regex leaked `lastIndex` between
+  `hasPathToken` probes and `matchAll` extraction, silently
+  shifting the guard's token offsets — the grammar now compiles per
+  call site (#34; FR-068).
 
 ## [2.5.0] - 2026-10-30
 

@@ -106,6 +106,7 @@ const ENV_MEMO_MAX_CRITIQUES = 'OPENCODE_SUPERVISOR_MEMO_MAX_CRITIQUES';
 const ENV_MEMO_MAX_REMINDERS = 'OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS';
 const ENV_MEMO_MAX_REPORTS = 'OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS';
 const ENV_MAX_ON_DEMAND_AUDITS = 'OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS';
+const ENV_MAX_TIMEOUT_FAIL_OPENS = 'OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS';
 
 /**
  * Hook-layer configuration: the auditor's `AuditConfig` plus the memo
@@ -119,6 +120,8 @@ export interface HookConfig extends AuditConfig {
   memoLimits: MemoLimits;
   /** Per-session cap on on-demand audits requested through the request_audit tool (FR-039). */
   maxOnDemandAudits: number;
+  /** Per-session cap on trace-check timeout fail-opens (FR-067, design D8): past it, a timed-out wait blocks. */
+  maxTimeoutFailOpens: number;
 }
 
 /**
@@ -136,6 +139,7 @@ export const pluginConfig: HookConfig = {
   requireStepReferenceInTools: true,
   memoLimits: { ...DEFAULT_MEMO_LIMITS },
   maxOnDemandAudits: 8,
+  maxTimeoutFailOpens: 3,
 };
 
 /**
@@ -158,6 +162,16 @@ export const logIdentityState = {
   /** True once the identity line has said the auditor is absent; a later-resolving model announces itself (review round 1). */
   identitySaidNoModel: false,
 };
+
+/**
+ * Trace-await state (FR-067, design D8): the bounded wait's timeout,
+ * in milliseconds. Held in exported mutable state — the
+ * `logIdentityState` precedent — so the timeout tests run in
+ * milliseconds, not ten seconds. The bound is 10 seconds because a
+ * small-model side-session round trip is seconds; the derived-lookup
+ * precedent budgets 5 s for a cheap GET, and an LLM call needs more.
+ */
+export const traceAwaitState = { timeoutMs: 10_000 };
 
 /** Session shape carrying plugin config overrides — the same key `resolveAuditorConfig` reads, so one override object governs the whole plugin. */
 const PLUGIN_CONFIG_KEY = 'opencode-supervisor';
@@ -319,6 +333,11 @@ export function resolveHookConfig(
       envNumber(ENV_MAX_ON_DEMAND_AUDITS) ??
       tiered(sources.project?.maxOnDemandAudits, sources.options?.maxOnDemandAudits, sources.global?.maxOnDemandAudits) ??
       pluginConfig.maxOnDemandAudits,
+    maxTimeoutFailOpens:
+      pickNumber(overrides.maxTimeoutFailOpens) ??
+      envNumber(ENV_MAX_TIMEOUT_FAIL_OPENS) ??
+      tiered(sources.project?.maxTimeoutFailOpens, sources.options?.maxTimeoutFailOpens, sources.global?.maxTimeoutFailOpens) ??
+      pluginConfig.maxTimeoutFailOpens,
   };
 }
 
@@ -360,6 +379,19 @@ export interface SessionState {
    * structurally impossible (FR-001).
    */
   seenParts: Set<string>;
+  /**
+   * In-flight audit continuations (FR-067, design D8): promises the
+   * event hook registers after dedupe, resolving only after the trace
+   * mutation (or the eviction/critique decision), so a waiting tool
+   * call always re-reads a settled trace. Deregistered in a finally.
+   */
+  pendingAudits: Set<Promise<unknown>>;
+  /**
+   * Trace-check waits that timed out and failed open this session
+   * (FR-067, design D8); the cap is `maxTimeoutFailOpens`. Past the
+   * cap a timed-out wait blocks naming the still-unsettled audit.
+   */
+  timeoutFailOpens: number;
 }
 
 /** Module-level state (design D4), keyed by session ID. */
@@ -379,6 +411,8 @@ function emptySessionState(): SessionState {
     triggeredDirectives: [],
     grantedGates: new Set(),
     seenParts: new Set(),
+    pendingAudits: new Set(),
+    timeoutFailOpens: 0,
   };
 }
 
@@ -1408,6 +1442,40 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
   // maxRegenerations bound, records every critique (FR-015), and never
   // rejects (FR-005).
   const deliverCritique = createCritiqueDelivery(input.client, logger);
+
+  /**
+   * Waits for the session's in-flight audit continuations, bounded by
+   * `traceAwaitState.timeoutMs` (FR-067, design D8). A rejected
+   * continuation counts as settled: `allSettled` never rethrows into
+   * the hook, each observed rejection is logged once, and the caller
+   * re-checks the live trace. The timer is cleared on every path (the
+   * round-3 derived-lookup precedent). Returns 'settled' or 'timeout'.
+   */
+  const waitForPendingAudits = async (
+    pending: Set<Promise<unknown>>
+  ): Promise<'settled' | 'timeout'> => {
+    const pendingList = [...pending];
+    const settled = Promise.allSettled(pendingList);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), traceAwaitState.timeoutMs);
+    });
+    try {
+      const winner = await Promise.race([settled.then(() => 'settled' as const), timeout]);
+      if (winner === 'settled') {
+        const results = await settled;
+        for (const result of results) {
+          if (result.status === 'rejected') {
+            logger.warn(`in-flight audit continuation rejected while a tool call waited: ${errorText(result.reason)}`);
+          }
+        }
+      }
+      return winner;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
   const hooks: Hooks = {
     /**
      * Reasoning observation (design D1; spike 1.1, tasks 3.2–3.3).
@@ -1450,45 +1518,62 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         // Task 3.2 — the live audit path. FR-002: strip narrative per
         // config.stripMode BEFORE the invariant checks, the audit, and
         // trace matching; each completed part contributes one step.
-        const config = await buildConfig();
-        const [stepText] = stripNarrative([part.text], config.stripMode);
-        // Nothing formal survives stripping: no audit, no model call,
-        // nothing recorded (runPeerAudit would no-op; skip even that).
-        if (stepText === undefined || stepText === '') {
-          return;
-        }
-        // Deterministic invariants (FR-003) short-circuit inside
-        // runPeerAudit before the side-session call; the goal (FR-013,
-        // captured by `chat.message`) scopes drift findings whenever
-        // present, and the engineer directives (FR-031) add violation
-        // criteria whenever configured.
-        const outcome = await runPeerAudit([stepText], config, invokeModel, state.goal, directivesAdvisory ?? undefined);
-        // FR-006/FR-063: the step joins the verified trace whenever the
-        // outcome records — passed steps and minor deterministic-invariant
-        // failures alike (the latter marked `passed: false`, since the
-        // trace is a path ledger and a misstated tally does not revoke the
-        // part's file reasoning). Severe findings and peer failures evict
-        // (`outcomeRecordsStep`); fail-open outcomes pass (FR-005), so a
-        // degraded auditor never fences the session's tools.
-        if (outcomeRecordsStep(outcome)) {
-          state.verifiedSteps.push({ text: stepText, passed: outcome.passed });
-          if (outcome.error !== undefined) {
-            logger.warn(`peer audit failed open; step recorded as passed: ${outcome.error}`);
+        // FR-067 (design D8): the audit continuation (config → strip →
+        // audit → trace mutation / critique delivery) registers in
+        // `pendingAudits` so a concurrent tool call can await the
+        // settled trace instead of blocking on a partial one. The
+        // registered promise resolves only after the trace mutation,
+        // and the finally deregistration keeps the set from leaking.
+        const continuation = (async () => {
+          const config = await buildConfig();
+          const [stepText] = stripNarrative([part.text], config.stripMode);
+          // Nothing formal survives stripping: no audit, no model call,
+          // nothing recorded (runPeerAudit would no-op; skip even that).
+          if (stepText === undefined || stepText === '') {
+            return;
           }
-        }
-        if (!outcome.passed) {
-          // Task 3.3 — critique delivery (FR-007/FR-008; spike 1.2). A
-          // minor invariants failure that stayed in the trace still gets
-          // its steering critique. An absent severity defaults to minor
-          // (design D3, fail-open conservatism: the bounded steer, never
-          // the interrupt).
-          await deliverCritique({
-            sessionID: part.sessionID,
-            critique: outcome.critique,
-            severity: outcome.severity ?? 'minor',
-            config,
-            state,
-          });
+          // Deterministic invariants (FR-003) short-circuit inside
+          // runPeerAudit before the side-session call; the goal (FR-013,
+          // captured by `chat.message`) scopes drift findings whenever
+          // present, and the engineer directives (FR-031) add violation
+          // criteria whenever configured.
+          const outcome = await runPeerAudit([stepText], config, invokeModel, state.goal, directivesAdvisory ?? undefined);
+          // FR-006/FR-063: the step joins the verified trace whenever the
+          // outcome records — passed steps and minor deterministic-invariant
+          // failures alike (the latter marked `passed: false`, since the
+          // trace is a path ledger and a misstated tally does not revoke the
+          // part's file reasoning). Severe findings and peer failures evict
+          // (`outcomeRecordsStep`); fail-open outcomes pass (FR-005), so a
+          // degraded auditor never fences the session's tools.
+          if (outcomeRecordsStep(outcome)) {
+            state.verifiedSteps.push({ text: stepText, passed: outcome.passed });
+            if (outcome.error !== undefined) {
+              logger.warn(`peer audit failed open; step recorded as passed: ${outcome.error}`);
+            }
+          }
+          if (!outcome.passed) {
+            // Task 3.3 — critique delivery (FR-007/FR-008; spike 1.2). A
+            // minor invariants failure that stayed in the trace still gets
+            // its steering critique. An absent severity defaults to minor
+            // (design D3, fail-open conservatism: the bounded steer, never
+            // the interrupt).
+            await deliverCritique({
+              sessionID: part.sessionID,
+              critique: outcome.critique,
+              severity: outcome.severity ?? 'minor',
+              config,
+              state,
+            });
+          }
+        })();
+        state.pendingAudits.add(continuation);
+        try {
+          // Fire-and-forget contract (spike 1.3) preserved: the outer
+          // catch observes any rejection; a waiting tool call observes
+          // it through `waitForPendingAudits` (logged once there).
+          await continuation;
+        } finally {
+          state.pendingAudits.delete(continuation);
         }
       } catch (error) {
         logger.error(`event hook failed: ${errorText(error)}`);
@@ -1569,22 +1654,69 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
             logger.info(`directive '${id}' triggered by tool '${hookInput.tool}'`);
           }
         }
-        verification = verifyToolIntent(
-          { name: hookInput.tool, arguments: output.args },
-          // FR-010 path ledger: the guard matches against recorded step
-          // text. Entries map to text here — a minor-failed entry keeps
-          // its file reasoning visible to the guard (FR-063) — keeping
-          // verifyToolIntent's pure-module signature on plain strings.
-          state.verifiedSteps.map((entry) => entry.text),
-          await buildConfig(),
-          enforcement,
-          // FR-065 (design D7): the plugin's own console tools skip the
-          // file-path trace check. Derived from the registered tool map —
-          // the same source the gate exemption below uses — so a future
-          // console tool is exempt automatically; the reward-hacking
-          // check inside the guard still applies to them.
-          new Set(hooks.tool !== undefined ? Object.keys(hooks.tool) : [])
-        );
+        // FR-067 (design D8): config and the console-tool set resolve
+        // once per call; `runGuard` re-runs the pure check against the
+        // live trace after a settled wait without re-resolving config.
+        const guardConfig = await buildConfig();
+        const consoleTools = new Set(hooks.tool !== undefined ? Object.keys(hooks.tool) : []);
+        const runGuard = () =>
+          verifyToolIntent(
+            { name: hookInput.tool, arguments: output.args },
+            // FR-010 path ledger: the guard matches against recorded step
+            // text. Entries map to text here — a minor-failed entry keeps
+            // its file reasoning visible to the guard (FR-063) — keeping
+            // verifyToolIntent's pure-module signature on plain strings.
+            state.verifiedSteps.map((entry) => entry.text),
+            guardConfig,
+            enforcement,
+            // FR-065 (design D7): the plugin's own console tools skip the
+            // file-path trace check. Derived from the registered tool map —
+            // the same source the gate exemption below uses — so a future
+            // console tool is exempt automatically; the reward-hacking
+            // check inside the guard still applies to them.
+            consoleTools
+          );
+        verification = runGuard();
+        // FR-067 (design D8): await-on-miss. A trace block with an
+        // in-flight audit continuation means the reasoning that would
+        // reference these paths may not have settled when the call
+        // arrived (same-turn interleave). One bounded wait per call
+        // (`traceAwaitState.timeoutMs`); a settled wait re-runs the
+        // guard against the settled trace, and a rejected continuation
+        // still counts as settled. Reward-hacking and directive blocks
+        // never charge the wait (their causes are not trace races), and
+        // the empty-trace allow (FR-011) never waits. A timed-out wait
+        // fails open — the live agent's progress outranks one
+        // unverified call — bounded per session by
+        // `maxTimeoutFailOpens`; past the cap it blocks, naming the
+        // still-unsettled audit so the model can wait and retry.
+        if (
+          !verification.allowed &&
+          verification.blockedCheck === 'trace' &&
+          state.pendingAudits.size > 0
+        ) {
+          const wait = await waitForPendingAudits(state.pendingAudits);
+          if (wait === 'settled') {
+            verification = runGuard();
+          } else {
+            state.timeoutFailOpens += 1;
+            if (state.timeoutFailOpens > guardConfig.maxTimeoutFailOpens) {
+              verification = {
+                allowed: false,
+                reason: `Tool '${hookInput.tool}' blocked by the file-path trace check: an earlier reasoning audit is still unsettled after ${traceAwaitState.timeoutMs} ms and the session's timeout fail-open cap (${guardConfig.maxTimeoutFailOpens}) is reached. Wait for the audit to settle, then retry.`,
+                blockedCheck: 'trace',
+              };
+            } else {
+              logger.warn(
+                `trace-check wait timed out; failing open (${state.timeoutFailOpens}/${guardConfig.maxTimeoutFailOpens}): tool '${hookInput.tool}'`
+              );
+              verification = {
+                allowed: true,
+                reason: 'Trace-check wait timed out; the call failed open within the per-session cap.',
+              };
+            }
+          }
+        }
         // Directive gates (FR-043..FR-047; design D2): evaluated
         // only when the guard allows, so a forbidden path never
         // reaches the gate question. The approvals file is

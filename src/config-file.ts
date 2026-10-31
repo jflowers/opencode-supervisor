@@ -34,6 +34,8 @@ export interface SupervisorFileConfig {
   requireStepReferenceInTools?: boolean;
   memoLimits?: Partial<MemoLimits>;
   maxOnDemandAudits?: number;
+  /** Per-session cap on trace-check timeout fail-opens (FR-067). */
+  maxTimeoutFailOpens?: number;
 }
 
 /** Parse outcome: the accepted subset, or an error when rejected. */
@@ -151,9 +153,10 @@ export const validateSupervisorConfig = (value: unknown): ParsedSupervisorConfig
     config.stripMode = stripModeRaw as StripMode;
   }
 
-  const numeric: readonly ('maxRegenerations' | 'maxOnDemandAudits')[] = [
+  const numeric: readonly ('maxRegenerations' | 'maxOnDemandAudits' | 'maxTimeoutFailOpens')[] = [
     'maxRegenerations',
     'maxOnDemandAudits',
+    'maxTimeoutFailOpens',
   ];
   for (const key of numeric) {
     const parsed = optionalNumber(value, key);
