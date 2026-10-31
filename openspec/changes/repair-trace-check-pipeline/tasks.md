@@ -238,7 +238,7 @@ FR-065)
   2.4.0/2.5.0 convention, with the release date and
   references to issues #35, #36, #33, and #34. Verify: the
   PLUGIN_VERSION lockstep test is green.
-- [ ] 6.3 File the documentation issue for this user-facing
+- [x] 6.3 File the documentation issue for this user-facing
   change (the AGENTS.md docs gate) with
   `--label "documentation"`, referencing #35, #36, #33, and
   #34; file-or-verify the paired unbound-force/website
