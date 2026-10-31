@@ -1,13 +1,13 @@
 {
   "name": "opencode-supervisor",
-  "version": "2.6.0",
+  "version": "2.7.0",
   "description": "Agent supervision middleware for OpenCode: a reasoning-audit loop, session memo, tool guard, and consoles for agent self-serve tools and engineer directives.",
   "main": "index.ts",
   "module": "index.ts",
   "type": "module",
   "scripts": {
     "test": "bun test",
-    "test:node": "node --test test/audit.test.ts test/memo.test.ts test/reminders.test.ts test/directives.test.ts test/console.test.ts test/gates.test.ts test/plugin-log.test.ts test/config-file.test.ts"
+    "test:node": "node --test test/audit.test.ts test/memo.test.ts test/reminders.test.ts test/directives.test.ts test/console.test.ts test/gates.test.ts test/plugin-log.test.ts test/config-file.test.ts test/arg-repair.test.ts"
   },
   "keywords": [
     "opencode",

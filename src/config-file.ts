@@ -11,6 +11,7 @@
  * parsing and validation are pure here.
  */
 
+import { SUPERVISOR_MODES, type ArgRepairConfig, type SupervisorMode } from './arg-repair.ts';
 import type { AuditorVariant } from './auditor.ts';
 import type { MemoLimits } from './memo.ts';
 import type { StripMode } from './stripper.ts';
@@ -36,6 +37,10 @@ export interface SupervisorFileConfig {
   maxOnDemandAudits?: number;
   /** Per-session cap on trace-check timeout fail-opens (FR-067). */
   maxTimeoutFailOpens?: number;
+  /** Supervisor mode: 'full' (default) or 'repair-only' (repair only, no other features). */
+  mode?: SupervisorMode;
+  /** Tool-argument repair overrides; unset keys fall through to the next tier. */
+  argRepair?: Partial<ArgRepairConfig>;
 }
 
 /** Parse outcome: the accepted subset, or an error when rejected. */
@@ -153,6 +158,14 @@ export const validateSupervisorConfig = (value: unknown): ParsedSupervisorConfig
     config.stripMode = stripModeRaw as StripMode;
   }
 
+  const modeRaw = value.mode;
+  if (modeRaw !== undefined) {
+    if (typeof modeRaw !== 'string' || !SUPERVISOR_MODES.includes(modeRaw as SupervisorMode)) {
+      return reject(`"mode" must be one of ${SUPERVISOR_MODES.join(', ')}`);
+    }
+    config.mode = modeRaw as SupervisorMode;
+  }
+
   const numeric: readonly ('maxRegenerations' | 'maxOnDemandAudits' | 'maxTimeoutFailOpens')[] = [
     'maxRegenerations',
     'maxOnDemandAudits',
@@ -194,6 +207,44 @@ export const validateSupervisorConfig = (value: unknown): ParsedSupervisorConfig
       }
     }
     config.memoLimits = limits;
+  }
+
+  const argRepairRaw = value.argRepair;
+  if (argRepairRaw !== undefined) {
+    if (!isRecord(argRepairRaw)) {
+      return reject('"argRepair" must be an object');
+    }
+    const argRepair: Partial<ArgRepairConfig> = {};
+    const enabled = optionalBoolean(argRepairRaw, 'enabled');
+    if (enabled.error !== null) return reject(enabled.error);
+    if (enabled.value !== undefined) argRepair.enabled = enabled.value;
+    const repairModel = optionalString(argRepairRaw, 'model');
+    if (repairModel.error !== null) return reject(repairModel.error);
+    if (repairModel.value !== undefined) {
+      const trimmed = repairModel.value.trim();
+      const slash = trimmed.indexOf('/');
+      if (slash <= 0 || slash === trimmed.length - 1) {
+        return reject('"argRepair.model" must be a provider/model slug (e.g. "provider/model")');
+      }
+      argRepair.model = trimmed;
+    }
+    const toolsRaw = argRepairRaw.tools;
+    if (toolsRaw !== undefined) {
+      if (
+        !Array.isArray(toolsRaw) ||
+        toolsRaw.some((entry) => typeof entry !== 'string' || entry.trim().length === 0)
+      ) {
+        return reject('"argRepair.tools" must be an array of non-empty tool names');
+      }
+      argRepair.tools = toolsRaw.map((entry) => (entry as string).trim());
+    }
+    const maxPerSession = optionalNumber(argRepairRaw, 'maxPerSession');
+    if (maxPerSession.error !== null) return reject('"argRepair.maxPerSession" must be a non-negative integer');
+    if (maxPerSession.value !== undefined) argRepair.maxPerSession = maxPerSession.value;
+    const timeoutMs = optionalNumber(argRepairRaw, 'timeoutMs');
+    if (timeoutMs.error !== null) return reject('"argRepair.timeoutMs" must be a non-negative integer');
+    if (timeoutMs.value !== undefined) argRepair.timeoutMs = timeoutMs.value;
+    config.argRepair = argRepair;
   }
 
   return { config, error: null };
