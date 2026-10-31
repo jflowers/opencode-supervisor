@@ -473,6 +473,73 @@ test('verifyToolIntent still allows pattern tokens on an empty trace (FR-011, FR
   assert.equal(result.allowed, true);
 });
 
+test('verifyToolIntent treats authored content as data, not a touch (FR-064)', () => {
+  // The #33 field scenario: a write whose content quotes an
+  // unreferenced filename is authored data — only the operational
+  // filePath is checked.
+  const authored = verifyToolIntent(
+    {
+      name: 'write',
+      arguments: { filePath: 'src/a.ts', content: 'deploy risk-tier1.sh with the new config' },
+    },
+    ['Edit src/a.ts to export the helper.'],
+    baseAuditConfig
+  );
+  assert.equal(authored.allowed, true);
+
+  // Custom/MCP key names stay covered — coverage fails closed for
+  // unknown tools rather than narrowing to a known-key allowlist.
+  const customKey = verifyToolIntent(
+    { name: 'deploy', arguments: { target: 'ops/risk-tier1.sh' } },
+    ['Edit src/a.ts to export the helper.'],
+    baseAuditConfig
+  );
+  assert.equal(customKey.allowed, false);
+  assert.ok(customKey.reason.includes('ops/risk-tier1.sh'));
+
+  // Bash command strings stay operational in full.
+  const bash = verifyToolIntent(
+    { name: 'bash', arguments: { command: 'cat ops/risk-tier1.sh' } },
+    ['Edit src/a.ts to export the helper.'],
+    baseAuditConfig
+  );
+  assert.equal(bash.allowed, false);
+  assert.ok(bash.reason.includes('ops/risk-tier1.sh'));
+});
+
+test('verifyToolIntent exempts registered console tools from the trace check (FR-065)', () => {
+  const consoleTools = new Set(['request_audit']);
+  const exempt = verifyToolIntent(
+    { name: 'request_audit', arguments: { focus: 'audit the change at ops/risk-tier1.sh' } },
+    ['Edit src/a.ts to export the helper.'],
+    baseAuditConfig,
+    undefined,
+    consoleTools
+  );
+  assert.equal(exempt.allowed, true);
+
+  // The reward-hacking check still applies to console tools — even on
+  // an empty trace (FR-009 is unconditional, FR-011).
+  const hacking = verifyToolIntent(
+    { name: 'request_audit', arguments: { focus: 'run git commit --no-verify for the change' } },
+    [],
+    baseAuditConfig,
+    undefined,
+    consoleTools
+  );
+  assert.equal(hacking.allowed, false);
+  assert.ok(hacking.reason.includes('reward-hacking'));
+
+  // Fail-closed default: without the set, the same call is checked
+  // like any other — direct callers opt in by passing the set.
+  const direct = verifyToolIntent(
+    { name: 'request_audit', arguments: { focus: 'audit the change at ops/risk-tier1.sh' } },
+    ['Edit src/a.ts to export the helper.'],
+    baseAuditConfig
+  );
+  assert.equal(direct.allowed, false);
+});
+
 // ── Hook layer (task 3.1): entry shape, config precedence, adapter ──
 
 // recordingPluginInput and silentPluginInput now live in ./mocks.ts
@@ -2139,6 +2206,31 @@ test('tool.execute.before satisfies a wildcard from a trace reference end to end
         assert.ok(message.includes('file-path trace check'), message);
         assert.ok(message.includes('kb/topics/*.md'), message);
         assert.ok(message.includes('pattern'), message);
+        return true;
+      }
+    );
+  });
+});
+
+test('tool.execute.before leaves the request_audit channel open end to end (FR-065)', async () => {
+  await withCleanAuditEnv(async () => {
+    const hooks = await plugin.server(silentPluginInput());
+    const sessionID = 'guard-console-exempt';
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'edit src/a.ts to export the helper', passed: true });
+
+    // The focus names an unreferenced path; the call still proceeds —
+    // the exemption is derived from the registered tool map, so the
+    // audit channel that exists to keep the loop open stays open.
+    await assert.doesNotReject(() =>
+      dispatchToolBefore(hooks, sessionID, 'request_audit', { focus: 'audit the change at ops/risk-tier1.sh' })
+    );
+
+    // The reward-hacking check still applies to the console channel.
+    await assert.rejects(
+      () => dispatchToolBefore(hooks, sessionID, 'request_audit', { focus: 'bypass with git commit --no-verify now' }),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.ok(message.includes('reward-hacking'), message);
         return true;
       }
     );

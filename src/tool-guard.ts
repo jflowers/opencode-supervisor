@@ -67,6 +67,25 @@ export function extractArgPaths(args: Record<string, unknown> | undefined): stri
 }
 
 /**
+ * Argument keys that carry document content rather than an
+ * operational target (FR-061, FR-064). Values under these keys are
+ * data the agent is writing — a mention there is not a touch — so
+ * both the protected-state check and the trace check skip them for
+ * non-bash tools (design D6: the round-4 lens). Every other key,
+ * including custom/MCP key names like `target`, IS scanned:
+ * coverage fails closed for unknown tools rather than narrowing to
+ * a known-key allowlist (review round 4: an operational-key
+ * allowlist had let a custom tool touch the approvals file
+ * unblocked). The set does not grow per tool — `focus` and `text`
+ * stay out; a per-tool except-list would open custom-tool evasion.
+ * Payload keys beyond this blocklist (`text`, `body`, `document`,
+ * `patch`, `diff`, `edits`, `data`) are still scanned for non-bash
+ * tools and can false-positive — fail closed, the round-5 residual
+ * class, accepted.
+ */
+const CONTENT_ARG_KEYS = ['content', 'oldString', 'newString'];
+
+/**
  * Compiles a pattern token into an anchored full-path regular
  * expression (FR-066, design D4/D5): `$name` spans translate to a
  * within-segment wildcard first — the runtime value is unknown, and
@@ -85,16 +104,24 @@ const globPathToRegExp = (token: string): RegExp => {
 };
 
 /**
- * Finds the first file path in the tool arguments that is absent from the
- * verified trace (FR-010, FR-066). A concrete token counts as referenced
- * when the trace contains either the full token or its basename,
- * case-insensitively. A pattern token (glob metacharacters or `$var`
- * spans — its runtime expansion is unknown) counts as referenced when
- * the trace contains the pattern verbatim (the model reasoned in the
- * same spelling) or names a path the compiled pattern matches; the
- * trace side extracts tokens with the same grammar (design D3), so
- * "reason about X" and "the guard checks X" recognize the same X.
+ * Finds the first operational file path in the tool arguments that is
+ * absent from the verified trace (FR-010, FR-064, FR-066). The lens
+ * (design D6) matches the round-4 protected-state idiom: for tools
+ * other than bash, values under the content keys (`content`,
+ * `oldString`, `newString`) are authored data — a filename quoted
+ * there is a mention, not a touch — while every other key, including
+ * unknown and custom names like `target`, stays scanned (coverage
+ * fails closed); bash command strings remain operational in full.
+ * A concrete token counts as referenced when the trace contains either
+ * the full token or its basename, case-insensitively. A pattern token
+ * (glob metacharacters or `$var` spans — its runtime expansion is
+ * unknown) counts as referenced when the trace contains the pattern
+ * verbatim (the model reasoned in the same spelling) or names a path
+ * the compiled pattern matches; the trace side extracts tokens with
+ * the same grammar (design D3), so "reason about X" and "the guard
+ * checks X" recognize the same X.
  *
+ * @param toolName The tool being invoked (bash gets the raw lens).
  * @param args The tool call's arguments; only top-level string values carry paths.
  * @param verifiedSteps The session's verified reasoning trace (non-empty).
  * @returns The unmatched token — a pattern names itself, never a phantom
@@ -102,11 +129,17 @@ const globPathToRegExp = (token: string): RegExp => {
  *   every token is referenced.
  */
 function findUnreferencedPath(
+  toolName: string,
   args: Record<string, unknown> | undefined,
   verifiedSteps: string[]
 ): string | null {
   const combinedSteps = verifiedSteps.join(' ').toLowerCase();
-  const argPaths = extractArgPaths(args);
+  // FR-064 lens: authored content is data, never an operational touch.
+  const lensedArgs =
+    toolName === 'bash'
+      ? args
+      : Object.fromEntries(Object.entries(args ?? {}).filter(([key]) => !CONTENT_ARG_KEYS.includes(key)));
+  const argPaths = extractArgPaths(lensedArgs);
   // Trace-side tokens, extracted lazily: only pattern satisfaction
   // needs them, and most calls carry none.
   let traceTokens: string[] | null = null;
@@ -146,13 +179,19 @@ function findUnreferencedPath(
  * @param verifiedSteps Reasoning steps that passed audit (the session's verified trace).
  * @param config Flags gating the reward-hacking and trace checks.
  * @param enforcement Compiled engineer-directive rules (FR-028); absent or empty never blocks.
+ * @param consoleTools Names of the plugin's own registered console tools (FR-065, design
+ *   D7); these skip the file-path trace check — the channel that exists to keep the
+ *   supervision loop open — while the reward-hacking check above still applies to them.
+ *   Default none: fail-closed for direct callers, who pass the set derived from the
+ *   registered tool map.
  * @returns The verdict; `reason` is the model's corrective signal when blocked.
  */
 export function verifyToolIntent(
   toolCall: { name: string; arguments?: Record<string, unknown> },
   verifiedSteps: string[],
   config: Pick<AuditConfig, 'blockRewardHacking' | 'requireStepReferenceInTools'>,
-  enforcement?: CompiledEnforcement
+  enforcement?: CompiledEnforcement,
+  consoleTools?: ReadonlySet<string>
 ): ToolVerificationResult {
   const rawArgs = JSON.stringify(toolCall.arguments || {});
   const lowerArgs = rawArgs.toLowerCase();
@@ -187,6 +226,19 @@ export function verifyToolIntent(
   }
 
   if (config.requireStepReferenceInTools) {
+    // FR-065 (design D7): the plugin's own console tools skip the
+    // file-path trace check — the review gate's corrective instruction
+    // points at request_audit, so blocking that call on its own focus
+    // text would fence the channel that exists to keep the loop open.
+    // Derived from the registered tool map by the caller, so a future
+    // console tool is exempt automatically. The reward-hacking check
+    // above still applies unconditionally.
+    if (consoleTools !== undefined && consoleTools.has(toolCall.name)) {
+      return {
+        allowed: true,
+        reason: 'Console tool exempt from the file-path trace check; reward-hacking checks still applied.',
+      };
+    }
     // FR-011 / design D5: an empty trace means no audited reasoning exists
     // yet (first call, auditor unavailable, audit still in flight) — the
     // path check MUST NOT block; only the reward-hacking check above applies.
@@ -197,7 +249,7 @@ export function verifyToolIntent(
       };
     }
 
-    const unmatchedPath = findUnreferencedPath(toolCall.arguments, verifiedSteps);
+    const unmatchedPath = findUnreferencedPath(toolCall.name, toolCall.arguments, verifiedSteps);
     if (unmatchedPath) {
       // FR-012 / FR-066: the reason names the token as it was spelled.
       // A pattern token names itself — never a phantom expansion like
@@ -313,18 +365,6 @@ const globSegmentToRegExp = (segment: string): RegExp => {
   }
   return new RegExp(`^${pattern}$`);
 };
-
-/**
- * Argument keys that carry document content rather than an
- * operational target (FR-061). Values under these keys are data
- * the agent is writing — a mention there is not a touch — so the
- * non-bash path lens skips them. Every other key, including
- * custom/MCP key names like `target`, IS scanned: coverage fails
- * closed for unknown tools rather than narrowing to a known-key
- * allowlist (review round 4: an operational-key allowlist had let
- * a custom tool touch the approvals file unblocked).
- */
-const CONTENT_ARG_KEYS = ['content', 'oldString', 'newString'];
 
 /**
  * Protected-state check (FR-061): returns the block reason when
