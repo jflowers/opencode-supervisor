@@ -36,9 +36,11 @@ as one change.
 - Changed (#35, #34): a minor deterministic invariant failure
   (arithmetic, off-by-one) delivers its bounded critique but no
   longer evicts the whole reasoning part from the verified trace;
-  severe findings (reward hacking) and peer-audit failures still
-  evict. A misstated tally no longer vanishes every path mention
-  in the same part.
+  the recorded step carries its outcome, so passed-only
+  consumers (review gates, `request_audit`) keep their
+  semantics. Severe findings (reward hacking) and peer-audit
+  failures still evict. A misstated tally no longer vanishes
+  every path mention in the same part.
 - Fixed (#36): the path tokenizer gains a trailing boundary
   (`.js` no longer matches inside `.json`) and treats
   wildcard-bearing and `$var`-bearing operational tokens as
@@ -58,11 +60,15 @@ as one change.
   When a call would block on the trace check and audits are still
   settling, the guard waits a bounded time (10 seconds) and
   re-checks before blocking; on timeout it fails open and logs
-  (FR-005 posture). Path-bearing prose survives narrative
+  (FR-005 posture), up to a per-session cap past which it
+  blocks naming the still-unsettled audit. Path-bearing prose
+  survives narrative
   stripping in `code_and_math` and `balanced` modes, so the
   corrective instruction ("reason about the file in verified
   steps, then retry") is followable under the default config.
-- Changed: version 2.5.1 (repair release).
+- Changed: version 2.6.0 (MINOR): the no-evict trace-semantics
+  change is a behavior change, not a defect repair, and every
+  Changed-bearing release shipped MINOR (design D11).
 
 ## Capabilities
 
@@ -88,12 +94,27 @@ as one change.
   fix-supervisor-logging and agent-reminders precedent — a
   MODIFIED delta would target a main spec that does not exist
   until `audit-supervisor` archives.
-- `reasoning-audit` (FR-002, FR-003, FR-006, pending in the
-  `audit-supervisor` change): the arithmetic invariant evaluates
-  full chains, minor deterministic failures no longer evict
-  steps from the verified trace, and path-bearing steps survive
-  stripping in `code_and_math`/`balanced`. Carried in the
+- `reasoning-audit` (FR-001, FR-002, FR-003, FR-006, pending
+  in the `audit-supervisor` change): the arithmetic invariant
+  evaluates full chains, minor deterministic failures no longer
+  evict steps from the verified trace, and path-bearing steps
+  survive stripping in `code_and_math`/`balanced`. Reconciled
+  with FR-001: a minor-failed step is audited and critiqued
+  but still enters the reference ledger. Carried in the
   `trace-check` delta for the same reason.
+- `directive-gates` (the review-gate trace requirement,
+  pending in the `directive-gates` change): the verified trace
+  gains outcome-carrying entries, and the review gate's
+  passed-step release condition is preserved by construction —
+  `evaluateReviewGates` matches only passed entries, so a
+  minor-failed step never releases an engineer-authored
+  review gate (FR-063). Reconciled at `directive-gates`
+  archive time (design D10).
+- `supervisor-tools` (FR-037/FR-038, archived main spec):
+  `request_audit`'s trace recording stays passed-only — a
+  failed focus does not append, so FR-037's "Passed focus
+  enters the verified trace" scenario remains true verbatim;
+  only the trace's internal entry shape changes (FR-063).
 
 ## Impact
 
@@ -108,15 +129,25 @@ as one change.
   matching); `src/stripper.ts` (path-token survival);
   `index.ts` (in-flight audit tracking, await-on-miss guard
   coordination, no-evict recording, console-tool set wiring);
-  `package.json` and `PLUGIN_VERSION` (2.5.1).
+  `src/config-file.ts` (the `maxTimeoutFailOpens` numeric
+  key, so the project and global file tiers resolve the
+  timeout cap); `package.json` and `PLUGIN_VERSION` (2.6.0).
 - **Tests**: `test/audit.test.ts` carries the regression
   material (chained sums, glob and `$var` tokens, content-key
-  lens, console-tool exemption, delayed-audit race); existing
-  fixtures asserting whole-part eviction on arithmetic failures
-  update to the no-evict contract.
-- **Docs**: `README.md` (§4.2 the tool guard, §7.1 stripMode,
-  §9 limitations), `CHANGELOG.md` (2.5.1), `AGENTS.md`
-  (architecture bullets for the trace pipeline).
+  lens, console-tool exemption, delayed-audit race);
+  `test/config-file.test.ts` covers the `maxTimeoutFailOpens`
+  file-tier key; existing fixtures asserting whole-part
+  eviction on arithmetic failures — and the sibling suites
+  asserting the trace's string-array shape (`console`,
+  `config-file`, `reminders`, `directives`) — update to the
+  no-evict, entry-shape contract.
+- **Docs**: `README.md` (§4.1 the supervision loop, §4.2 the
+  tool guard, §4.4 hook-map rows, §7 knob table's
+  `maxTimeoutFailOpens` row, §7.1 stripMode, §9 limitations),
+  `CHANGELOG.md` (2.6.0), `AGENTS.md`
+  (architecture bullets for the trace pipeline, the Project
+  Structure tree entry for `src/path-tokens.ts`, and the
+  session-state bullet's `pendingAudits` field).
 - **Users**: default-config sessions stop receiving misquoted
   arithmetic findings; writes whose content quotes filenames, and
   calls like `request_audit` that name one in passing, stop
@@ -127,5 +158,8 @@ as one change.
 - **Out of scope**: reward-hacking markers inside console-tool
   payloads (FR-009 stays unconditional), heredoc-aware bash
   parsing, shell-variable resolution, memo critique re-delivery
-  (follows automatically once findings are accurate), and a
-  config knob for the await bound.
+  (follows automatically once findings are accurate), a config
+  knob for the await bound, and syncing
+  `skills/reasoning-auditor/skill.md` (unaffected: the
+  standalone skill keeps no trace ledger and no tool guard, so
+  trace-semantics changes do not map to it).

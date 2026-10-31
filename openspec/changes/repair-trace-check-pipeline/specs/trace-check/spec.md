@@ -7,7 +7,7 @@ reasoning trace contains, which tool-call arguments the trace
 check scans, how those arguments are tokenized and matched
 against the trace, and when the check reads the trace. Refines
 the pending tool-guard (FR-010..FR-012) and reasoning-audit
-(FR-002, FR-003, FR-006) contracts.
+(FR-001, FR-002, FR-003, FR-006) contracts.
 
 ## ADDED Requirements
 
@@ -22,7 +22,8 @@ The critique SHALL quote the full matched expression verbatim.
 
 #### Scenario: Correct chained sums pass
 
-- **WHEN** a reasoning step states any of the field chains
+- **GIVEN** a completed reasoning step is under audit
+- **WHEN** the step states any of the field chains
   `38+16+2=56`, `1+1+3+2+2+2+9 = 20`, `456+139+62=657`,
   `133+3+521=657`, or `31+3+623=657`
 - **THEN** the step passes the arithmetic invariant and no
@@ -30,21 +31,24 @@ The critique SHALL quote the full matched expression verbatim.
 
 #### Scenario: Standalone errors still fail
 
-- **WHEN** a reasoning step states `16 + 2 = 56` or `2 * 3 = 8`
+- **GIVEN** a completed reasoning step is under audit
+- **WHEN** the step states `16 + 2 = 56` or `2 * 3 = 8`
 - **THEN** the arithmetic invariant fails the step
 
 #### Scenario: Mixed precedence evaluates correctly
 
-- **WHEN** a reasoning step states `2+3*4=14`
+- **GIVEN** a completed reasoning step is under audit
+- **WHEN** the step states `2+3*4=14`
 - **THEN** the step passes, because 3*4 binds before the
   addition
-- **WHEN** a reasoning step states `2+3*4=20`
+- **WHEN** the step states `2+3*4=20`
 - **THEN** the step fails, because the expression evaluates
   to 14
 
 #### Scenario: The critique quotes the whole expression
 
-- **WHEN** a chained sum fails the invariant
+- **GIVEN** a reasoning step states an incorrect chained sum
+- **WHEN** the arithmetic invariant fails the step
 - **THEN** the critique quotes the complete stated expression
   verbatim, so a flagged claim is self-describing rather than
   a misread fragment
@@ -54,9 +58,12 @@ The critique SHALL quote the full matched expression verbatim.
 When a deterministic invariant fails with minor severity (an
 arithmetic misstatement or an off-by-one bound), the system
 SHALL deliver the bounded critique and SHALL still record the
-reasoning step in the verified trace. Severe deterministic
-findings (reward hacking) and peer-audit failures SHALL still
-evict the whole step from the trace.
+step in the verified trace, as an entry carrying its outcome.
+The directive-gates review gate SHALL release only on passed
+steps, and `request_audit` recording SHALL stay passed-only
+(FR-037). Severe deterministic findings (reward hacking) and
+peer-audit failures SHALL still evict the whole step from
+the trace.
 
 #### Scenario: A misstated tally no longer vanishes path mentions
 
@@ -89,6 +96,23 @@ evict the whole step from the trace.
 - **WHEN** the peer-audit model returns a failed verdict for
   the step
 - **THEN** the step stays out of the verified trace
+
+#### Scenario: A minor-failed step never releases a review gate
+
+- **GIVEN** a review gate holds a path and the verified trace
+  holds a minor-failed entry referencing it, with no passed
+  entry referencing it
+- **WHEN** a tool call touches that gated path
+- **THEN** the call is blocked: the review gate counts only
+  passed steps
+
+#### Scenario: A failed on-demand focus does not append
+
+- **GIVEN** the agent calls `request_audit` and the focus
+  fails a minor deterministic invariant
+- **WHEN** the audit completes
+- **THEN** the critique is returned in the tool result and the
+  focus is not appended to the verified trace
 
 ### Requirement: FR-064 The trace check scans operational arguments
 
@@ -147,6 +171,8 @@ check SHALL still apply to console tools.
 
 #### Scenario: A future console tool is exempt automatically
 
+- **GIVEN** the exemption is derived from the registered tool
+  map
 - **WHEN** a new tool is added to the plugin's registered tool
   map
 - **THEN** calls to it are exempt from the trace check without
@@ -182,6 +208,8 @@ SHALL name only tokens that exist.
 
 #### Scenario: Shell variables create no phantom demand
 
+- **GIVEN** the trace check tokenizes a call's operational
+  arguments
 - **WHEN** a bash argument contains `"$bdir/$id.md"`
 - **THEN** the check never demands `id.md` from the trace; the
   token is matched as a pattern
@@ -195,6 +223,8 @@ SHALL name only tokens that exist.
 
 #### Scenario: Extension matching carries a trailing boundary
 
+- **GIVEN** the trace check tokenizes a call's operational
+  arguments
 - **WHEN** a tool argument contains `config.json`
 - **THEN** the tokenizer produces `config.json` and not the
   prefix `config.js`
@@ -208,13 +238,17 @@ SHALL name only tokens that exist.
 
 ### Requirement: FR-067 Bounded wait for in-flight audits
 
-When a tool call would block on the trace check and audits of
-the session's reasoning are still in flight, the guard SHALL
-wait for them, bounded by a fixed timeout, and re-evaluate the
-check against the settled trace before blocking. On timeout the
-call SHALL be allowed and the delay logged (fail-open,
-FR-005). A path genuinely absent from settled, verified
-reasoning SHALL still block.
+When a tool call would block on the trace check while audits
+of the session's reasoning are still in flight, the guard
+SHALL wait, bounded by a fixed timeout, then re-evaluate the
+check against the settled trace. A rejected continuation
+SHALL count as settled, logged once and never thrown into
+the hook. On timeout the call SHALL be allowed and the delay
+logged (fail-open, FR-005), up to a per-session bound; past
+that bound a timed-out wait SHALL block naming the
+still-unsettled audit. Every timeout SHALL be logged. A path
+genuinely absent from settled, verified reasoning SHALL
+still block.
 
 #### Scenario: Same-turn reasoning arrives before the verdict
 
@@ -229,7 +263,8 @@ reasoning SHALL still block.
 
 #### Scenario: Timeout fails open
 
-- **GIVEN** an audit that does not settle within the bound
+- **GIVEN** an audit that does not settle within the bound and
+  the session is below its timeout fail-open bound
 - **WHEN** a call would block on the trace check
 - **THEN** the call is allowed and one warning naming the
   delay is logged
@@ -248,6 +283,24 @@ reasoning SHALL still block.
 - **THEN** the empty-trace allow applies (FR-011) and the
   guard imposes no wait
 
+#### Scenario: A rejected continuation settles the wait
+
+- **GIVEN** an in-flight audit continuation rejects while a
+  call is waiting on the trace check
+- **WHEN** the rejection lands
+- **THEN** the wait settles, the rejection is logged once, and
+  the guard re-evaluates against the live trace without
+  throwing into the hook
+
+#### Scenario: Repeated timeouts stop failing open
+
+- **GIVEN** the session has already failed open on timeouts up
+  to its per-session bound
+- **WHEN** another wait times out with the audit still
+  unsettled
+- **THEN** the call is blocked with a reason naming the
+  still-unsettled audit, and the timeout is logged
+
 ### Requirement: FR-068 Path-bearing steps survive narrative stripping
 
 In `code_and_math` and `balanced` strip modes, a reasoning step
@@ -259,19 +312,23 @@ survive.
 
 #### Scenario: Prose path mentions survive the default mode
 
+- **GIVEN** the strip mode is `code_and_math`
 - **WHEN** a step is plain prose mentioning `notes.md` with no
-  code ticks or operators and the mode is `code_and_math`
+  code ticks or operators
 - **THEN** the step survives stripping and is audited
 
 #### Scenario: Balanced mode keeps the same survival
 
-- **WHEN** the same step is processed with the mode
-  `balanced`
+- **GIVEN** the strip mode is `balanced`
+- **WHEN** the same prose step mentioning `notes.md` is
+  processed
 - **THEN** the step survives stripping and is audited
 
 #### Scenario: Strict mode is unchanged
 
-- **WHEN** the same step is processed with the mode `strict`
+- **GIVEN** the strip mode is `strict`
+- **WHEN** the same prose step mentioning `notes.md` is
+  processed
 - **THEN** the step is dropped, as before
 
 #### Scenario: The corrective instruction becomes followable
