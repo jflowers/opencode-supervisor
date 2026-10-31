@@ -5,6 +5,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The arithmetic invariant now evaluates an equation's full operand
+  chain instead of only its last binary pair. `38+16+2=56` was
+  checked as `16+2=56`, so every correct chained sum failed the
+  audit and the entire reasoning part — with it, every file path
+  the part mentioned — vanished from the verified trace. Chains
+  evaluate with standard operator precedence (`2+3*4=14` passes,
+  `2+3*4=20` fails), division by zero still declines to judge, and
+  the critique quotes the whole stated expression. A step that
+  fails a minor deterministic invariant now stays in the verified
+  trace marked unpassed while its critique still steers — the
+  trace is a path ledger, and one misstated tally no longer
+  revokes the part's file reasoning; severe findings and
+  peer-audit failures still evict, and review gates match only
+  passed entries (#35; `openspec/changes/repair-trace-check-pipeline`).
+
 ## [2.5.0] - 2026-10-30
 
 ### Fixed

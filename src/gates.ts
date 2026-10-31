@@ -10,6 +10,7 @@
  * decisions.
  */
 
+import type { VerifiedTraceEntry } from './auditor.ts';
 import { globToRegExp, type Directive } from './directives.ts';
 
 /**
@@ -283,13 +284,15 @@ export function evaluateApproveGate(
  * semantics as the FR-011 trace check). An empty trace
  * blocks: the gate is explicit engineer policy, and the
  * request_audit tool gives the agent a constructive path to
- * populate the trace.
+ * populate the trace. Entries carrying `passed: false`
+ * (FR-063 no-evict recording) do not release a gate: only
+ * a step the audit passed counts as verified reasoning.
  */
 export function evaluateReviewGates(
   gates: CompiledReviewGate[],
   toolName: string,
   argPaths: string[],
-  verifiedSteps: string[]
+  verifiedSteps: VerifiedTraceEntry[]
 ): GateDecision {
   let combinedSteps: string | null = null;
   for (const gate of gates) {
@@ -299,7 +302,11 @@ export function evaluateReviewGates(
       const touched = gate.regex.test(argPath) || gate.regex.test(base);
       if (!touched) continue;
       if (combinedSteps === null) {
-        combinedSteps = verifiedSteps.join(' ').toLowerCase();
+        combinedSteps = verifiedSteps
+          .filter((entry) => entry.passed)
+          .map((entry) => entry.text)
+          .join(' ')
+          .toLowerCase();
       }
       const referenced =
         combinedSteps.includes(base) ||

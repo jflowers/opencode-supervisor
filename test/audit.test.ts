@@ -8,6 +8,7 @@ import plugin, { createInvokeModel, PLUGIN_VERSION, resolveHookConfig, sessionSt
 import { recordingPluginInput, silentClientSurface, silentPluginInput } from './mocks.ts';
 import { stripNarrative } from '../src/stripper.ts';
 import {
+  checkDeterministicInvariants,
   resolveAuditorConfig,
   runPeerAudit,
   type AuditConfig,
@@ -132,7 +133,70 @@ test('runPeerAudit fails an arithmetic invariant without invoking the model', as
   assert.equal(outcome.passed, false);
   assert.equal(outcome.failedStep, 1);
   assert.equal(outcome.severity, 'minor');
+  assert.equal(outcome.source, 'invariants');
   assert.equal(calls, 0);
+});
+
+test('arithmetic invariant verifies the full chain, not the last binary pair (#35, FR-062)', async () => {
+  // Regression strings from the field session (ses_e72a74b18ffeOU3uNACKZ9k1Jz):
+  // the binary-pair matcher checked `38+16+2=56` as `16+2=56` and failed
+  // every correct chained sum, vanishing each part's path mentions from
+  // the trace. Full-chain evaluation verifies them as one expression.
+  const correctChains = [
+    'capacity: 38+16+2=56',
+    'tally = 1+1+3+2+2+2+9 = 20',
+    'sum: 456+139+62=657',
+    'recount = 133+3+521=657',
+    'total 31+3+623=657',
+  ];
+  for (const step of correctChains) {
+    // No auditor model: the invariants are the whole audit, so a pass here
+    // means the chain tier specifically declined to flag the step.
+    const outcome = await runPeerAudit([step], { ...baseAuditConfig, auditorModel: undefined }, neverInvokeModel);
+    assert.equal(outcome.passed, true, step);
+  }
+});
+
+test('arithmetic invariant still fails genuinely misstated chains and pairs (#35)', () => {
+  const chain = checkDeterministicInvariants(['batch total 9+3+2=56']);
+  assert.ok(chain !== null);
+  assert.equal(chain.passed, false);
+  assert.equal(chain.severity, 'minor');
+  assert.equal(chain.source, 'invariants');
+
+  const pair = checkDeterministicInvariants(['count = 16 + 2 = 56']);
+  assert.ok(pair !== null);
+  assert.equal(pair.passed, false);
+
+  const product = checkDeterministicInvariants(['pairs = 2 * 3 = 8']);
+  assert.ok(product !== null);
+  assert.equal(product.passed, false);
+});
+
+test('arithmetic invariant applies standard precedence inside chains (FR-062)', async () => {
+  // Multiplication binds before addition: 2+3*4 is 14, not 20.
+  const correct = await runPeerAudit(['terms = 2+3*4 = 14'], { ...baseAuditConfig, auditorModel: undefined }, neverInvokeModel);
+  assert.equal(correct.passed, true);
+
+  const misstated = checkDeterministicInvariants(['terms = 2+3*4 = 20']);
+  assert.ok(misstated !== null);
+  assert.equal(misstated.passed, false);
+});
+
+test('arithmetic invariant declines to judge division by zero (FR-062)', async () => {
+  // The fail-open posture the binary-pair matcher already took on a/0:
+  // an un-evaluable chain passes unchecked rather than guessing.
+  const outcome = await runPeerAudit(['ratio = 10 / 0 = 0'], { ...baseAuditConfig, auditorModel: undefined }, neverInvokeModel);
+  assert.equal(outcome.passed, true);
+});
+
+test('arithmetic critique quotes the whole stated expression (FR-062)', () => {
+  const outcome = checkDeterministicInvariants(['batch total 9+3+2=56']);
+  assert.ok(outcome !== null);
+  // The corrective signal names the full span — operand chain and stated
+  // total — so the supervised model can see exactly what it misstated.
+  assert.ok(outcome.critique.includes('stated 9+3+2=56'), outcome.critique);
+  assert.ok(outcome.critique.includes('evaluates to 14'), outcome.critique);
 });
 
 test('runPeerAudit classifies an off-by-one loop bound as minor', async () => {
@@ -811,9 +875,11 @@ test('event hook observes a completed reasoning part once and never rejects', as
     assert.equal(state.seenParts.size, 1);
     assert.ok(state.seenParts.has('event-session-1:msg-1:part-1'));
     // The arithmetic invariant (24 * 15 = 360, not 340) fails the audit
-    // deterministically (FR-003), so the model is never consulted and
-    // the step never enters the verified trace (FR-006).
-    assert.equal(state.verifiedSteps.length, 0);
+    // deterministically (FR-003), so the model is never consulted. The
+    // minor failure still records (FR-063): the step stays in the
+    // verified trace marked passed: false — a misstated tally does not
+    // revoke the part's file reasoning.
+    assert.deepEqual(state.verifiedSteps, [{ text: 'capacity = 24 * 15 = 340', passed: false }]);
     assert.equal(calls.create.length, 0);
     assert.equal(calls.prompt.length, 0);
 
@@ -854,7 +920,9 @@ test('event hook audits a completed reasoning part exactly once and records the 
     assert.ok(promptText.includes('Ship the audit supervisor'));
 
     // FR-006: the passed step lands in the verified trace.
-    assert.deepEqual(sessionState.get('audit-session-once').verifiedSteps, ['the rate = 24 * 15 = 360']);
+    assert.deepEqual(sessionState.get('audit-session-once').verifiedSteps, [
+      { text: 'the rate = 24 * 15 = 360', passed: true },
+    ]);
   });
 });
 
@@ -877,11 +945,13 @@ test('event hook records only passed steps in the verified trace', async () => {
       })
     );
 
-    // One side session per audit; the failed verdict never enters the
-    // trace, the passed verdict does (FR-006).
+    // One side session per audit; the failed peer verdict never enters
+    // the trace (FR-063: peer failures evict), the passed verdict does.
     assert.equal(calls.create.length, 2);
     assert.equal(calls.prompt.length, 2);
-    assert.deepEqual(sessionState.get('audit-session-trace').verifiedSteps, ['total = 2 + 3 = 5']);
+    assert.deepEqual(sessionState.get('audit-session-trace').verifiedSteps, [
+      { text: 'total = 2 + 3 = 5', passed: true },
+    ]);
 
     // Task 3.3 wiring: the failed verdict's critique is steered to the
     // session and recorded (FR-007/FR-015) — it never enters the
@@ -914,7 +984,7 @@ test('event hook strips narrative before the audit and the trace', async () => {
 
     // ...and the trace entry is the stripped text, not the raw part.
     assert.deepEqual(sessionState.get('audit-session-strip').verifiedSteps, [
-      'the throughput = 120 / 4 = 30 requests per second',
+      { text: 'the throughput = 120 / 4 = 30 requests per second', passed: true },
     ]);
   });
 });
@@ -934,7 +1004,7 @@ test('event hook still dedupes duplicate publications with the live audit path',
     assert.equal(calls.prompt.length, 1);
     const state = sessionState.get('audit-session-dedupe');
     assert.equal(state.seenParts.size, 1);
-    assert.deepEqual(state.verifiedSteps, ['x = 3 + 4 = 7']);
+    assert.deepEqual(state.verifiedSteps, [{ text: 'x = 3 + 4 = 7', passed: true }]);
   });
 });
 
@@ -990,7 +1060,96 @@ test('event hook never rejects when the audit client fails (fail-open)', async (
       dispatchPart(hooks, completedReasoningPart({ sessionID: 'audit-session-failopen', id: 'part-x', text: 'x = 3 + 4 = 7' }))
     );
     assert.equal(createCalls.length, 1);
-    assert.deepEqual(sessionState.get('audit-session-failopen').verifiedSteps, ['x = 3 + 4 = 7']);
+    assert.deepEqual(sessionState.get('audit-session-failopen').verifiedSteps, [{ text: 'x = 3 + 4 = 7', passed: true }]);
+  });
+});
+
+test('event hook keeps a minor arithmetic failure in the trace marked unpassed (FR-063)', async () => {
+  await withCleanAuditEnv(async () => {
+    const { input, calls } = auditHarness([]);
+    const hooks = await plugin.server(input);
+    const sessionID = 'audit-session-no-evict';
+
+    // The part names a file AND misstates a tally. The critique still
+    // steers (FR-007) while the step stays in the ledger carrying its
+    // outcome — the trace is a path ledger (FR-010), and a misstated
+    // tally does not revoke the part's file reasoning.
+    await dispatchPart(
+      hooks,
+      completedReasoningPart({
+        sessionID,
+        id: 'part-ne1',
+        text: 'edit src/a.ts: capacity = 24 * 15 = 340',
+      })
+    );
+    const state = sessionState.get(sessionID);
+    assert.deepEqual(state.verifiedSteps, [{ text: 'edit src/a.ts: capacity = 24 * 15 = 340', passed: false }]);
+    assert.equal(calls.promptAsync.length, 1); // the critique still steers
+    assert.equal(state.critiqueCount, 1);
+
+    // The guarded path proceeds on the recorded reasoning: a minor
+    // misstatement does not fence the tools the part reasoned about.
+    await assert.doesNotReject(() =>
+      dispatchToolBefore(hooks, sessionID, 'edit', { filePath: 'src/a.ts', content: 'export const x = 1;' })
+    );
+  });
+});
+
+test('event hook keeps an off-by-one failure in the trace marked unpassed (FR-063)', async () => {
+  await withCleanAuditEnv(async () => {
+    const { input, calls } = auditHarness([]);
+    const hooks = await plugin.server(input);
+    const sessionID = 'audit-session-off-by-one';
+
+    await dispatchPart(
+      hooks,
+      completedReasoningPart({
+        sessionID,
+        id: 'part-obo',
+        text: 'for (let i = 0; i <= items.length; i++) { total += items[i]; }',
+      })
+    );
+    const state = sessionState.get(sessionID);
+    assert.deepEqual(state.verifiedSteps, [
+      { text: 'for (let i = 0; i <= items.length; i++) { total += items[i]; }', passed: false },
+    ]);
+    assert.equal(calls.promptAsync.length, 1); // minor: steer, not interrupt
+    assert.equal(calls.abort.length, 0);
+  });
+});
+
+test('event hook evicts severe findings and peer failures from the trace entirely (FR-063)', async () => {
+  await withCleanAuditEnv(async () => {
+    // Severe (reward hacking): evicted — the reasoning is not trustworthy
+    // as a path ledger, and the session is interrupted (FR-008).
+    const severeHarness = auditHarness([]);
+    const severeHooks = await plugin.server(severeHarness.input);
+    await dispatchPart(
+      severeHooks,
+      completedReasoningPart({
+        sessionID: 'audit-session-severe-evict',
+        id: 'part-sev',
+        text: 'git commit --no-verify -m "bypass src/a.ts hooks"',
+      })
+    );
+    const severeState = sessionState.get('audit-session-severe-evict');
+    assert.equal(severeState.verifiedSteps.length, 0);
+    assert.equal(severeHarness.calls.abort.length, 1);
+
+    // Peer failure (minor): evicted too — only deterministic invariants
+    // carry the no-evict exception; a peer finding means the reasoning
+    // itself did not verify.
+    const peerHarness = auditHarness(['{"passed":false,"failedStep":1,"severity":"minor","critique":"Step 1 misstates the capacity bound."}']);
+    const peerHooks = await plugin.server(peerHarness.input);
+    await dispatchPart(
+      peerHooks,
+      completedReasoningPart({
+        sessionID: 'audit-session-peer-evict',
+        id: 'part-peer',
+        text: 'the rate = 24 * 15 = 360 with src/a.ts',
+      })
+    );
+    assert.equal(sessionState.get('audit-session-peer-evict').verifiedSteps.length, 0);
   });
 });
 
@@ -1672,7 +1831,7 @@ test('tool.execute.before blocks an unreferenced path with an actionable reason'
   await withCleanAuditEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'guard-unreferenced';
-    sessionState.get(sessionID).verifiedSteps.push('Edit src/a.ts to export the helper.');
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
 
     // FR-010 + FR-012: the rejection names the unmatched path and the
     // failed check, so the model can reason about the file and retry.
@@ -1696,7 +1855,7 @@ test('tool.execute.before proceeds for referenced paths by full path or basename
 
     // FR-010: full-path match — trace and arguments both name src/a.ts.
     const fullTrace = 'guard-referenced-full';
-    sessionState.get(fullTrace).verifiedSteps.push('Edit src/a.ts to export the helper.');
+    sessionState.get(fullTrace).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
     await assert.doesNotReject(() =>
       dispatchToolBefore(hooks, fullTrace, 'edit', { filePath: 'src/a.ts', content: 'export const helper = 1;' })
     );
@@ -1707,7 +1866,7 @@ test('tool.execute.before proceeds for referenced paths by full path or basename
     // Basename match the other way — a full path in the arguments
     // against a trace that only holds the basename.
     const baseTrace = 'guard-referenced-base';
-    sessionState.get(baseTrace).verifiedSteps.push('Refactor a.ts to export the helper.');
+    sessionState.get(baseTrace).verifiedSteps.push({ text: 'Refactor a.ts to export the helper.', passed: true });
     await assert.doesNotReject(() =>
       dispatchToolBefore(hooks, baseTrace, 'edit', { filePath: 'src/a.ts', content: 'export const helper = 1;' })
     );
@@ -1718,7 +1877,7 @@ test('tool.execute.before blocks every reward-hacking pattern with check and mar
   await withCleanAuditEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'guard-hack-patterns';
-    sessionState.get(sessionID).verifiedSteps.push('Edit src/a.ts to export the helper.');
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
 
     const patterns: Array<{ tool: string; args: Record<string, unknown>; marker: string }> = [
       { tool: 'bash', args: { command: 'git commit -m "bypass" --no-verify' }, marker: '--no-verify' },
@@ -1769,7 +1928,9 @@ test('tool guard consumes the live verified trace populated by the event hook', 
       })
     );
     assert.equal(calls.create.length, 1); // the audit really ran
-    assert.deepEqual(sessionState.get(sessionID).verifiedSteps, ['the edit targets `src/a.ts` to export the helper']);
+    assert.deepEqual(sessionState.get(sessionID).verifiedSteps, [
+      { text: 'the edit targets `src/a.ts` to export the helper', passed: true },
+    ]);
 
     // A tool call referencing the traced path proceeds (FR-010)...
     await assert.doesNotReject(() =>
@@ -1802,7 +1963,7 @@ test('tool.execute.before fails open when the guard infrastructure throws', asyn
     // Corrupted state entry: a non-array verifiedSteps makes
     // verifyToolIntent throw — the hook must resolve and the call must
     // proceed; a guard crash must never block or break the session.
-    (state as { verifiedSteps: string[] | null }).verifiedSteps = null;
+    (state as { verifiedSteps: { text: string; passed: boolean }[] | null }).verifiedSteps = null;
 
     await assert.doesNotReject(() =>
       dispatchToolBefore(hooks, sessionID, 'bash', { command: 'cat src/anything.ts' })
@@ -1820,7 +1981,7 @@ test('tool.execute.before logs every block with the reason before throwing', asy
     const { input, logEntries } = recordingPluginInput();
     const hooks = await plugin.server(input);
     const sessionID = 'guard-block-log';
-    sessionState.get(sessionID).verifiedSteps.push('Edit src/a.ts to export the helper.');
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
 
     // Spike 1.3, restated for FR-052: the host does not log trigger
     // failures, so the plugin's own server-log entry is the block's
@@ -1850,7 +2011,7 @@ test('tool.execute.before honors disabled guard checks via configuration', async
     process.env.OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING = 'false';
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'guard-config-reward-off';
-    sessionState.get(sessionID).verifiedSteps.push('Edit src/a.ts to export the helper.');
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
     await assert.doesNotReject(() =>
       dispatchToolBefore(hooks, sessionID, 'bash', { command: 'git commit -m "bypass" --no-verify' })
     );
@@ -1861,7 +2022,7 @@ test('tool.execute.before honors disabled guard checks via configuration', async
     process.env.OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS = 'false';
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'guard-config-trace-off';
-    sessionState.get(sessionID).verifiedSteps.push('Edit src/a.ts to export the helper.');
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
     await assert.doesNotReject(() =>
       dispatchToolBefore(hooks, sessionID, 'write', {
         filePath: 'src/never-referenced.ts',
@@ -1992,6 +2153,6 @@ test("hooks ignore the plugin's own auditor side sessions (self-suppression)", a
     await auditRun;
     assert.equal(calls.create.length, 1);
     assert.equal(calls.delete.length, 1);
-    assert.deepEqual(sessionState.peek(supervisedID)?.verifiedSteps, ['the rate = 24 * 15 = 360']);
+    assert.deepEqual(sessionState.peek(supervisedID)?.verifiedSteps, [{ text: 'the rate = 24 * 15 = 360', passed: true }]);
   });
 });

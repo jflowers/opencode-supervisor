@@ -41,7 +41,7 @@ while it happens.
 
 | Failure mode | Example | What the supervisor does |
 | :--- | :--- | :--- |
-| Arithmetic errors | `24 * 15 = 340` in a budget step | An invariant fails the audit with no model call; the critique names the step |
+| Arithmetic errors | `24 * 15 = 340`, `9+3+2=56` in a budget step | An invariant fails the audit with no model call (equations evaluate as full chains); the critique names the whole stated expression |
 | Off-by-one bounds | `for (let i = 0; i <= array.length; i++)` | Flagged by an invariant or the peer audit; the agent self-corrects |
 | Unsafe code | SQL string interpolation, unsafe shell commands | The peer audit flags the step before the code reaches disk |
 | Reward hacking | `.skip()` on a failing test, deleted asserts, `git commit --no-verify` | The tool guard blocks the call before execution |
@@ -136,14 +136,21 @@ flowchart TD
    steps — code, equations, explicit rules — so confidence prose
    cannot talk the auditor into agreement.
 3. **Audit.** Deterministic invariants run first: arithmetic
-   misstatements, off-by-one loop bounds, and reward-hacking markers
-   fail with no model call. Surviving steps go to an independent
-   auditor model in a dedicated side session — created per audit
-   through the OpenCode client (`auditorModel` / `auditorVariant`),
-   with the session goal and engineer directives in the prompt, so
-   scope drift and directive violations are also findings. Audit
-   traffic never enters the supervised conversation; auditor errors
-   fail open. Passed steps join the **verified trace**.
+   misstatements (equations evaluate as full chains — `38+16+2=56`
+   verifies as one expression, with standard precedence), off-by-one
+   loop bounds, and reward-hacking markers fail with no model call.
+   Surviving steps go to an independent auditor model in a dedicated
+   side session — created per audit through the OpenCode client
+   (`auditorModel` / `auditorVariant`), with the session goal and
+   engineer directives in the prompt, so scope drift and directive
+   violations are also findings. Audit traffic never enters the
+   supervised conversation; auditor errors fail open. Steps join the
+   **verified trace** as outcome-carrying entries: passed steps
+   record normally, and a step that failed a minor invariant
+   critiques without losing its place — the entry stays, marked
+   unpassed, so the file reasoning the tool guard matches against
+   survives one misstated tally. Severe findings and peer-audit
+   failures still evict.
 4. **Intervene.** A `minor` failure (arithmetic, off-by-one, scope
    drift) arrives as a `[supervisor]`-prefixed user message the agent
    incorporates at its next step; a `severe` failure (reward hacking)
@@ -188,7 +195,7 @@ tuple registration — Section 6):
 
 | Hook | Purpose |
 | :--- | :--- |
-| `event` | Observes completed reasoning parts (`message.part.updated`), deduplicates them, strips narrative, runs the invariants and the side-session peer audit, records passed steps in the verified trace, and routes failures to critique delivery. |
+| `event` | Observes completed reasoning parts (`message.part.updated`), deduplicates them, strips narrative, runs the invariants and the side-session peer audit, records steps in the verified trace (passed, or minor deterministic findings marked unpassed), and routes failures to critique delivery. |
 | `chat.message` | Captures the first user message of the session as the goal. The goal is never replaced. |
 | `tool.execute.before` | Tool guard: blocks reward-hacking tool calls, engineer-directive violations, and file paths absent from the verified trace (never blocks when the trace is empty); holds approve-gated calls for engineer approval and review-gated calls for a passed peer audit (agent-console tools are exempt so `request_audit` stays reachable); records directive triggers. |
 | `tool.execute.after` | Appends a solved item (tool name + short outcome) to a bounded log. |

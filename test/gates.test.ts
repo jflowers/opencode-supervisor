@@ -352,7 +352,9 @@ test('evaluateReviewGates blocks a touched path absent from the trace', () => {
     text: 'Billing changes need review.',
     review: [{ path: 'src/billing/**' }],
   }]);
-  const decision = evaluateReviewGates(gates.review, 'edit', ['src/billing/invoice.ts'], ['unrelated work']);
+  const decision = evaluateReviewGates(gates.review, 'edit', ['src/billing/invoice.ts'], [
+    { text: 'unrelated work', passed: true },
+  ]);
   assert.equal(decision.allowed, false);
   assert.ok(decision.reason.includes('review gate'));
   assert.ok(decision.reason.includes('src/billing/invoice.ts'));
@@ -369,9 +371,29 @@ test('evaluateReviewGates admits a path referenced by basename', () => {
     gates.review,
     'edit',
     ['src/billing/invoice.ts'],
-    ['refactoring invoice.ts for the rate change']
+    [{ text: 'refactoring invoice.ts for the rate change', passed: true }]
   );
   assert.equal(decision.allowed, true);
+});
+
+test('evaluateReviewGates ignores a minor-failed trace entry (FR-063)', () => {
+  const { gates } = compileGates([{
+    id: 'rg',
+    text: 'Billing changes need review.',
+    review: [{ path: 'src/billing/**' }],
+  }]);
+  // A no-evict entry references the gated path but carries its failed
+  // outcome: only a step the audit passed counts as verified reasoning,
+  // so the gate still holds and points at request_audit.
+  const decision = evaluateReviewGates(
+    gates.review,
+    'edit',
+    ['src/billing/invoice.ts'],
+    [{ text: 'refactoring invoice.ts for the rate change', passed: false }]
+  );
+  assert.equal(decision.allowed, false);
+  assert.ok(decision.reason.includes('review gate'));
+  assert.ok(decision.reason.includes('request_audit'));
 });
 
 test('evaluateReviewGates blocks on an empty trace', () => {
@@ -405,7 +427,7 @@ test('evaluateReviewGates matches trace references case-insensitively', () => {
     gates.review,
     'edit',
     ['src/billing/invoice.ts'],
-    ['UPDATING SRC/BILLING/INVOICE.TS NOW']
+    [{ text: 'UPDATING SRC/BILLING/INVOICE.TS NOW', passed: true }]
   );
   assert.equal(decision.allowed, true);
 });
