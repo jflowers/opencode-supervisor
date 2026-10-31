@@ -45,6 +45,15 @@ export interface ReviewRule {
   path: string;
 }
 
+/**
+ * A repair-scope rule: `tool` is a tool name or glob; matching tools join
+ * the tool-argument repair scope on top of the `argRepair.tools` config
+ * list (covers MCP and plugin tools that are not builtin).
+ */
+export interface RepairRule {
+  tool: string;
+}
+
 export interface Directive {
   id: string;
   text: string;
@@ -52,6 +61,7 @@ export interface Directive {
   when?: TriggerRule[];
   approve?: ApproveRule[];
   review?: ReviewRule[];
+  repair?: RepairRule[];
 }
 
 /** Minimal render shape consumed by the memo and audit prompt. */
@@ -102,6 +112,7 @@ interface RawRules {
   when?: unknown;
   approve?: unknown;
   review?: unknown;
+  repair?: unknown;
 }
 
 const normalizeEnforcementRules = (
@@ -242,6 +253,36 @@ const normalizeReviewRules = (
 };
 
 /**
+ * Normalize `repair` scope rules: a rule is a tool name or glob and
+ * nothing else — a repair rule without a tool is meaningless and is
+ * dropped.
+ */
+const normalizeRepairRules = (
+  raw: unknown
+): { rules: RepairRule[]; dropped: number } => {
+  if (raw === undefined || raw === null) return { rules: [], dropped: 0 };
+  if (!Array.isArray(raw)) return { rules: [], dropped: 1 };
+  const rules: RepairRule[] = [];
+  let dropped = 0;
+  for (const entry of raw.slice(0, MAX_RULES_PER_DIRECTIVE)) {
+    if (typeof entry !== 'object' || entry === null) {
+      dropped += 1;
+      continue;
+    }
+    const record = entry as Record<string, unknown>;
+    if (typeof record.tool !== 'string' || record.tool.trim().length === 0) {
+      dropped += 1;
+      continue;
+    }
+    rules.push({ tool: record.tool.trim() });
+  }
+  if (raw.length > MAX_RULES_PER_DIRECTIVE) {
+    dropped += raw.length - MAX_RULES_PER_DIRECTIVE;
+  }
+  return { rules, dropped };
+};
+
+/**
  * Parse directive files (FR-026, FR-027). Each file's markdown body
  * is the advisory text; the first ```supervisor-fenced block holds a
  * JSON rules object. The file id is the filename without `.md`.
@@ -288,6 +329,7 @@ export const parseDirectives = (files: DirectiveFile[]): ParseDirectivesResult =
     const when = normalizeTriggerRules(rawRules.when);
     const approve = normalizeApproveRules(rawRules.approve);
     const review = normalizeReviewRules(rawRules.review);
+    const repair = normalizeRepairRules(rawRules.repair);
     if (enforce.dropped > 0) {
       warnings.push(
         `directive '${id}': ${enforce.dropped} enforce rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
@@ -308,12 +350,18 @@ export const parseDirectives = (files: DirectiveFile[]): ParseDirectivesResult =
         `directive '${id}': ${review.dropped} review rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
       );
     }
+    if (repair.dropped > 0) {
+      warnings.push(
+        `directive '${id}': ${repair.dropped} repair rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
+      );
+    }
     if (
       !trimmed &&
       enforce.rules.length === 0 &&
       when.rules.length === 0 &&
       approve.rules.length === 0 &&
-      review.rules.length === 0
+      review.rules.length === 0 &&
+      repair.rules.length === 0
     ) {
       warnings.push(
         `directive file '${file.name}' has neither advisory text nor rules; file skipped`
@@ -327,6 +375,7 @@ export const parseDirectives = (files: DirectiveFile[]): ParseDirectivesResult =
       ...(when.rules.length > 0 ? { when: when.rules } : {}),
       ...(approve.rules.length > 0 ? { approve: approve.rules } : {}),
       ...(review.rules.length > 0 ? { review: review.rules } : {}),
+      ...(repair.rules.length > 0 ? { repair: repair.rules } : {}),
     });
   }
   return { directives, warnings };
@@ -367,6 +416,7 @@ export const parseOptionsDirectives = (raw: unknown): ParseDirectivesResult => {
     const when = normalizeTriggerRules(record.when);
     const approve = normalizeApproveRules(record.approve);
     const review = normalizeReviewRules(record.review);
+    const repair = normalizeRepairRules(record.repair);
     if (enforce.dropped > 0) {
       warnings.push(
         `directive '${id}': ${enforce.dropped} enforce rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
@@ -387,12 +437,18 @@ export const parseOptionsDirectives = (raw: unknown): ParseDirectivesResult => {
         `directive '${id}': ${review.dropped} review rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
       );
     }
+    if (repair.dropped > 0) {
+      warnings.push(
+        `directive '${id}': ${repair.dropped} repair rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
+      );
+    }
     if (
       !text &&
       enforce.rules.length === 0 &&
       when.rules.length === 0 &&
       approve.rules.length === 0 &&
-      review.rules.length === 0
+      review.rules.length === 0 &&
+      repair.rules.length === 0
     ) {
       warnings.push(`options.directives[${index}] ('${id}') has neither text nor rules; skipped`);
       return;
@@ -404,6 +460,7 @@ export const parseOptionsDirectives = (raw: unknown): ParseDirectivesResult => {
       ...(when.rules.length > 0 ? { when: when.rules } : {}),
       ...(approve.rules.length > 0 ? { approve: approve.rules } : {}),
       ...(review.rules.length > 0 ? { review: review.rules } : {}),
+      ...(repair.rules.length > 0 ? { repair: repair.rules } : {}),
     });
   });
   return { directives, warnings };
@@ -515,6 +572,39 @@ export const compileEnforcement = (
   }
   return { enforcement: { forbidPaths, forbidPatterns }, warnings };
 };
+
+/** Compiled repair-scope rules for the tool-argument repair pipeline. */
+export interface CompiledRepairTools {
+  regexes: RegExp[];
+}
+
+/**
+ * Compile repair-scope rules into anchored, case-insensitive regexes via
+ * `globToRegExp` — exact tool names and globs both work, and glob
+ * compilation cannot throw.
+ *
+ * @param directives Parsed directives carrying optional `repair` rules.
+ * @returns The compiled matcher set.
+ */
+export const compileRepairTools = (directives: Directive[]): CompiledRepairTools => {
+  const regexes: RegExp[] = [];
+  for (const directive of directives) {
+    for (const rule of directive.repair ?? []) {
+      regexes.push(globToRegExp(rule.tool));
+    }
+  }
+  return { regexes };
+};
+
+/**
+ * Whether a tool name matches any compiled repair-scope rule.
+ *
+ * @param compiled Output of {@link compileRepairTools}.
+ * @param toolName Tool name from the hook input.
+ * @returns True when the tool is directive-scoped for repair.
+ */
+export const matchRepairTools = (compiled: CompiledRepairTools, toolName: string): boolean =>
+  compiled.regexes.some((regex) => regex.test(toolName));
 
 export interface EnforcementVerdict {
   allowed: boolean;

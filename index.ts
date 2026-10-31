@@ -32,6 +32,16 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { tool, type Hooks, type PluginInput, type PluginModule, type PluginOptions } from '@opencode-ai/plugin';
 import {
+  DEFAULT_ARG_REPAIR,
+  isPlainObject,
+  mergeArgsInPlace,
+  repairToolArgs,
+  SUPERVISOR_MODES,
+  type ArgRepairConfig,
+  type RepairInvoker,
+  type SupervisorMode,
+} from './src/arg-repair.ts';
+import {
   outcomeRecordsStep,
   resolveAuditorConfig,
   runPeerAudit,
@@ -68,7 +78,9 @@ import {
 import {
   activeDirectives,
   compileEnforcement,
+  compileRepairTools,
   extractPolicyPaths,
+  matchRepairTools,
   matchTriggers,
   MAX_DIRECTIVES,
   parseDirectives,
@@ -107,6 +119,8 @@ const ENV_MEMO_MAX_REMINDERS = 'OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS';
 const ENV_MEMO_MAX_REPORTS = 'OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS';
 const ENV_MAX_ON_DEMAND_AUDITS = 'OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS';
 const ENV_MAX_TIMEOUT_FAIL_OPENS = 'OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS';
+const ENV_MODE = 'OPENCODE_SUPERVISOR_MODE';
+const ENV_REPAIR_MODEL = 'OPENCODE_SUPERVISOR_REPAIR_MODEL';
 
 /**
  * Hook-layer configuration: the auditor's `AuditConfig` plus the memo
@@ -122,6 +136,10 @@ export interface HookConfig extends AuditConfig {
   maxOnDemandAudits: number;
   /** Per-session cap on trace-check timeout fail-opens (FR-067, design D8): past it, a timed-out wait blocks. */
   maxTimeoutFailOpens: number;
+  /** Supervisor mode: 'full' (everything) or 'repair-only' (tool-arg repair only). */
+  mode: SupervisorMode;
+  /** Tool-argument repair configuration (deterministic first, model tier second). */
+  argRepair: ArgRepairConfig;
 }
 
 /**
@@ -140,6 +158,8 @@ export const pluginConfig: HookConfig = {
   memoLimits: { ...DEFAULT_MEMO_LIMITS },
   maxOnDemandAudits: 8,
   maxTimeoutFailOpens: 3,
+  mode: 'full',
+  argRepair: { ...DEFAULT_ARG_REPAIR, tools: [...DEFAULT_ARG_REPAIR.tools] },
 };
 
 /**
@@ -148,7 +168,7 @@ export const pluginConfig: HookConfig = {
  * build. `package.json` cannot be imported from here without a build
  * step, so the constant is the source of truth for the log prefix.
  */
-export const PLUGIN_VERSION = '2.6.0';
+export const PLUGIN_VERSION = '2.7.0';
 
 /**
  * Log-identity state (FR-055): the module-identity line is emitted
@@ -217,6 +237,21 @@ function pickStripMode(value: unknown): HookConfig['stripMode'] | undefined {
   return value === 'code_and_math' || value === 'balanced' || value === 'strict' ? value : undefined;
 }
 
+function pickSupervisorMode(value: unknown): SupervisorMode | undefined {
+  return value === 'full' || value === 'repair-only' ? value : undefined;
+}
+
+/** Model slugs are `provider/model` strings; blank strings are treated as unset. */
+function pickModelSlug(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed === '' ? undefined : trimmed;
+}
+
+function argRepairOverrides(value: unknown): Partial<ArgRepairConfig> {
+  return typeof value === 'object' && value !== null ? (value as Partial<ArgRepairConfig>) : {};
+}
+
 /**
  * File/options config tiers for `resolveHookConfig` (FR-056). Each tier
  * is a validated `SupervisorFileConfig` subset; `derivedModel` carries
@@ -266,16 +301,18 @@ export function resolveHookConfig(
 ): HookConfig {
   const overrides = sessionOverrides(session);
   const memoOverrides = memoLimitOverrides(overrides.memoLimits);
+  const repairOverrides = argRepairOverrides(overrides.argRepair);
   const base = resolveAuditorConfig(pluginConfig, session);
+  const auditorModel = tiered(
+    base.auditorModel,
+    sources.project?.auditorModel,
+    sources.options?.auditorModel,
+    sources.global?.auditorModel,
+    sources.derivedModel
+  );
   return {
     ...base,
-    auditorModel: tiered(
-      base.auditorModel,
-      sources.project?.auditorModel,
-      sources.options?.auditorModel,
-      sources.global?.auditorModel,
-      sources.derivedModel
-    ),
+    auditorModel,
     auditorVariant: tiered(
       base.auditorVariant,
       sources.project?.auditorVariant,
@@ -338,6 +375,33 @@ export function resolveHookConfig(
       envNumber(ENV_MAX_TIMEOUT_FAIL_OPENS) ??
       tiered(sources.project?.maxTimeoutFailOpens, sources.options?.maxTimeoutFailOpens, sources.global?.maxTimeoutFailOpens) ??
       pluginConfig.maxTimeoutFailOpens,
+    mode:
+      pickSupervisorMode(overrides.mode) ??
+      pickSupervisorMode(envText(ENV_MODE)) ??
+      tiered(sources.project?.mode, sources.options?.mode, sources.global?.mode) ??
+      pluginConfig.mode,
+    argRepair: {
+      enabled:
+        pickBoolean(repairOverrides.enabled) ??
+        tiered(sources.project?.argRepair?.enabled, sources.options?.argRepair?.enabled, sources.global?.argRepair?.enabled) ??
+        pluginConfig.argRepair.enabled,
+      model:
+        pickModelSlug(repairOverrides.model) ??
+        envText(ENV_REPAIR_MODEL) ??
+        tiered(sources.project?.argRepair?.model, sources.options?.argRepair?.model, sources.global?.argRepair?.model) ??
+        auditorModel,
+      tools:
+        tiered(sources.project?.argRepair?.tools, sources.options?.argRepair?.tools, sources.global?.argRepair?.tools) ??
+        pluginConfig.argRepair.tools,
+      maxPerSession:
+        pickNumber(repairOverrides.maxPerSession) ??
+        tiered(sources.project?.argRepair?.maxPerSession, sources.options?.argRepair?.maxPerSession, sources.global?.argRepair?.maxPerSession) ??
+        pluginConfig.argRepair.maxPerSession,
+      timeoutMs:
+        pickNumber(repairOverrides.timeoutMs) ??
+        tiered(sources.project?.argRepair?.timeoutMs, sources.options?.argRepair?.timeoutMs, sources.global?.argRepair?.timeoutMs) ??
+        pluginConfig.argRepair.timeoutMs,
+    },
   };
 }
 
@@ -392,6 +456,16 @@ export interface SessionState {
    * cap a timed-out wait blocks naming the still-unsettled audit.
    */
   timeoutFailOpens: number;
+  /**
+   * Provider/model identity captured from `chat.message` hook payloads
+   * (tool-arg repair): drives the per-model tool-schema lookup so repair
+   * validates against the schema the live model actually sees.
+   */
+  modelIdentity: { providerID: string; modelID: string } | undefined;
+  /** Repair-model invocations used this session; bounded by `argRepair.maxPerSession`. */
+  repairAttempts: number;
+  /** Log-once keys for repair notices, so repeated skips do not spam the plugin log. */
+  repairNotices: Set<string>;
 }
 
 /** Module-level state (design D4), keyed by session ID. */
@@ -413,6 +487,9 @@ function emptySessionState(): SessionState {
     seenParts: new Set(),
     pendingAudits: new Set(),
     timeoutFailOpens: 0,
+    modelIdentity: undefined,
+    repairAttempts: 0,
+    repairNotices: new Set(),
   };
 }
 
@@ -612,6 +689,14 @@ type SessionPromptOptions = Parameters<PluginInput['client']['session']['prompt'
 type SessionPromptResponse = Awaited<ReturnType<PluginInput['client']['session']['prompt']>>;
 type SessionPromptPart = NonNullable<SessionPromptResponse['data']>['parts'][number];
 
+/** Tool-list response shapes (tool-arg repair): `parameters` carries each tool's JSON schema. */
+type ToolListResponse = Awaited<ReturnType<PluginInput['client']['tool']['list']>>;
+type ToolListEntry = NonNullable<ToolListResponse['data']>[number];
+
+/** Session-message list response shape (tool-arg repair evidence + identity fallback). */
+type SessionMessagesResponse = Awaited<ReturnType<PluginInput['client']['session']['messages']>>;
+type SessionMessage = NonNullable<SessionMessagesResponse['data']>[number];
+
 /** Prompt body augmented with `variant`, which the SDK typings lag (agent-executor convention). */
 type PromptBodyWithVariant = NonNullable<SessionPromptOptions['body']> & { variant?: string };
 
@@ -790,6 +875,101 @@ export function createInvokeModel(client: PluginInput['client'], directory: stri
       // itself: once deleted, the side session no longer exists, so
       // no further events can carry this ID.
       auditorSessionIds.delete(auditorSessionID);
+    }
+  };
+}
+
+/**
+ * Builds the tool-arg repair model adapter: each call creates a dedicated
+ * side session (never the supervised conversation) and prompts it with the
+ * configured repair model, mirroring `createInvokeModel`'s call shapes —
+ * self-suppression registered before prompting, the side session deleted
+ * on every exit path, and transport failures rejecting so
+ * `repairToolArgs`'s fail-open path records them. Differs from the auditor
+ * adapter in two ways: the prompt is bounded by `timeoutMs` (a repair must
+ * not stall the tool call it guards; the timeout promise wins the race and
+ * the losing prompt promise has a no-op catch attached so a late transport
+ * failure cannot surface as an unhandled rejection), and there is no
+ * variant tier.
+ *
+ * @param client The plugin input's OpenCode HTTP client.
+ * @param directory The project directory scoping the side session.
+ * @param logger The plugin logger (server log).
+ * @returns The invoker driving the repair side session.
+ */
+export function createRepairInvoker(
+  client: PluginInput['client'],
+  directory: string,
+  logger?: PluginLogger
+): (prompt: string, model: string, timeoutMs: number) => Promise<string> {
+  const log = logger ?? silentPluginLogger;
+  return async (prompt: string, model: string, timeoutMs: number): Promise<string> => {
+    const identity = splitModelSlug(model);
+    if (identity === null) {
+      throw new Error(`repair model '${model}' is not a <provider>/<model-id> slug`);
+    }
+    const created = await client.session.create({
+      body: { title: `supervisor-repair @ ${model}` },
+      query: { directory },
+    });
+    const repairSessionID = created.data?.id;
+    if (repairSessionID === undefined) {
+      throw new Error(responseFailure('repair side session create failed', created));
+    }
+    // Self-suppression before prompting, mirroring `createInvokeModel`.
+    auditorSessionIds.add(repairSessionID);
+    // Best-effort delete of the ephemeral side session, fail-open.
+    const deleteSideSession = async (): Promise<void> => {
+      try {
+        const deleted = await client.session.delete({ path: { id: repairSessionID } });
+        if (deleted.error !== undefined && deleted.error !== null) {
+          log.error(responseFailure('repair side session delete failed', deleted));
+        }
+      } catch (error) {
+        log.error(`repair side session delete failed open: ${errorText(error)}`);
+      }
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const boundedMs = Math.max(1000, timeoutMs);
+      const promptCall = client.session.prompt({
+        path: { id: repairSessionID },
+        query: { directory },
+        body: {
+          model: { providerID: identity.providerID, modelID: identity.modelID },
+          parts: [{ type: 'text', text: prompt }],
+        },
+      });
+      // A late rejection of the losing prompt promise must not surface as
+      // an unhandled rejection after the timeout already settled the race.
+      promptCall.catch(() => {});
+      const prompted = await Promise.race([
+        promptCall,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`repair side session timed out after ${boundedMs}ms`)), boundedMs);
+          timer.unref?.();
+        }),
+      ]);
+      if (prompted.data === undefined) {
+        throw new Error(responseFailure('repair side session prompt failed', prompted));
+      }
+      if (prompted.data.info.error !== undefined) {
+        throw new Error(`repair side session message error: ${errorText(prompted.data.info.error)}`);
+      }
+      const text = extractResponseText(prompted.data.parts);
+      if (text === '') {
+        throw new Error('repair side session returned no response text');
+      }
+      await deleteSideSession();
+      return text;
+    } catch (error) {
+      await deleteSideSession();
+      throw error;
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+      auditorSessionIds.delete(repairSessionID);
     }
   };
 }
@@ -1277,6 +1457,16 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
     bootstrapWarnings.push(`plugin options supervisor config ignored: ${optionsParsed.error}`);
   }
   const optionsConfig = optionsParsed.config;
+  // Tool-arg repair mode (static registration-time tier): 'full' keeps the
+  // whole supervision pipeline; 'repair-only' disables the audit/guard/memo
+  // features so the plugin only repairs malformed tool arguments. Same tier
+  // order as resolveHookConfig (environment → project file → plugin options
+  // → global file → default); no derived tier — mode is never derived.
+  const mode: SupervisorMode =
+    pickSupervisorMode(envText(ENV_MODE)) ??
+    tiered(projectFile.config.mode, optionsConfig.mode, globalFile.config.mode) ??
+    'full';
+  const repairOnly = mode === 'repair-only';
   // FR-058 derived tier: the OpenCode config's model (small_model
   // preferred) when no earlier tier set one. Lazy and memoized on
   // success only — a failed lookup (the server's HTTP listener may
@@ -1399,7 +1589,7 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         configTiers.push('plugin options');
       }
       logger.info(
-        `v${PLUGIN_VERSION} loaded (auditor: ${
+        `v${PLUGIN_VERSION} loaded (mode: ${config.mode}, auditor: ${
           config.auditorModel ?? (derivedLookupFailed ? 'pending host lookup' : 'none — LLM audit disabled')
         }, variant: ${config.auditorVariant ?? 'unset'}${
           directives.length > 0 ? `, directives: ${directives.length}` : ''
@@ -1442,6 +1632,216 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
   // maxRegenerations bound, records every critique (FR-015), and never
   // rejects (FR-005).
   const deliverCritique = createCritiqueDelivery(input.client, logger);
+
+  // ── Tool-arg repair (arg-repair feature) ──────────────────────────
+
+  // Directive `repair` rules extend the configured argRepair scope by
+  // tool name or glob — the only way to cover MCP and plugin tools the
+  // default builtin list cannot name.
+  const repairToolMatchers = compileRepairTools(directives);
+
+  /** Repair notices log once per key per session, so repeated skips do not spam the log. */
+  const noticeOnce = (state: SessionState, key: string, message: string): void => {
+    if (state.repairNotices.has(key)) {
+      return;
+    }
+    state.repairNotices.add(key);
+    logger.warn(message);
+  };
+
+  // Tool schemas are fetched once per provider/model and memoized — the
+  // promise (including a null failure result) is cached, so a degraded
+  // endpoint costs at most one lookup per key per process (the
+  // derived-lookup precedent: eventual consistency, bounded work).
+  const toolSchemaCache = new Map<string, Promise<ToolListEntry[] | null>>();
+  const fetchToolSchemas = (providerID: string, modelID: string): Promise<ToolListEntry[] | null> => {
+    const key = `${providerID}/${modelID}`;
+    const cached = toolSchemaCache.get(key);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const lookup = (async (): Promise<ToolListEntry[] | null> => {
+      try {
+        const response = await input.client.tool.list({
+          query: { directory: input.directory, provider: providerID, model: modelID },
+        });
+        if (!Array.isArray(response.data)) {
+          throw new Error(responseFailure('tool schema lookup failed', response));
+        }
+        return response.data;
+      } catch (error) {
+        logger.warn(`tool-arg repair: tool schemas unavailable for ${key}: ${errorText(error)}`);
+        return null;
+      }
+    })();
+    toolSchemaCache.set(key, lookup);
+    return lookup;
+  };
+
+  const invokeRepairModel = createRepairInvoker(input.client, input.directory, logger);
+
+  /**
+   * Finds the message carrying the tool part for `callID`. The in-progress
+   * assistant message is persisted before the tool executes, so the lookup
+   * is safe from inside `tool.execute.before`.
+   */
+  const findToolMessage = async (sessionID: string, callID: string): Promise<SessionMessage | undefined> => {
+    try {
+      const response = await input.client.session.messages({ path: { id: sessionID } });
+      const messages = response.data;
+      if (!Array.isArray(messages)) {
+        return undefined;
+      }
+      for (let index = messages.length - 1; index >= 0; index--) {
+        const message = messages[index];
+        if (message === undefined) {
+          continue;
+        }
+        if (message.parts.some((part) => part?.type === 'tool' && part.callID === callID)) {
+          return message;
+        }
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  /** Reasoning/text evidence from the message that emitted the tool call. */
+  const collectRepairEvidence = async (sessionID: string, callID: string): Promise<string> => {
+    const message = await findToolMessage(sessionID, callID);
+    if (message === undefined) {
+      return '';
+    }
+    return message.parts
+      .filter(
+        (part) =>
+          (part?.type === 'reasoning' || part?.type === 'text') && typeof part.text === 'string' && part.text !== ''
+      )
+      .map((part) => part.text)
+      .join('\n\n');
+  };
+
+  /** Model-identity fallback when no `chat.message` payload captured it. */
+  const fallbackModelIdentity = async (
+    sessionID: string,
+    callID: string
+  ): Promise<{ providerID: string; modelID: string } | null> => {
+    const message = await findToolMessage(sessionID, callID);
+    if (message === undefined || message.info.role !== 'assistant') {
+      return null;
+    }
+    const { providerID, modelID } = message.info;
+    if (providerID === '' || modelID === '') {
+      return null;
+    }
+    return { providerID, modelID };
+  };
+
+  /**
+   * The `tool.execute.before` repair pass. Runs FIRST — before the guard —
+   * so the guard sees repaired arguments, and never throws: every failure
+   * path (including unrepairable args) fails open, leaving opencode's own
+   * schema error to reach the model.
+   */
+  const runArgRepair = async (
+    hookInput: { tool: string; sessionID: string; callID: string },
+    output: { args: unknown },
+    state: SessionState
+  ): Promise<void> => {
+    const config = await buildConfig();
+    const argRepair = config.argRepair;
+    if (!argRepair.enabled) {
+      return;
+    }
+    const toolName = hookInput.tool;
+    const inScope =
+      argRepair.tools.includes('*') ||
+      argRepair.tools.some((name) => name.toLowerCase() === toolName.toLowerCase()) ||
+      matchRepairTools(repairToolMatchers, toolName);
+    if (!inScope) {
+      return;
+    }
+    // The plugin's own console tools never need repair.
+    if (!repairOnly && hooks.tool !== undefined && Object.prototype.hasOwnProperty.call(hooks.tool, toolName)) {
+      return;
+    }
+    // In-place mutation only works on plain-object args; primitives cannot
+    // be repaired through the hook output.
+    if (!isPlainObject(output.args)) {
+      noticeOnce(
+        state,
+        `args-not-object:${toolName}`,
+        `tool-arg repair: arguments for '${toolName}' are not an object; skipped`
+      );
+      return;
+    }
+    const identity = state.modelIdentity ?? (await fallbackModelIdentity(hookInput.sessionID, hookInput.callID));
+    if (identity === null) {
+      noticeOnce(
+        state,
+        `no-identity:${hookInput.sessionID}`,
+        `tool-arg repair: no model identity for session '${hookInput.sessionID}'; skipped`
+      );
+      return;
+    }
+    const toolsList = await fetchToolSchemas(identity.providerID, identity.modelID);
+    if (toolsList === null) {
+      return; // fetchToolSchemas already logged the failure.
+    }
+    const toolDef = toolsList.find((entry) => entry.id === toolName);
+    if (toolDef === undefined) {
+      noticeOnce(
+        state,
+        `no-schema:${toolName}`,
+        `tool-arg repair: no schema advertised for tool '${toolName}'; skipped`
+      );
+      return;
+    }
+    let invoker: RepairInvoker | null = null;
+    if (argRepair.model !== undefined) {
+      if (state.repairAttempts >= argRepair.maxPerSession) {
+        noticeOnce(
+          state,
+          'repair-bound',
+          `tool-arg repair: per-session bound of ${argRepair.maxPerSession} reached; malformed arguments now fail normally`
+        );
+      } else {
+        const model = argRepair.model;
+        invoker = (prompt: string): Promise<string> => {
+          state.repairAttempts += 1;
+          return invokeRepairModel(prompt, model, argRepair.timeoutMs);
+        };
+      }
+    }
+    const outcome = await repairToolArgs(output.args, toolDef.parameters, invoker, {
+      tool: toolName,
+      getEvidence: () => collectRepairEvidence(hookInput.sessionID, hookInput.callID),
+    });
+    if (outcome.status === 'repaired' && outcome.args !== undefined) {
+      const applied = mergeArgsInPlace(output.args, outcome.args);
+      if (!applied) {
+        logger.warn(`tool-arg repair: repaired arguments for '${toolName}' could not be applied in place`);
+        return;
+      }
+      logger.info(`repaired tool '${toolName}' arguments via ${outcome.method}`);
+      if (!repairOnly) {
+        appendBounded(
+          state.solvedItems,
+          { tool: toolName, outcome: `arguments repaired (${outcome.method})` },
+          SOLVED_RETENTION_CAP
+        );
+      }
+      return;
+    }
+    if (outcome.status === 'unrepairable') {
+      logger.warn(`tool '${toolName}' arguments unrepairable: ${outcome.reason}`);
+      return;
+    }
+    if (outcome.status === 'error') {
+      logger.warn(`tool-arg repair failed open for '${toolName}': ${outcome.reason}`);
+    }
+  };
 
   /**
    * Waits for the session's in-flight audit continuations, bounded by
@@ -1602,6 +2002,21 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           return; // not a user message (or an odd payload) — no goal
         }
         const state = sessionState.get(hookInput.sessionID);
+        // Tool-arg repair: capture the session's model identity in every
+        // mode — it drives the per-model tool-schema lookup.
+        const model = hookInput.model;
+        if (
+          model !== undefined &&
+          typeof model.providerID === 'string' &&
+          model.providerID !== '' &&
+          typeof model.modelID === 'string' &&
+          model.modelID !== ''
+        ) {
+          state.modelIdentity = { providerID: model.providerID, modelID: model.modelID };
+        }
+        if (repairOnly) {
+          return; // goal capture is audit-pipeline state; repair-only skips it
+        }
         if (state.goal !== undefined) {
           return; // FR-013: the first user message wins, permanently
         }
@@ -1644,6 +2059,18 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         // attempt itself is signal; recording happens before the
         // guard decision so neither path loses it.
         const state = sessionState.get(hookInput.sessionID);
+        // Tool-arg repair runs FIRST (arg-repair feature): malformed
+        // arguments are repaired in place before the guard so the guard —
+        // and the tool itself — see the repaired values. Fail-open: a
+        // repair crash never blocks the call.
+        try {
+          await runArgRepair(hookInput, output, state);
+        } catch (error) {
+          logger.warn(`tool-arg repair failed open: ${errorText(error)}`);
+        }
+        if (repairOnly) {
+          return;
+        }
         const argPaths = extractPolicyPaths(output.args);
         for (const id of matchTriggers(directives, hookInput.tool, argPaths)) {
           if (!state.triggeredDirectives.includes(id)) {
@@ -1844,6 +2271,9 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         // tool output is audit machinery, not supervised progress.
         if (isAuditorSessionId(hookInput.sessionID)) {
           return;
+        }
+        if (repairOnly) {
+          return; // solved items are memo state; repair-only skips the memo
         }
         const state = sessionState.get(hookInput.sessionID);
         appendBounded(
@@ -2103,6 +2533,16 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
       sessionState.clearAll();
     },
   };
+  // Repair-only mode (arg-repair feature): strip the audit-pipeline hooks
+  // — no reasoning observation, no agent console — leaving exactly
+  // chat.message (model capture), tool.execute.before (repair, then its
+  // own repairOnly early return), tool.execute.after (no-op via its own
+  // repairOnly check), and dispose. delete is safe: the properties are
+  // optional on Hooks.
+  if (repairOnly) {
+    delete hooks.event;
+    delete hooks.tool;
+  }
 
   // Memo injection (FR-016): registered through the guarded helper so
   // absence of the experimental hook degrades to memo-less operation
@@ -2187,7 +2627,10 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
       logger.error(`messages transform failed open: ${errorText(error)}`);
     }
   };
-  registerMessagesTransform(hooks, messagesTransform);
+  // Repair-only mode skips the memo: no goal, no trace, nothing to say.
+  if (!repairOnly) {
+    registerMessagesTransform(hooks, messagesTransform);
+  }
 
   return hooks;
 };

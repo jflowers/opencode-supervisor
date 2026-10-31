@@ -3,6 +3,48 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.7.0] - 2026-10-31
+
+### Added
+
+- Tool-arg repair: malformed tool-call arguments are repaired before the
+  tool executes. Models occasionally emit structurally broken arguments —
+  `{"questions": null}` where an array belongs, JSON-stringified arrays
+  and objects, or one question call's fragments split across separate
+  array elements — and OpenCode's schema error alone burns turns on
+  retry loops. The `tool.execute.before` hook now validates arguments
+  against the tool's JSON schema (fetched per provider/model from the
+  host's tool list, cached per identity), applies deterministic repairs
+  first (parse stringified values, extract embedded JSON, wrap single
+  objects in arrays, merge fragment runs, drop null optionals — each
+  gated by re-validation), and only then asks a repair model in a
+  dedicated side session, with the calling assistant message's reasoning
+  text as evidence and a strict no-invention rule: values must be
+  recovered verbatim or the call is declared unrepairable. Repaired
+  arguments merge in place, so the guard, the recorded tool-part input,
+  and execution all see one object; repair never throws, and every
+  failure path leaves the original arguments to fail normally.
+- `mode` configuration: `full` (default, everything) or `repair-only` —
+  the supervision hooks (reasoning audit, tool guard, memo, agent
+  console) stay unregistered so the plugin runs purely as an argument
+  repair pass. Settable through `OPENCODE_SUPERVISOR_MODE`, the
+  supervisor config files, and plugin options.
+- `argRepair` configuration block: `enabled` (default `true`), `model`
+  (defaults to the resolved auditor model, inheriting its derived
+  host-model fallback), `tools` (default: the OpenCode builtin tool
+  ids), `maxPerSession` (default 8), `timeoutMs` (default 15000).
+  Environment override: `OPENCODE_SUPERVISOR_REPAIR_MODEL`.
+- `repair` directive rule kind:
+  `{"repair": [{"tool": "dewey_search"}]}` adds matching tools (name or
+  glob) to the repair scope — the escape hatch for MCP and plugin tools
+  outside the builtin default.
+
+### Changed
+
+- The identity log line now names the active mode.
+
+50 new tests (353 total) pass under Bun and Node 22+.
+
 ## [2.6.0] - 2026-10-31
 
 Spec deltas:

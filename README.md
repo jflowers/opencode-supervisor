@@ -32,8 +32,14 @@ while it happens.
   on-demand audits.
 - **[The engineer console](#6-the-engineer-console)** — directive
   files pairing advisory text with machine rules (`when`, `enforce`,
-  `approve`, `review`) that shape the memo, the audit criteria, and
-  the tool guard.
+  `approve`, `review`, `repair`) that shape the memo, the audit
+  criteria, and the tool guard.
+- **[Tool-arg repair](#45-tool-arg-repair)** — malformed tool-call
+  arguments (`{"questions": null}` where an array belongs, a
+  JSON-stringified array, one call's fragments split across array
+  elements) are repaired before the tool executes: deterministic
+  structure fixes first, then a bounded repair-model side session.
+  Run standalone with `mode: "repair-only"`.
 
 ---
 
@@ -47,6 +53,7 @@ while it happens.
 | Reward hacking | `.skip()` on a failing test, deleted asserts, `git commit --no-verify` | The tool guard blocks the call before execution |
 | Hallucinated paths | Editing a file never named in verified reasoning | The tool guard blocks the write unless the verified trace names the path |
 | Scope drift | Asked to fix a bug, starts refactoring the module | The audit prompt carries the session goal; drift is a finding |
+| Malformed tool arguments | `{"questions": null}` where an array belongs, a JSON-stringified array, one call's fragments split across array elements | Tool-arg repair fixes the arguments before execution — deterministically when structure allows, otherwise a repair model recovers values from the assistant's reasoning (Section 4.5) |
 
 The loop is not code-specific: the same technique catches bad math in
 financial calculations, unit-conversion errors in data pipelines, and
@@ -228,8 +235,8 @@ tuple registration — Section 6):
 | Hook | Purpose |
 | :--- | :--- |
 | `event` | Observes completed reasoning parts (`message.part.updated`), deduplicates them, strips narrative, runs the invariants and the side-session peer audit, records steps in the verified trace (passed, or minor deterministic findings marked unpassed), and routes failures to critique delivery. |
-| `chat.message` | Captures the first user message of the session as the goal. The goal is never replaced. |
-| `tool.execute.before` | Tool guard: blocks reward-hacking tool calls, engineer-directive violations, and file paths absent from the verified trace (never blocks when the trace is empty; a trace block with an audit in flight waits up to 10 s for the settled trace, failing open up to the per-session `maxTimeoutFailOpens` cap — Section 4.2); holds approve-gated calls for engineer approval and review-gated calls for a passed peer audit (agent-console tools are exempt so `request_audit` stays reachable); records directive triggers. |
+| `chat.message` | Captures the session's model identity (drives the tool-arg repair schema lookup) and the first user message of the session as the goal. The goal is never replaced. |
+| `tool.execute.before` | Tool-arg repair first: validates raw arguments against the tool's JSON schema and repairs malformed ones in place (Section 4.5). Then the tool guard: blocks reward-hacking tool calls, engineer-directive violations, and file paths absent from the verified trace (never blocks when the trace is empty; a trace block with an audit in flight waits up to 10 s for the settled trace, failing open up to the per-session `maxTimeoutFailOpens` cap — Section 4.2); holds approve-gated calls for engineer approval and review-gated calls for a passed peer audit (agent-console tools are exempt so `request_audit` stays reachable); records directive triggers. |
 | `tool.execute.after` | Appends a solved item (tool name + short outcome) to a bounded log. |
 | `tool` | Agent console: registers `remind_me` / `forget_reminder` (durable reminders), `recall` (full retained state), `report` (self-reported events), and `request_audit` (on-demand peer audit) (Section 5). |
 | `experimental.chat.messages.transform` | Appends the supervisor memo to the conversation as one trailing user message per user prompt. Degrades gracefully (memo-less operation) when the hook is absent. |
@@ -238,7 +245,64 @@ tuple registration — Section 6):
 All logic lives in pure `src/` modules that import no OpenCode APIs;
 hooks and session state live only in `index.ts`, in module-level Maps
 keyed by session ID that die with the opencode process. See
-`AGENTS.md` for the module map.
+`AGENTS.md` for the module map. In `repair-only` mode the `event`,
+`tool`, and messages-transform hooks stay unregistered — only the
+model capture, the repair pass, `tool.execute.after`, and `dispose`
+remain.
+
+### 4.5 Tool-Arg Repair
+
+Some models emit structurally broken tool-call arguments: an array
+field arrives as `null`, a serialized array arrives as a JSON string,
+or one call's fragments are split across array elements. GLM 5.3 on
+one provider served all three shapes to the `question` tool, burning
+turns on schema-error retry loops. The repair pass fixes such calls
+before execution.
+
+The pass runs first inside `tool.execute.before`:
+
+1. **Validate.** The raw arguments are checked against the tool's
+   JSON schema, fetched through `client.tool.list` for the session's
+   model and cached per provider/model. The model identity comes from
+   `chat.message`, falling back to the persisted assistant message
+   carrying the call.
+2. **Repair deterministically.** Structure fixes apply first, each
+   gated by re-validation: parse JSON-stringified values, extract
+   embedded JSON from garbled strings, wrap a single object in an
+   array, merge fragment-run splits, drop null optionals. These make
+   no model call and are not bounded.
+3. **Repair with a model.** Unresolved cases go to a repair-model
+   side session — by default the resolved auditor model (including
+   the derived host-model fallback), or a dedicated one through
+   `argRepair.model` / `OPENCODE_SUPERVISOR_REPAIR_MODEL`. The prompt
+   carries the tool, the schema, the emitted arguments, the
+   validation issues, and the assistant reasoning text as evidence,
+   under a no-invention rule: values are recovered verbatim or the
+   call is declared unrepairable.
+4. **Apply.** Repaired arguments are re-validated against the schema
+   and merged in place, so the guard, the recorded tool-part input,
+   and execution all see one object.
+
+The pass never throws — every failure fails open to OpenCode's normal
+schema error. The scope defaults to the builtin tool ids
+(`argRepair.tools`; `"*"` covers everything including MCP and plugin
+tools, and `repair` directive rules add tools by name or glob —
+Section 6). Model-tier attempts are bounded per session
+(`argRepair.maxPerSession`, default 8), and the side session times
+out at `argRepair.timeoutMs` (default 15000). In full mode a repaired
+call logs a solved item.
+
+Run the pass standalone — no audit loop, guard, memo, or console —
+with:
+
+```json
+{
+  "mode": "repair-only",
+  "argRepair": {
+    "model": "openrouter/deepseek/deepseek-v4-pro"
+  }
+}
+```
 
 ---
 
@@ -304,6 +368,9 @@ directive is advisory text plus optional machine rules:
   is the reviewer — a passed audit referencing the path is the
   sign-off, and `request_audit` can produce one immediately. Review
   gates block on an empty trace.
+- **`repair` rules** add matching tools (`tool`, name or glob,
+  case-insensitive) to the tool-arg repair scope (Section 4.5) — the
+  escape hatch for MCP and plugin tools outside the builtin default.
 
 Directive files live in `.opencode/supervisor/directives/*.md`; the
 markdown body is the advisory text, and a fenced `supervisor` code
@@ -399,9 +466,10 @@ the approvals file — traversal and slash-free `cd` spellings are
 covered too. There
 is no default auditor model: with no tier setting one, the LLM audit
 tier is skipped entirely — deterministic invariants, the tool guard,
-and the memo remain active — and a warning names the state. The
-`auditorVariant` is optional; when unset, the side-session prompt
-omits it.
+and the memo remain active — and a warning names the state.
+`argRepair.model` defaults to the resolved auditor model, so a
+derived host model covers both. The `auditorVariant` is optional;
+when unset, the side-session prompt omits it.
 
 | Knob | Environment variable | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -417,6 +485,12 @@ omits it.
 | `memoLimits.maxReports` | `OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS` | `5` | Cap on agent reports kept in state and shown in the memo (the most recent are kept). |
 | `maxOnDemandAudits` | `OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS` | `8` | Per-session cap on audits requested through the `request_audit` tool. The automatic audit loop is unaffected. |
 | `maxTimeoutFailOpens` | `OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS` | `3` | Per-session cap on trace-check waits that time out and fail open (the wait itself is bounded at 10 seconds). Past the cap a timed-out wait blocks naming the still-unsettled audit. |
+| `mode` | `OPENCODE_SUPERVISOR_MODE` | `full` | `full` runs everything; `repair-only` registers only the tool-arg repair pass (Section 4.5). |
+| `argRepair.enabled` | *(config file/options only)* | `true` | Master switch for the tool-arg repair pass. |
+| `argRepair.model` | `OPENCODE_SUPERVISOR_REPAIR_MODEL` | *(the resolved auditor model)* | Repair-model slug, `<provider>/<model-id>` (for example, `openrouter/deepseek/deepseek-v4-pro`). Inherits the auditor's derived host-model fallback. |
+| `argRepair.tools` | *(config file/options only)* | builtin tool ids | Tools in the repair scope; `"*"` covers everything including MCP and plugin tools. |
+| `argRepair.maxPerSession` | *(config file/options only)* | `8` | Per-session bound on repair-model attempts; deterministic repairs are unbounded. |
+| `argRepair.timeoutMs` | *(config file/options only)* | `15000` | Timeout on the repair side session. |
 
 Gate approvals are not a knob: `approve` rules read the approvals file
 fresh at each gated call, so approving or revoking takes effect on
@@ -424,8 +498,8 @@ the next tool call with no restart (Section 6).
 
 Environment variable values: booleans accept exactly `true` or
 `false`; numbers must be non-negative; `stripMode` must be one of the
-three mode names. Invalid values fall through to the next precedence
-tier.
+three mode names; `mode` must be `full` or `repair-only`. Invalid
+values fall through to the next precedence tier.
 
 All plugin diagnostics go to the OpenCode server log (service tag
 `opencode-supervisor`) through the `/log` endpoint — never to
