@@ -77,7 +77,7 @@ Spec deltas:
   shifting the guard's token offsets — the grammar now compiles per
   call site (#34; FR-068).
 
-9 new tests (303 total) pass under Bun and Node 22+.
+27 new tests (303 total) pass under Bun and Node 22+.
 
 ## [2.5.0] - 2026-10-30
 
