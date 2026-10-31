@@ -1577,7 +1577,13 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           // verifyToolIntent's pure-module signature on plain strings.
           state.verifiedSteps.map((entry) => entry.text),
           await buildConfig(),
-          enforcement
+          enforcement,
+          // FR-065 (design D7): the plugin's own console tools skip the
+          // file-path trace check. Derived from the registered tool map —
+          // the same source the gate exemption below uses — so a future
+          // console tool is exempt automatically; the reward-hacking
+          // check inside the guard still applies to them.
+          new Set(hooks.tool !== undefined ? Object.keys(hooks.tool) : [])
         );
         // Directive gates (FR-043..FR-047; design D2): evaluated
         // only when the guard allows, so a forbidden path never

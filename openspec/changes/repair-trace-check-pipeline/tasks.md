@@ -122,14 +122,14 @@
 ## 4. Argument lens and console exemption (#33 — FR-064,
 FR-065)
 
-- [ ] 4.1 Give the trace check the round-4 content-key lens in
+- [x] 4.1 Give the trace check the round-4 content-key lens in
   `verifyToolIntent`: for non-bash tools, scan top-level string
   values minus CONTENT_ARG_KEYS (the `checkProtectedState`
   idiom); bash command strings stay operational in full
   (FR-064, design D6). Verify: a write whose `content` quotes
   an unreferenced filename no longer trace-blocks while its
   `filePath` is checked as before.
-- [ ] 4.2 Add the optional `consoleTools?: ReadonlySet<string>`
+- [x] 4.2 Add the optional `consoleTools?: ReadonlySet<string>`
   parameter to `verifyToolIntent` (default none) skipping the
   file-path trace check for registered console tools, and pass
   the set derived from `hooks.tool` in index.ts, mirroring the
@@ -137,7 +137,7 @@ FR-065)
   with a focus naming an unreferenced path is not
   trace-blocked; the reward-hacking check still applies;
   existing four-argument callers are unaffected.
-- [ ] 4.3 Tests (test/audit.test.ts): content-key tokens never
+- [x] 4.3 Tests (test/audit.test.ts): content-key tokens never
   trigger the trace check for non-bash tools (a `write` whose
   `content` quotes `risk-tier1.sh` with a referenced
   `filePath`); custom keys like `target` still block; bash
@@ -145,7 +145,7 @@ FR-065)
   trace-blocked; the FR-010 positive case and FR-011 unchanged
   (FR-064, FR-065). Verify: `bun test` and
   `node --test test/audit.test.ts` green.
-- [ ] 4.4 Docs: CHANGELOG Fixed bullet; README §4.2
+- [x] 4.4 Docs: CHANGELOG Fixed bullet; README §4.2
   content-versus-operational lens and console-tool exemption;
   AGENTS.md tool-guard bullet. Verify: README names the bash
   heredoc residual.

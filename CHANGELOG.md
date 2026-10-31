@@ -33,6 +33,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `config.json` tokenizes whole. The shared grammar lives in the new
   `src/path-tokens.ts` leaf module, so the guard and the stripper
   recognize the same tokens (#36; FR-066).
+- The trace check now scans operational arguments only. A write whose
+  `content` quoted a filename the verified trace never mentioned
+  blocked as an unaudited touch — authored data is not an operation.
+  For tools other than bash, values under the content keys
+  (`content`, `oldString`, `newString`) are skipped while every other
+  argument key, including custom and MCP names, stays scanned;
+  bash command strings remain operational in full. The plugin's own
+  console tools are exempt from the trace check, derived from the
+  registered tool map so a future console tool is covered
+  automatically — `request_audit` can no longer fence its own
+  channel, and the reward-hacking check still applies to it (#33;
+  FR-064, FR-065).
 
 ## [2.5.0] - 2026-10-30
 
