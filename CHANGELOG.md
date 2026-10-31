@@ -3,7 +3,10 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [2.6.0] - 2026-10-31
+
+Spec deltas:
+`openspec/changes/repair-trace-check-pipeline/specs/trace-check/spec.md`.
 
 ### Fixed
 
@@ -73,6 +76,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `hasPathToken` probes and `matchAll` extraction, silently
   shifting the guard's token offsets — the grammar now compiles per
   call site (#34; FR-068).
+
+9 new tests (303 total) pass under Bun and Node 22+.
 
 ## [2.5.0] - 2026-10-30
 

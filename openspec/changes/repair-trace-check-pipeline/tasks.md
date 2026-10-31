@@ -227,11 +227,11 @@ FR-065)
 
 ## 6. Integration and release
 
-- [ ] 6.1 Run both suites end to end: `bun test` and
+- [x] 6.1 Run both suites end to end: `bun test` and
   `node --test` across all eight test files (no new test
   files, so the AGENTS.md node list is unchanged). Verify:
   both runtimes green.
-- [ ] 6.2 Stamp 2.6.0 (MINOR, design D11): `package.json` and
+- [x] 6.2 Stamp 2.6.0 (MINOR, design D11): `package.json` and
   `PLUGIN_VERSION` together; the CHANGELOG `[Unreleased]`
   section becomes `[2.6.0]`, opening with `Spec deltas:
   openspec/changes/repair-trace-check-pipeline` per the
