@@ -1,0 +1,13 @@
+schema: spec-driven
+created: 2026-10-31
+goal: Repair the verified-trace check pipeline end to end (issues #35, #36, #33, #34)
+originating_issue: 35
+sibling_issues: [33, 34, 36]
+notes: >
+  Primary issue #35 (the /uf.unleash tier route resolved from it);
+  siblings #33, #34, and #36 come from the same field session
+  (ses_e72a74b18ffeOU3uNACKZ9k1Jz, adlc-research, plugin v2.5.0,
+  default config). The eventual PR must thread closes-references
+  for all four issues. The originating_issue / sibling_issues /
+  notes keys are unrecognized by the openspec CLI (ignored, no
+  effect) but kept for /uf.finale to read when threading the PR.
