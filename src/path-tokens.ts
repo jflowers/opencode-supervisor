@@ -53,11 +53,17 @@ const PATTERN_CHARS = /[*?$\[]/;
  */
 export function extractPathTokens(text: string): string[] {
   const tokens: string[] = [];
+  // Set-backed dedupe (review iteration 3): the array scan was
+  // O(n^2) in token count, so an adversarial step carrying tens of
+  // thousands of distinct paths cost seconds — and the
+  // spread-limit regression test needs exactly that volume.
+  const seen = new Set<string>();
   // Fresh `g` instance per call: the iterator starts at offset 0 no
   // matter what any earlier consumer left behind (see the source
   // constant's comment on the shared-cursor hazard).
   for (const match of text.matchAll(new RegExp(PATH_TOKEN_SOURCE, 'g'))) {
-    if (!tokens.includes(match[0])) {
+    if (!seen.has(match[0])) {
+      seen.add(match[0]);
       tokens.push(match[0]);
     }
   }

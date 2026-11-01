@@ -14,7 +14,7 @@ import {
   type AuditConfig,
   type InvokeModel,
 } from '../src/auditor.ts';
-import { extractArgPaths, isGlobPatternRejected, isTokenCovered, verifyToolIntent } from '../src/tool-guard.ts';
+import { extractArgPaths, globPathMatches, isGlobPatternRejected, isTokenCovered, verifyToolIntent } from '../src/tool-guard.ts';
 import { extractPathTokens, hasPathToken, isPatternToken } from '../src/path-tokens.ts';
 import { DEFAULT_MEMO_LIMITS } from '../src/memo.ts';
 import { silentPluginLogger } from '../src/plugin-log.ts';
@@ -691,6 +691,74 @@ test('isTokenCovered fails closed on patterns the compiler rejects (FR-070 harde
   // result must stay false, not throw.
   const longToken = `${'a'.repeat(600)}.md`;
   assert.equal(isTokenCovered(longToken, ['a*.md']), false);
+});
+
+test('globPathMatches applies POSIX character-class semantics without eating slashes (review iteration 3)', () => {
+  // Positive class.
+  assert.equal(globPathMatches('kb/[ab].md', 'kb/a.md'), true);
+  assert.equal(globPathMatches('kb/[ab].md', 'kb/c.md'), false);
+  // '!' negation and '^' negation.
+  assert.equal(globPathMatches('a[!x]b.md', 'aqb.md'), true);
+  assert.equal(globPathMatches('a[!x]b.md', 'axb.md'), false);
+  assert.equal(globPathMatches('a[^x]b.md', 'aqb.md'), true);
+  assert.equal(globPathMatches('a[^x]b.md', 'axb.md'), false);
+  // Ranges, and negated ranges.
+  assert.equal(globPathMatches('a[b-d]b.md', 'acb.md'), true);
+  assert.equal(globPathMatches('a[b-d]b.md', 'aeb.md'), false);
+  assert.equal(globPathMatches('a[!b-d]b.md', 'aeb.md'), true);
+  assert.equal(globPathMatches('a[!b-d]b.md', 'acb.md'), false);
+  // The iteration-3 bug: a negated class used to match '/' (the
+  // boundary guard was XORed with the negation), letting
+  // 'x[!y]z.md' match 'x/z.md'. A class — negated or not — never
+  // consumes a slash.
+  assert.equal(globPathMatches('x[!y]z.md', 'x/z.md'), false);
+  assert.equal(globPathMatches('x[!y]z.md', 'xwz.md'), true);
+  // Class-versus-slash in a full-path context, both directions.
+  assert.equal(globPathMatches('kb/[!x]/notes.md', 'kb/x/notes.md'), false);
+  assert.equal(globPathMatches('kb/[!x]/notes.md', 'kb/y/notes.md'), true);
+  assert.equal(globPathMatches('kb/[!x]/notes.md', 'kb//notes.md'), false);
+  // The same semantics through coverage: pattern spellings stay
+  // path-scoped so the pattern gate passes.
+  assert.equal(isTokenCovered('kb/xwz.md', ['kb/x[!y]z.md']), true);
+  assert.equal(isTokenCovered('kb/x/z.md', ['kb/x[!y]z.md']), false);
+});
+
+test('pattern satisfaction fails closed when the aggregate glob budget is exhausted (review iteration 3)', () => {
+  // Per-pair bounds do not bound the total: trace patterns x call
+  // tokens x suffix positions are all agent-authored, so the scan
+  // carries one shared work budget (MAX_GLOB_BUDGET_CELLS, 4M).
+  // Each decoy pattern costs ~19k cells against a 511-cell
+  // subject; 220 decoys exceed the budget before the covering
+  // pattern is reached.
+  const decoys = Array.from({ length: 220 }, (_unused, index) => `kb/x${index}/${'*a'.repeat(16)}.md`);
+  const callToken = `kb/real/${'n'.repeat(500)}.md`;
+  const steps = decoys.map((pattern) => `Write ${pattern}.`);
+  const write = { name: 'write', arguments: { filePath: callToken, content: 'x' } };
+  // Covering pattern last: the budget is drained first, so the
+  // call blocks — the aggregate bound, not the semantics.
+  const blocked = verifyToolIntent(write, [...steps, 'Write kb/real/*.md.'], baseAuditConfig);
+  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.unmatchedToken, callToken);
+  // Covering pattern first: the same steps pass, proving the
+  // block above is the budget, not a matching defect.
+  const allowed = verifyToolIntent(write, ['Write kb/real/*.md.', ...steps], baseAuditConfig);
+  assert.equal(allowed.allowed, true);
+  // The mirror through isTokenCovered: candidate order decides.
+  assert.equal(isTokenCovered(callToken, [...decoys, 'kb/real/*.md']), false);
+  assert.equal(isTokenCovered(callToken, ['kb/real/*.md', ...decoys]), true);
+});
+
+test('verifyToolIntent explains pattern non-satisfaction for pattern call tokens (FR-069, review iteration 3)', () => {
+  const verdict = verifyToolIntent(
+    { name: 'write', arguments: { filePath: 'kb/topics/*.md', content: 'x' } },
+    ['Edit src/a.ts to export the helper.'],
+    baseAuditConfig
+  );
+  assert.equal(verdict.allowed, false);
+  assert.equal(verdict.unmatchedToken, 'kb/topics/*.md');
+  assert.ok(verdict.reason.includes('is not satisfied by the verified reasoning trace'));
+  assert.ok(verdict.reason.includes('Reason about the files the pattern expands to'));
+  assert.ok(verdict.reason.includes('retry once the audit settles'));
 });
 
 test('verifyToolIntent treats authored content as data, not a touch (FR-064)', () => {
@@ -2596,9 +2664,18 @@ function raceHarness(): {
   input: PluginInput;
   logEntries: Array<{ level: string; message: string }>;
   parkedResolvers: Array<(text: string) => void>;
+  nextPromptStarted: () => Promise<void>;
 } {
   const logEntries: Array<{ level: string; message: string }> = [];
   const parkedResolvers: Array<(text: string) => void> = [];
+  // Deterministic handshake (review iteration 3): each prompt call
+  // releases exactly one waiter, so tests await audit registration
+  // instead of polling the event loop.
+  const promptWaiters: Array<() => void> = [];
+  const nextPromptStarted = (): Promise<void> =>
+    new Promise<void>((resolve) => {
+      promptWaiters.push(resolve);
+    });
   const input = {
     client: {
       session: {
@@ -2609,6 +2686,7 @@ function raceHarness(): {
         prompt: () =>
           new Promise<{ data: { info: unknown; parts: Array<{ type: 'text'; text: string }> } }>((resolve) => {
             parkedResolvers.push((text: string) => resolve({ data: { info: {}, parts: [{ type: 'text', text }] } }));
+            promptWaiters.shift()?.();
           }),
         promptAsync: async () => ({}),
         abort: async () => ({}),
@@ -2625,7 +2703,7 @@ function raceHarness(): {
     },
     directory: '/tmp/supervisor-race-test',
   };
-  return { input: input as unknown as PluginInput, logEntries, parkedResolvers };
+  return { input: input as unknown as PluginInput, logEntries, parkedResolvers, nextPromptStarted };
 }
 
 /** The queued passing verdict every battery cleanup path releases the parked audit with. */
@@ -2749,6 +2827,111 @@ test('a covered trace-check wait that times out fails open on its own budget (FR
       harness.parkedResolvers[0]?.(PASSED_VERDICT);
       await dispatch;
       traceAwaitState.timeoutMs = savedTimeoutMs;
+    }
+  });
+});
+
+test('a covered timeout keeps its pre-wait coverage after that audit settles (design D4, FR-070)', async () => {
+  await withCleanAuditEnv(async () => {
+    const harness = raceHarness();
+    const hooks = await plugin.server(harness.input);
+    const sessionID = 'race-two-audits';
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
+
+    // Two audits are in flight when the call blocks: audit A's
+    // step names notes.md (the blocked token), audit B names
+    // other.md. A settles — and deregisters — after the call has
+    // entered its wait but before the timeout. Coverage reads the
+    // PRE-WAIT snapshot (design D4): the correction was reasoned
+    // before the call blocked, so the timeout stays covered and
+    // charges the covered budget, not the uncovered one. If
+    // coverage read the live map instead, A's deregistration
+    // would flip this to uncovered — that is the discrimination.
+    const savedTimeoutMs = traceAwaitState.timeoutMs;
+    traceAwaitState.timeoutMs = 15;
+    const firstPrompt = harness.nextPromptStarted();
+    const secondPrompt = harness.nextPromptStarted();
+    let dispatchA: Promise<void> | undefined;
+    let dispatchB: Promise<void> | undefined;
+    let call: Promise<void> | undefined;
+    try {
+      dispatchA = dispatchPart(
+        hooks,
+        completedReasoningPart({ sessionID, id: 'part-two-audits-a', text: 'I will record the outcome in notes.md.' })
+      );
+      dispatchB = dispatchPart(
+        hooks,
+        completedReasoningPart({ sessionID, id: 'part-two-audits-b', text: 'I will review the checklist in other.md.' })
+      );
+      await firstPrompt;
+      await secondPrompt;
+      assert.equal(harness.parkedResolvers.length, 2, 'both audits should be parked and registered');
+
+      call = dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'notes.md', content: 'session summary' });
+      // One macrotask boundary: the call has entered its bounded
+      // wait and snapshotted both in-flight audits.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      // Audit A settles and deregisters; B keeps the allSettled
+      // wait pending, so the call times out with A gone from the
+      // live map but present in its pre-wait snapshot.
+      harness.parkedResolvers[0](PASSED_VERDICT);
+      await dispatchA;
+      assert.ok(
+        sessionState.get(sessionID).verifiedSteps.some((step) => step.text.includes('record the outcome in notes.md')),
+        'audit A should have recorded its step'
+      );
+      await assert.doesNotReject(() => call);
+      const warnings = harness.logEntries.filter(
+        (entry) => entry.level === 'warn' && entry.message.includes('trace-check wait timed out')
+      );
+      assert.equal(warnings.length, 1);
+      assert.ok(warnings[0].message.includes('covered token'));
+      assert.ok(warnings[0].message.includes('failing open (1/6)'));
+      assert.equal(sessionState.get(sessionID).coveredTimeoutFailOpens, 1);
+      assert.equal(sessionState.get(sessionID).timeoutFailOpens, 0);
+    } finally {
+      harness.parkedResolvers[1]?.(PASSED_VERDICT);
+      await dispatchB?.catch(() => {});
+      await call?.catch(() => {});
+      traceAwaitState.timeoutMs = savedTimeoutMs;
+    }
+  });
+});
+
+test('the event hook records step tokens without spread limits on adversarial parts (review iteration 3)', async () => {
+  await withCleanAuditEnv(async () => {
+    const harness = raceHarness();
+    const hooks = await plugin.server(harness.input);
+    const sessionID = 'race-spread-limit';
+
+    // The reasoning part carries more DISTINCT path tokens than the
+    // old spread-into-push argument limit (>65k) — the extractor
+    // dedupes, so only distinct spellings grow the array. The
+    // step-token fill is a bounded loop, so the continuation
+    // survives, the audit parks, and the recorded box carries the
+    // full token list.
+    const tokenText = Array.from({ length: 70000 }, (_unused, index) => `f${index}.md`).join(' ');
+    const promptStarted = harness.nextPromptStarted();
+    let dispatch: Promise<void> | undefined;
+    try {
+      dispatch = dispatchPart(
+        hooks,
+        completedReasoningPart({
+          sessionID,
+          id: 'part-spread-limit',
+          text: `I will touch the files: ${tokenText}`
+        })
+      );
+      await promptStarted;
+      assert.equal(harness.parkedResolvers.length, 1, 'the audit should be parked — the token fill survived');
+      assert.equal(sessionState.get(sessionID).pendingAudits.size, 1);
+      const box = [...sessionState.get(sessionID).pendingAudits.values()][0];
+      assert.ok(box.length > 65000, `the step-token box should carry every token (got ${box.length})`);
+      const failures = harness.logEntries.filter((entry) => entry.message.includes('event hook failed'));
+      assert.equal(failures.length, 0, 'no continuation failure should be logged');
+    } finally {
+      harness.parkedResolvers[0]?.(PASSED_VERDICT);
+      await dispatch?.catch(() => {});
     }
   });
 });
@@ -2880,6 +3063,7 @@ test('a settled wait whose correction was audited but evicted says so (FR-070)',
     sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
 
     const PEER_FAILED_VERDICT = '{"passed":false,"failedStep":0,"severity":"minor","critique":"The claim is not verifiable."}';
+    const promptStarted = harness.nextPromptStarted();
     const dispatch = dispatchPart(
       hooks,
       completedReasoningPart({ sessionID, id: 'part-evicted', text: 'I will record the outcome in notes.md.' })
@@ -2889,9 +3073,7 @@ test('a settled wait whose correction was audited but evicted says so (FR-070)',
     // synchronous with the dispatch, strictly before the model
     // call), so the tool call below always takes the wait branch —
     // no wall-clock sleep to lose the interleaving.
-    for (let attempt = 0; harness.parkedResolvers.length === 0 && attempt < 500; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    }
+    await promptStarted;
     assert.ok(harness.parkedResolvers.length > 0, 'audit should be parked and registered');
     let call: Promise<void> | undefined;
     try {
@@ -2938,13 +3120,12 @@ test('a settled wait re-blocked on a different path names that path, not an evic
     // b.md is not covered by the departed audit's [a.md], so the
     // reason is the generic absent-path one naming b.md, never the
     // stale-token eviction attribution blaming a.md.
+    const promptStarted = harness.nextPromptStarted();
     const dispatch = dispatchPart(
       hooks,
       completedReasoningPart({ sessionID, id: 'part-fresh-unmatched', text: 'I will update a.md with the summary.' })
     );
-    for (let attempt = 0; harness.parkedResolvers.length === 0 && attempt < 500; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    }
+    await promptStarted;
     assert.ok(harness.parkedResolvers.length > 0, 'audit should be parked and registered');
     let call: Promise<void> | undefined;
     try {

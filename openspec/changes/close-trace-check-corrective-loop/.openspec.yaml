@@ -5,6 +5,7 @@ affected_areas:
   - src/tool-guard.ts
   - index.ts
   - src/config-file.ts
+  - src/path-tokens.ts
   - test/audit.test.ts
   - test/config-file.test.ts
   - openspec/specs/trace-check/spec.md

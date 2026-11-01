@@ -598,9 +598,12 @@ cp skills/reasoning-auditor/skill.md ~/.config/opencode/skills/reasoning-auditor
   combined worst case is their sum (9 by default). Trace-pattern
   matching (FR-069) runs a total bounded DP glob matcher, never a
   RegExp: patterns over 512 characters or 32 wildcards, or match
-  subjects over 512 characters, are rejected fail-closed with a
-  block reason naming the complexity bounds. An
-  empty trace never blocks. Directive
+  subjects over 512 characters, are rejected fail-closed, and
+  every match in one guard call shares a 4M-cell work budget
+  that fails closed when exhausted. Only a rejected *call*
+  pattern surfaces the complexity bounds in its block reason;
+  rejected trace-side patterns and over-cap subjects simply
+  match nothing. An empty trace never blocks. Directive
   globs are root-anchored and case-insensitive;
   `**/`-prefixed globs cover deeper spellings.
 - Path-bearing survival (Section 7.1) is mode-scoped and

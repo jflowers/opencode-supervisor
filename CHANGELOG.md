@@ -41,10 +41,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fail-open path) and runs in O(pattern × subject) instead of
   catastrophic backtracking. Both sides are capped (pattern over
   512 characters or more than 32 wildcards, subject over 512
-  characters); a rejected pattern covers nothing — fail closed,
-  with a block reason naming the complexity bounds (review
-  hardening, iterations 1 and 2). Engineer-authored directive
-  globs are unchanged.
+  characters) and every match in one guard call shares a 4M-cell
+  aggregate work budget that fails closed when exhausted, so
+  agent-authored pattern counts cannot multiply the work. A
+  rejected *call* pattern names the complexity bounds in its
+  block reason; rejected trace-side patterns and over-cap
+  subjects match nothing (review hardening, iterations 1-3).
+  Engineer-authored directive globs are unchanged.
+- `extractPathTokens` deduplication is now Set-backed (was
+  `Array.includes`), O(n²) → O(n) in token count — adversarial
+  reasoning parts carrying tens of thousands of distinct path
+  tokens no longer stall the event hook (review iteration 3).
+- API stability: `pendingAudits` (Set → Map) and the new required
+  `HookConfig.maxCoveredTimeoutFailOpens` field ship on this
+  minor bump; both are plugin-internal surfaces — OpenCode loads
+  `index.ts` directly and configuration flows through opencode
+  plugin options, so there are no programmatic consumers of
+  either shape.
 
 Spec deltas: `openspec/changes/close-trace-check-corrective-loop/`
 (base synced to `openspec/specs/trace-check/spec.md`).

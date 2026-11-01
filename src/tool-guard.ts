@@ -210,15 +210,56 @@ const parseGlobPattern = (devaried: string): GlobToken[] => {
 };
 
 /**
+ * Counted work budget for one calling operation (review iteration
+ * 3): every DP table reserves its cells against the budget, and a
+ * drained budget fails closed — no coverage. The per-pattern caps
+ * bound a single match, but the multiplication axes around it
+ * (trace pattern tokens × call tokens × suffix positions) are all
+ * agent-authored, so per-invocation caps alone left the TOTAL
+ * unbounded (learning availability-20261101T160155).
+ */
+type GlobWorkBudget = { cellsRemaining: number };
+
+const MAX_GLOB_BUDGET_CELLS = 4_000_000;
+
+const createGlobBudget = (): GlobWorkBudget => ({ cellsRemaining: MAX_GLOB_BUDGET_CELLS });
+
+/**
+ * Devary + bounds-check + parse, once per pattern: the shared
+ * pre-compilation step every match site goes through, so a
+ * pattern is never re-devaried and re-parsed per subject or per
+ * suffix (review iteration 3). Returns null when the pattern
+ * exceeds the complexity bounds — it matches nothing, fail closed.
+ */
+const compileGlobPattern = (pattern: string): GlobToken[] | null => {
+  const devaried = pattern.replace(/\$[a-zA-Z0-9_]+/g, '*');
+  if (devaried.length > MAX_GLOB_PATTERN_LENGTH || countGlobWildcards(devaried) > MAX_GLOB_PATTERN_WILDCARDS) {
+    return null;
+  }
+  return parseGlobPattern(devaried);
+};
+
+/**
  * O(pattern × subject) glob evaluation — an iterative DP over
  * suffix indexes, total by construction: no RegExp, no
  * backtracking, no throw. `*` consumes any run of non-slash
  * characters, `?` and classes consume exactly one non-slash
- * character, literals (including `/`) consume themselves.
+ * character — a class never consumes `/`, not even a negated one
+ * (review iteration 3: the old `inClass !== negated` XOR let a
+ * negated class eat the slash boundary) — and literals (including
+ * `/`) consume themselves. The full first row is returned so one
+ * pass answers every suffix start; null means the work budget
+ * drained (fail closed).
  */
-const globTokensMatch = (tokens: readonly GlobToken[], subject: string): boolean => {
+const globMatchTable = (tokens: readonly GlobToken[], subject: string, budget: GlobWorkBudget): boolean[] | null => {
   const p = tokens.length;
   const s = subject.length;
+  const cells = (p + 1) * (s + 1);
+  if (cells > budget.cellsRemaining) {
+    budget.cellsRemaining = 0;
+    return null;
+  }
+  budget.cellsRemaining -= cells;
   const dp: boolean[][] = Array.from({ length: p + 1 }, () => new Array<boolean>(s + 1).fill(false));
   dp[p][s] = true;
   for (let i = p - 1; i >= 0; i -= 1) {
@@ -233,15 +274,51 @@ const globTokensMatch = (tokens: readonly GlobToken[], subject: string): boolean
         if (token.kind === 'question') {
           dp[i][j] = sc !== '/' && dp[i + 1][j + 1];
         } else if (token.kind === 'class') {
-          const inClass = sc !== '/' && token.chars.has(sc);
-          dp[i][j] = inClass !== token.negated && dp[i + 1][j + 1];
+          const inClass = token.chars.has(sc);
+          dp[i][j] = sc !== '/' && inClass !== token.negated && dp[i + 1][j + 1];
         } else {
           dp[i][j] = token.char === sc && dp[i + 1][j + 1];
         }
       }
     }
   }
-  return dp[0][0];
+  return dp[0];
+};
+
+/**
+ * Full-path match: the pattern must cover the subject from index
+ * 0, within the subject cap.
+ */
+const globTokensMatch = (tokens: readonly GlobToken[], subject: string, budget: GlobWorkBudget): boolean => {
+  if (subject.length > MAX_GLOB_SUBJECT_LENGTH) {
+    return false;
+  }
+  const starts = globMatchTable(tokens, subject, budget);
+  return starts !== null && starts[0];
+};
+
+/**
+ * Slash-boundary suffix match: the pattern matches subject[j..]
+ * for j = 0 or any j just past a `/`, each suffix within the
+ * subject cap — one DP pass instead of a re-run per boundary
+ * (review iteration 3: the old suffix loop was O(pattern ×
+ * subject²) per pair).
+ */
+const globTokensMatchAnySuffix = (tokens: readonly GlobToken[], subject: string, budget: GlobWorkBudget): boolean => {
+  const starts = globMatchTable(tokens, subject, budget);
+  if (starts === null) {
+    return false;
+  }
+  const s = subject.length;
+  if (s <= MAX_GLOB_SUBJECT_LENGTH && starts[0]) {
+    return true;
+  }
+  for (let j = 1; j <= s; j += 1) {
+    if (starts[j] && subject[j - 1] === '/' && s - j <= MAX_GLOB_SUBJECT_LENGTH) {
+      return true;
+    }
+  }
+  return false;
 };
 
 /**
@@ -253,18 +330,15 @@ const globTokensMatch = (tokens: readonly GlobToken[], subject: string): boolean
  * on either complexity bound: a rejected pattern or an over-long
  * subject matches nothing. Cross-segment `**` for variables was
  * rejected (any `.md` mention would satisfy any `$var/*.md` call,
- * dissolving the filename-level check).
+ * dissolving the filename-level check). Exported for direct
+ * match-semantics testing (review iteration 3).
  */
-const globPathMatches = (pattern: string, subject: string): boolean => {
-  const devaried = pattern.replace(/\$[a-zA-Z0-9_]+/g, '*');
-  if (
-    devaried.length > MAX_GLOB_PATTERN_LENGTH ||
-    countGlobWildcards(devaried) > MAX_GLOB_PATTERN_WILDCARDS ||
-    subject.length > MAX_GLOB_SUBJECT_LENGTH
-  ) {
+export const globPathMatches = (pattern: string, subject: string, budget: GlobWorkBudget = createGlobBudget()): boolean => {
+  const compiled = compileGlobPattern(pattern);
+  if (compiled === null) {
     return false;
   }
-  return globTokensMatch(parseGlobPattern(devaried), subject);
+  return globTokensMatch(compiled, subject, budget);
 };
 
 /**
@@ -277,21 +351,24 @@ const globPathMatches = (pattern: string, subject: string): boolean => {
  * absolute tool arguments against relative reasoning spellings.
  * A pattern rejected by the complexity bounds matches nothing —
  * fail closed, exactly as an unmatched pattern does.
+ *
+ * The pattern compiles once and a single DP pass answers every
+ * slash-boundary suffix at once (row dp[0] holds match-by-start
+ * for the whole subject; review iteration 3 — the old per-suffix
+ * re-runs multiplied work by subject slash density). Budget
+ * cells are charged against the caller's aggregate (one budget
+ * per guard scan, not per pair), so pattern × token × suffix
+ * multiplication cannot exceed MAX_GLOB_BUDGET_CELLS.
  */
-const patternCoversToken = (pattern: string, loweredToken: string): boolean => {
+const patternCoversToken = (pattern: string, loweredToken: string, budget: GlobWorkBudget): boolean => {
   if (!pattern.includes('/')) {
     return false;
   }
-  if (globPathMatches(pattern, loweredToken)) {
-    return true;
+  const compiled = compileGlobPattern(pattern);
+  if (compiled === null) {
+    return false;
   }
-  for (let index = loweredToken.indexOf('/'); index !== -1; index = loweredToken.indexOf('/', index + 1)) {
-    const suffix = loweredToken.slice(index + 1);
-    if (suffix !== '' && globPathMatches(pattern, suffix)) {
-      return true;
-    }
-  }
-  return false;
+  return globTokensMatchAnySuffix(compiled, loweredToken, budget);
 };
 
 /**
@@ -324,9 +401,18 @@ export function isTokenCovered(token: string, candidateTokens: readonly string[]
     return true;
   }
   if (isPatternToken(lowered)) {
-    return loweredCandidates.some((candidate) => globPathMatches(lowered, candidate));
+    // One budget covers the whole coverage check (review
+    // iteration 3): candidates × patterns are both bounded
+    // counts, but their product charges one aggregate.
+    const budget = createGlobBudget();
+    const compiled = compileGlobPattern(lowered);
+    if (compiled === null) {
+      return false;
+    }
+    return loweredCandidates.some((candidate) => globTokensMatch(compiled, candidate, budget));
   }
-  return loweredCandidates.some((candidate) => isPatternToken(candidate) && patternCoversToken(candidate, lowered));
+  const budget = createGlobBudget();
+  return loweredCandidates.some((candidate) => isPatternToken(candidate) && patternCoversToken(candidate, lowered, budget));
 }
 
 /**
@@ -370,6 +456,11 @@ function findUnreferencedPath(
   // Trace-side tokens, extracted lazily: only pattern satisfaction
   // needs them, and most calls carry none.
   let traceTokens: string[] | null = null;
+  // One glob budget covers the whole scan (review iteration 3):
+  // trace patterns × call tokens × suffix positions are all
+  // agent-authored axes, so the multiplication itself — not just
+  // each single match — must be bounded and fail closed.
+  const globBudget = createGlobBudget();
 
   for (const fileToken of argPaths) {
     if (isPatternToken(fileToken)) {
@@ -383,7 +474,8 @@ function findUnreferencedPath(
       // A rejected pattern (complexity bounds) matches nothing:
       // it blocks naming itself, exactly as an unmatched pattern
       // does — the reason layer distinguishes it (FR-012).
-      if (traceTokens.some((token) => globPathMatches(lowered, token))) {
+      const compiled = compileGlobPattern(lowered);
+      if (compiled !== null && traceTokens.some((token) => globTokensMatch(compiled, token, globBudget))) {
         continue;
       }
       return fileToken;
@@ -399,7 +491,7 @@ function findUnreferencedPath(
     traceTokens ??= verifiedSteps
       .flatMap((step) => extractPathTokens(step))
       .map((token) => token.toLowerCase());
-    if (traceTokens.some((token) => isPatternToken(token) && patternCoversToken(token, lowered))) {
+    if (traceTokens.some((token) => isPatternToken(token) && patternCoversToken(token, lowered, globBudget))) {
       continue;
     }
     return fileToken;
@@ -580,17 +672,22 @@ export const hasProtectedSegmentRun = (normalized: string, run: string): boolean
  * matches within a segment, `?` one character, and `[...]` a
  * character class. Evaluation goes through the total DP matcher
  * (review iteration 2): the segment is agent-authored, so it is
- * never compiled into a RegExp; a segment beyond the
- * defense-in-depth length cap matches nothing (fail closed).
+ * never compiled into a RegExp. A segment beyond the
+ * defense-in-depth length cap MATCHES (review iteration 3 — the
+ * cap fails toward blocking): this is the protected-state check,
+ * so absurd input must fail closed, not open.
  */
 const segmentMatches = (segment: string, needleSegment: string): boolean => {
   if (segment === needleSegment) {
     return true;
   }
-  if (!/[*?[]/.test(segment) || segment.length > MAX_GLOB_SEGMENT_PATTERN_LENGTH) {
+  if (!/[*?[]/.test(segment)) {
     return false;
   }
-  return globTokensMatch(parseGlobPattern(segment), needleSegment);
+  if (segment.length > MAX_GLOB_SEGMENT_PATTERN_LENGTH) {
+    return true;
+  }
+  return globTokensMatch(parseGlobPattern(segment), needleSegment, createGlobBudget());
 };
 
 /**
