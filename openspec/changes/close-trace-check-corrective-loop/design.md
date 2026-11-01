@@ -4,8 +4,8 @@
 
 The FR-066 pattern grammar is one-directional: a wildcard- or
 `$var`-bearing *call* token passes on a verbatim pattern mention
-or a trace reference its compiled pattern matches
-(`globPathToRegExp`, `findUnreferencedPath`), but a concrete call
+or a trace reference its pattern matches
+(`globPathMatches`, `findUnreferencedPath`), but a concrete call
 token needs a full-path or basename substring. The FR-067 wait
 re-runs the guard after in-flight audits settle and fails open
 on timeout up to `maxTimeoutFailOpens` (3). Field session
@@ -38,11 +38,21 @@ corrective loop could not close inside a turn.
 A concrete token that fails full/basename matching tests the
 trace's pattern tokens (the lazy `traceTokens` array already
 built for the FR-066 direction): each pattern token that is
-path-scoped compiles through the existing `globPathToRegExp` and
-is tested against the concrete token's full lowercased path and
-every slash-boundary suffix of it. Suffixes bridge absolute tool
+path-scoped is matched against the concrete token's full
+lowercased path and every slash-boundary suffix of it in one
+dynamic-programming pass. Suffixes bridge absolute tool
 arguments against relative reasoning spellings. Matching is
 case-insensitive, matching every other comparison in the check.
+(Amended during implementation review, iterations 1-3: the
+original design compiled globs to regular expressions via
+`globPathToRegExp`; that compiler was replaced by a total,
+bounded DP matcher, `globPathMatches`, which parses each
+pattern once (`compileGlobPattern`), answers every suffix in a
+single table pass (`globTokensMatchAnySuffix`), and charges all
+matches in one call against an aggregate work budget
+(`MAX_GLOB_BUDGET_CELLS`, 4M DP cells) that fails closed, so
+agent-authored pattern counts cannot multiply the work. Neither
+matcher compiles untrusted input to a RegExp.)
 
 ### D2 Path-scoped guardrail
 

@@ -18,9 +18,10 @@
 
 - [x] 2.1 `src/tool-guard.ts`: in `findUnreferencedPath`'s
   concrete branch, on full/basename miss test trace pattern
-  tokens that are path-scoped (contain `/`) via
-  `globPathToRegExp` against the lowered full token and its
-  slash-boundary suffixes; reuse the lazy `traceTokens` array
+  tokens that are path-scoped (contain `/`) via the bounded DP
+  matcher `globPathMatches` (parse-once, one any-suffix table
+  pass, aggregate work budget) against the lowered full token;
+  reuse the lazy `traceTokens` array
 - [x] 2.2 `src/tool-guard.ts`: plain block reason names both
   corrective forms (explicit path/basename or path-scoped
   pattern) and the settle-then-retry instruction (FR-070 text)

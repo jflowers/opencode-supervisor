@@ -709,6 +709,19 @@ test('hasProtectedSegmentRun matches glob spellings of protected runs', () => {
   assert.ok(!hasProtectedSegmentRun('opencode/app*valsx.json', 'approvals.json'));
 });
 
+test('hasProtectedSegmentRun fails toward blocking on over-long glob segments (review iteration 3)', () => {
+  // An over-long glob segment (>4096 chars) cannot be matched
+  // within bounds, and in the protected-state context a
+  // non-match is an evasion — so the cap fails toward matching
+  // (blocking). Absurd input, safe to block.
+  const overLong = `su${'a'.repeat(4100)}*ervisor`;
+  assert.ok(hasProtectedSegmentRun(`x/${overLong}`, 'supervisor'));
+  // Sanity: a long segment without glob metachars still only
+  // matches by exact equality.
+  const overLongPlain = `su${'a'.repeat(4100)}ervisor`;
+  assert.ok(!hasProtectedSegmentRun(`x/${overLongPlain}`, 'supervisor'));
+});
+
 test('checkProtectedState blocks the approvals file for non-bash tools', () => {
   const reason = checkProtectedState('read', { path: '.opencode/supervisor/approvals.json' }, []);
   assert.ok(reason !== null, 'expected the approvals file to be blocked');
