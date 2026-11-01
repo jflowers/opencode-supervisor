@@ -57,12 +57,20 @@ with the existing verbatim-pattern pass.
 
 `pendingAudits` becomes `Map<Promise<unknown>, string[]>` — each
 in-flight continuation registered with the path tokens of the
-stripped step it is auditing. `buildConfig` and `stripNarrative`
-are hoisted above the continuation so tokens exist at
-registration (a waiter never reads a half-filled entry); a strip
+stripped step it is auditing. Registration stays SYNCHRONOUS with
+the dispatch: FR-067's wait contract requires a racing tool call
+to see the pending audit the moment the part completes, and
+hoisting the async `buildConfig`/`stripNarrative` above
+registration would delay that registration and reopen the
+partial-trace race. The entry is therefore a mutable token box
+the continuation fills once the strip resolves; a waiter reading
+before the fill sees no coverage (fail-closed, and in practice
+the strip finishes long before the 10 s wait bound); a strip
 failure falls to the outer catch, failing open exactly as today.
 Tokens use the shared grammar, so "the step names the path" and
 "the guard demands the path" agree by construction.
+(Implementation-review amendment: an earlier draft of this
+decision described the hoist; the shipped mechanism is the box.)
 
 ### D4 Covered timeouts charge a separate bounded budget
 

@@ -14,7 +14,7 @@ import {
   type AuditConfig,
   type InvokeModel,
 } from '../src/auditor.ts';
-import { extractArgPaths, verifyToolIntent } from '../src/tool-guard.ts';
+import { extractArgPaths, isTokenCovered, verifyToolIntent } from '../src/tool-guard.ts';
 import { extractPathTokens, hasPathToken, isPatternToken } from '../src/path-tokens.ts';
 import { DEFAULT_MEMO_LIMITS } from '../src/memo.ts';
 import { silentPluginLogger } from '../src/plugin-log.ts';
@@ -534,6 +534,7 @@ test('verifyToolIntent does not satisfy a concrete write from a non-covering tra
     baseAuditConfig
   );
   assert.equal(blocked.allowed, false);
+  assert.equal(blocked.unmatchedToken, 'kb/topics/gov-ci.md');
 });
 
 test('verifyToolIntent satisfies an absolute argument from a relative trace pattern by suffix (FR-069)', () => {
@@ -552,6 +553,52 @@ test('verifyToolIntent matches trace patterns case-insensitively (FR-069)', () =
     baseAuditConfig
   );
   assert.equal(covered.allowed, true);
+});
+
+test('verifyToolIntent rejects a wildcard-heavy trace pattern instead of compiling it (FR-069 hardening)', () => {
+  // A 40-star pattern exceeds the compiler's wildcard bound (32):
+  // it covers nothing rather than driving catastrophic
+  // backtracking against a long token.
+  const starChain = `kb/${'a*'.repeat(40)}.md`;
+  const blocked = verifyToolIntent(
+    { name: 'write', arguments: { filePath: 'kb/topics/gov-ci.md', content: 'topic notes' } },
+    [`Write the topic files as ${starChain}.`],
+    baseAuditConfig
+  );
+  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.unmatchedToken, 'kb/topics/gov-ci.md');
+});
+
+test('isTokenCovered matches exact, basename, and pattern spellings in both directions (FR-070)', () => {
+  // Exact equality, case-insensitive.
+  assert.equal(isTokenCovered('kb/topics/gov-ci.md', ['KB/TOPICS/GOV-CI.MD']), true);
+  // Basename direction: the guard passes a call on `notes.md` when
+  // the trace names `kb/topics/notes.md`, so coverage must too —
+  // both ways.
+  assert.equal(isTokenCovered('kb/topics/notes.md', ['notes.md']), true);
+  assert.equal(isTokenCovered('notes.md', ['kb/topics/notes.md']), true);
+  // FR-069 direction: a path-scoped candidate pattern covers a
+  // concrete token.
+  assert.equal(isTokenCovered('kb/topics/gov-ci.md', ['kb/topics/*.md']), true);
+  // FR-066 direction: a pattern token is covered by a concrete
+  // candidate its compiled glob matches.
+  assert.equal(isTokenCovered('kb/topics/*.md', ['kb/topics/gov-ci.md']), true);
+  // No coverage from unrelated tokens.
+  assert.equal(isTokenCovered('kb/topics/gov-ci.md', ['kb/other/notes.md']), false);
+  assert.equal(isTokenCovered('kb/topics/gov-ci.md', []), false);
+});
+
+test('isTokenCovered fails closed on patterns the compiler rejects (FR-070 hardening)', () => {
+  // Over the wildcard bound in either role: no compile, no
+  // coverage, no hang.
+  const starChain = `kb/${'a*'.repeat(40)}.md`;
+  assert.equal(isTokenCovered('kb/topics/gov-ci.md', [starChain]), false);
+  assert.equal(isTokenCovered(starChain, ['kb/topics/gov-ci.md']), false);
+  // Over the length bound (512) as the call token: the pattern
+  // branch is never compiled for a concrete token anyway, but the
+  // result must stay false, not throw.
+  const longToken = `${'a'.repeat(600)}.md`;
+  assert.equal(isTokenCovered(longToken, ['a*.md']), false);
 });
 
 test('verifyToolIntent treats authored content as data, not a touch (FR-064)', () => {
@@ -2717,6 +2764,14 @@ test('repeated covered timeouts block at the covered fail-open cap (FR-070)', as
       );
       assert.equal(sessionState.get(sessionID).coveredTimeoutFailOpens, 2);
       assert.equal(sessionState.get(sessionID).timeoutFailOpens, 0);
+      // The past-cap block is logged at error level naming the
+      // still-unsettled audit (every timeout leaves a log trail).
+      assert.ok(
+        harness.logEntries.some(
+          (entry) =>
+            entry.level === 'error' && entry.message.includes('blocked tool') && entry.message.includes('still unsettled')
+        )
+      );
     } finally {
       harness.parkedResolvers[0]?.(PASSED_VERDICT);
       await dispatch;
@@ -2819,6 +2874,10 @@ test('the corrective instruction loop closes end to end: block, prose re-stateme
         assert.ok(error instanceof Error);
         assert.ok(error.message.includes('notes.md'));
         assert.ok(error.message.includes('Name the file in verified steps'));
+        // Both corrective forms and the retry timing are in the
+        // reason text (FR-012 + FR-070 reason scope).
+        assert.ok(error.message.includes('path-scoped pattern'));
+        assert.ok(error.message.includes('audit settles'));
         return true;
       }
     );

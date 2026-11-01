@@ -27,10 +27,11 @@
 ## 3. Pending-audit awareness (FR-070, FR-067)
 
 - [x] 3.1 `index.ts`: `pendingAudits` becomes
-  `Map<Promise<unknown>, string[]>`; hoist `buildConfig` +
-  `stripNarrative` above continuation registration so step
-  tokens exist at registration; deregister in the finally as
-  today
+  `Map<Promise<unknown>, string[]>`; register the continuation
+  synchronously with a step-token box it fills after `buildConfig`
+  + `stripNarrative` resolve (FR-067's registration contract
+  preserved — the hoist was rejected in review); deregister in the
+  finally as today
 - [x] 3.2 `index.ts`: covered-wait branch — when the trace
   block's unmatched token is named by an in-flight audit's
   tokens, a timed-out wait fails open against

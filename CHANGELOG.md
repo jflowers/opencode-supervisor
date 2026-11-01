@@ -33,6 +33,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `pendingAudits` session state is a `Map` from each audit continuation
   to the path tokens of the stripped step it audits (was a `Set` of
   promises).
+- The shared path-pattern compiler (`globPathToRegExp`) rejects over-long
+  or wildcard-heavy pattern tokens (length over 512, or more than 32
+  wildcards) instead of compiling them: an adversarial star-chain could
+  otherwise stall the event loop with catastrophic backtracking, and
+  pattern tokens are agent-authored input. A rejected pattern covers
+  nothing — fail closed, like an unmatched pattern (review hardening).
+
+Spec deltas: `openspec/changes/close-trace-check-corrective-loop/`
+(base synced to `openspec/specs/trace-check/spec.md`).
 
 ## [2.7.0] - 2026-10-31
 
