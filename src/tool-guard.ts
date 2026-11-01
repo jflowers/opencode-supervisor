@@ -37,6 +37,14 @@ export interface ToolVerificationResult {
    * Names the token as the guard spelled it.
    */
   unmatchedToken?: string;
+  /**
+   * True when the trace block came from a drained glob work budget
+   * rather than a completed scan (review iteration 4): the reason
+   * says the check could not complete — a distinct correction from a
+   * genuine miss — and the hook layer logs the exhaustion. Absent
+   * otherwise; the `blockedCheck` idiom.
+   */
+  budgetExhausted?: boolean;
 }
 
 /**
@@ -154,16 +162,24 @@ const countGlobWildcards = (devaried: string): number => {
 };
 
 /**
+ * Whether a devaried pattern exceeds the shared compiler's
+ * complexity bounds. ONE predicate (review iteration 4): the
+ * compiler below and the bound-rejection signal below it derive
+ * from the same check, so the block reason can never misreport
+ * what the compiler accepts.
+ */
+const exceedsGlobBounds = (devaried: string): boolean =>
+  devaried.length > MAX_GLOB_PATTERN_LENGTH || countGlobWildcards(devaried) > MAX_GLOB_PATTERN_WILDCARDS;
+
+/**
  * Whether a pattern token exceeds the shared compiler's complexity
  * bounds — the distinct bound-rejection signal for block reasons
  * (FR-012, review iteration 2): a rejected pattern must be
  * distinguishable from an unmatched one, because its corrective
  * action differs (name the files concretely, not reason in globs).
  */
-export const isGlobPatternRejected = (token: string): boolean => {
-  const devaried = token.replace(/\$[a-zA-Z0-9_]+/g, '*');
-  return devaried.length > MAX_GLOB_PATTERN_LENGTH || countGlobWildcards(devaried) > MAX_GLOB_PATTERN_WILDCARDS;
-};
+export const isGlobPatternRejected = (token: string): boolean =>
+  exceedsGlobBounds(token.replace(/\$[a-zA-Z0-9_]+/g, '*'));
 
 const parseGlobPattern = (devaried: string): GlobToken[] => {
   const tokens: GlobToken[] = [];
@@ -216,13 +232,23 @@ const parseGlobPattern = (devaried: string): GlobToken[] => {
  * bound a single match, but the multiplication axes around it
  * (trace pattern tokens × call tokens × suffix positions) are all
  * agent-authored, so per-invocation caps alone left the TOTAL
- * unbounded (learning availability-20261101T160155).
+ * unbounded (learning availability-20261101T160155). Review
+ * iteration 4: every scanned PAIR charges the budget too — the
+ * sweep itself, not only DP cells, is a multiplication axis an
+ * adversary controls.
  */
-type GlobWorkBudget = { cellsRemaining: number };
+export type GlobWorkBudget = { cellsRemaining: number };
 
 const MAX_GLOB_BUDGET_CELLS = 4_000_000;
 
-const createGlobBudget = (): GlobWorkBudget => ({ cellsRemaining: MAX_GLOB_BUDGET_CELLS });
+/**
+ * Budget factory, exported for composition sites (review iteration
+ * 4): the hook layer loops `isTokenCovered` over in-flight audit
+ * boxes and must create exactly ONE budget per blocked call, not
+ * one per box — the aggregate invariant holds only at the boundary
+ * that owns the whole operation.
+ */
+export const createGlobBudget = (): GlobWorkBudget => ({ cellsRemaining: MAX_GLOB_BUDGET_CELLS });
 
 /**
  * Devary + bounds-check + parse, once per pattern: the shared
@@ -233,7 +259,7 @@ const createGlobBudget = (): GlobWorkBudget => ({ cellsRemaining: MAX_GLOB_BUDGE
  */
 const compileGlobPattern = (pattern: string): GlobToken[] | null => {
   const devaried = pattern.replace(/\$[a-zA-Z0-9_]+/g, '*');
-  if (devaried.length > MAX_GLOB_PATTERN_LENGTH || countGlobWildcards(devaried) > MAX_GLOB_PATTERN_WILDCARDS) {
+  if (exceedsGlobBounds(devaried)) {
     return null;
   }
   return parseGlobPattern(devaried);
@@ -251,38 +277,45 @@ const compileGlobPattern = (pattern: string): GlobToken[] | null => {
  * pass answers every suffix start; null means the work budget
  * drained (fail closed).
  */
-const globMatchTable = (tokens: readonly GlobToken[], subject: string, budget: GlobWorkBudget): boolean[] | null => {
+const globMatchTable = (tokens: readonly GlobToken[], subject: string, budget: GlobWorkBudget): Uint8Array | null => {
   const p = tokens.length;
   const s = subject.length;
-  const cells = (p + 1) * (s + 1);
+  const width = s + 1;
+  const cells = (p + 1) * width;
   if (cells > budget.cellsRemaining) {
     budget.cellsRemaining = 0;
     return null;
   }
   budget.cellsRemaining -= cells;
-  const dp: boolean[][] = Array.from({ length: p + 1 }, () => new Array<boolean>(s + 1).fill(false));
-  dp[p][s] = true;
+  // Flat row-major table (review iteration 4): dp[i * width + j]
+  // holds whether tokens[i..] matches subject[j..]. One Uint8Array
+  // instead of boxed per-row boolean arrays — ~4 MB of transient
+  // allocation at the caps, not ~32.
+  const dp = new Uint8Array(cells);
+  dp[p * width + s] = 1;
   for (let i = p - 1; i >= 0; i -= 1) {
     const token = tokens[i];
+    const row = i * width;
+    const next = (i + 1) * width;
     for (let j = s; j >= 0; j -= 1) {
       if (token.kind === 'star') {
-        dp[i][j] = dp[i + 1][j] || (j < s && subject[j] !== '/' && dp[i][j + 1]);
+        dp[row + j] = dp[next + j] === 1 || (j < s && subject[j] !== '/' && dp[row + j + 1] === 1) ? 1 : 0;
       } else if (j >= s) {
-        dp[i][j] = false;
+        dp[row + j] = 0;
       } else {
         const sc = subject[j];
         if (token.kind === 'question') {
-          dp[i][j] = sc !== '/' && dp[i + 1][j + 1];
+          dp[row + j] = sc !== '/' && dp[next + j + 1] === 1 ? 1 : 0;
         } else if (token.kind === 'class') {
           const inClass = token.chars.has(sc);
-          dp[i][j] = sc !== '/' && inClass !== token.negated && dp[i + 1][j + 1];
+          dp[row + j] = sc !== '/' && inClass !== token.negated && dp[next + j + 1] === 1 ? 1 : 0;
         } else {
-          dp[i][j] = token.char === sc && dp[i + 1][j + 1];
+          dp[row + j] = token.char === sc && dp[next + j + 1] === 1 ? 1 : 0;
         }
       }
     }
   }
-  return dp[0];
+  return dp.subarray(0, width);
 };
 
 /**
@@ -294,7 +327,7 @@ const globTokensMatch = (tokens: readonly GlobToken[], subject: string, budget: 
     return false;
   }
   const starts = globMatchTable(tokens, subject, budget);
-  return starts !== null && starts[0];
+  return starts !== null && starts[0] === 1;
 };
 
 /**
@@ -385,8 +418,16 @@ const patternCoversToken = (pattern: string, loweredToken: string, budget: GlobW
  *
  * @param token The unmatched call token as the guard named it.
  * @param candidateTokens Path tokens of an in-flight audit's step text.
+ * @param budget Aggregate work budget (review iteration 4): pass ONE
+ *   per hook-layer operation when looping over in-flight audits; a
+ *   drained budget fails closed (no coverage). Defaults to a fresh
+ *   budget for direct callers.
  */
-export function isTokenCovered(token: string, candidateTokens: readonly string[]): boolean {
+export function isTokenCovered(
+  token: string,
+  candidateTokens: readonly string[],
+  budget: GlobWorkBudget = createGlobBudget()
+): boolean {
   const lowered = token.toLowerCase();
   const loweredCandidates = candidateTokens.map((candidate) => candidate.toLowerCase());
   if (loweredCandidates.includes(lowered)) {
@@ -400,19 +441,28 @@ export function isTokenCovered(token: string, candidateTokens: readonly string[]
   if (loweredCandidates.some((candidate) => candidate.split('/').pop() === base)) {
     return true;
   }
+  // One budget covers the whole check (review iterations 3 and 4):
+  // every scanned pair is charged — not only DP cells — and callers
+  // that loop over in-flight audits pass ONE budget for the whole
+  // operation, the `globPathMatches` idiom (a fresh 4M budget per
+  // box would multiply by pendingAudits.size).
+  const chargePair = (): boolean => {
+    if (budget.cellsRemaining <= 0) {
+      return false;
+    }
+    budget.cellsRemaining -= 1;
+    return true;
+  };
   if (isPatternToken(lowered)) {
-    // One budget covers the whole coverage check (review
-    // iteration 3): candidates × patterns are both bounded
-    // counts, but their product charges one aggregate.
-    const budget = createGlobBudget();
     const compiled = compileGlobPattern(lowered);
     if (compiled === null) {
       return false;
     }
-    return loweredCandidates.some((candidate) => globTokensMatch(compiled, candidate, budget));
+    return loweredCandidates.some((candidate) => chargePair() && globTokensMatch(compiled, candidate, budget));
   }
-  const budget = createGlobBudget();
-  return loweredCandidates.some((candidate) => isPatternToken(candidate) && patternCoversToken(candidate, lowered, budget));
+  return loweredCandidates.some(
+    (candidate) => chargePair() && isPatternToken(candidate) && patternCoversToken(candidate, lowered, budget)
+  );
 }
 
 /**
@@ -437,15 +487,27 @@ export function isTokenCovered(token: string, candidateTokens: readonly string[]
  * @param toolName The tool being invoked (bash gets the raw lens).
  * @param args The tool call's arguments; only top-level string values carry paths.
  * @param verifiedSteps The session's verified reasoning trace (non-empty).
- * @returns The unmatched token — a pattern names itself, never a phantom
- *   expansion like `id.md` — for the block reason (FR-012), or null when
- *   every token is referenced.
+ * @returns The unmatched token with its scan state — a pattern names
+ *   itself, never a phantom expansion like `id.md` — for the block
+ *   reason (FR-012), or null when every token is referenced.
  */
+interface UnreferencedPathResult {
+  /** The unmatched token, spelled as the guard saw it (FR-012). */
+  fileToken: string;
+  /**
+   * True when the glob work budget drained before the scan finished
+   * (review iteration 4): the block is fail-closed and the reason
+   * must say the check could not complete — a distinct correction
+   * from a genuine miss.
+   */
+  budgetExhausted: boolean;
+}
+
 function findUnreferencedPath(
   toolName: string,
   args: Record<string, unknown> | undefined,
   verifiedSteps: string[]
-): string | null {
+): UnreferencedPathResult | null {
   const combinedSteps = verifiedSteps.join(' ').toLowerCase();
   // FR-064 lens: authored content is data, never an operational touch.
   const lensedArgs =
@@ -453,14 +515,43 @@ function findUnreferencedPath(
       ? args
       : Object.fromEntries(Object.entries(args ?? {}).filter(([key]) => !CONTENT_ARG_KEYS.includes(key)));
   const argPaths = extractArgPaths(lensedArgs);
-  // Trace-side tokens, extracted lazily: only pattern satisfaction
-  // needs them, and most calls carry none.
+  // Trace-side tokens, extracted lazily and shared by both branches
+  // (review iteration 4: the two duplicated lazy inits had drifted);
+  // only pattern satisfaction needs them, and most calls carry none.
   let traceTokens: string[] | null = null;
-  // One glob budget covers the whole scan (review iteration 3):
-  // trace patterns × call tokens × suffix positions are all
+  const getTraceTokens = (): string[] => {
+    traceTokens ??= verifiedSteps
+      .flatMap((step) => extractPathTokens(step))
+      .map((token) => token.toLowerCase());
+    return traceTokens;
+  };
+  // Pattern candidates partitioned once per scan (review iteration
+  // 4): the concrete branch sweeps only pattern trace tokens, and
+  // the per-call-token loop must not re-filter the whole trace on
+  // every token.
+  let tracePatternTokens: string[] | null = null;
+  const getTracePatternTokens = (): string[] => {
+    tracePatternTokens ??= getTraceTokens().filter((token) => isPatternToken(token));
+    return tracePatternTokens;
+  };
+  // One glob budget covers the whole scan (review iterations 3 and
+  // 4): trace patterns × call tokens × suffix positions are all
   // agent-authored axes, so the multiplication itself — not just
-  // each single match — must be bounded and fail closed.
+  // each single match — must be bounded and fail closed. Every
+  // scanned PAIR charges the budget, not only DP cells: a
+  // non-matching sweep over a dense trace is pure per-pair work,
+  // and the 10 s trace wait is a Promise.race that cannot fire
+  // during synchronous CPU.
   const globBudget = createGlobBudget();
+  let budgetExhausted = false;
+  const chargePair = (): boolean => {
+    if (globBudget.cellsRemaining <= 0) {
+      budgetExhausted = true;
+      return false;
+    }
+    globBudget.cellsRemaining -= 1;
+    return true;
+  };
 
   for (const fileToken of argPaths) {
     if (isPatternToken(fileToken)) {
@@ -468,17 +559,17 @@ function findUnreferencedPath(
       if (combinedSteps.includes(lowered)) {
         continue;
       }
-      traceTokens ??= verifiedSteps
-        .flatMap((step) => extractPathTokens(step))
-        .map((token) => token.toLowerCase());
       // A rejected pattern (complexity bounds) matches nothing:
       // it blocks naming itself, exactly as an unmatched pattern
       // does — the reason layer distinguishes it (FR-012).
       const compiled = compileGlobPattern(lowered);
-      if (compiled !== null && traceTokens.some((token) => globTokensMatch(compiled, token, globBudget))) {
+      const covered =
+        compiled !== null &&
+        getTraceTokens().some((token) => chargePair() && globTokensMatch(compiled, token, globBudget));
+      if (covered) {
         continue;
       }
-      return fileToken;
+      return { fileToken, budgetExhausted };
     }
     const lowered = fileToken.toLowerCase();
     const base = lowered.split('/').pop() || lowered;
@@ -488,13 +579,13 @@ function findUnreferencedPath(
     // FR-069 (design D1/D2): a path-scoped trace pattern covers the
     // concrete token — glob-form reasoning satisfies the writes it
     // describes.
-    traceTokens ??= verifiedSteps
-      .flatMap((step) => extractPathTokens(step))
-      .map((token) => token.toLowerCase());
-    if (traceTokens.some((token) => isPatternToken(token) && patternCoversToken(token, lowered, globBudget))) {
+    const covered = getTracePatternTokens().some(
+      (token) => chargePair() && patternCoversToken(token, lowered, globBudget)
+    );
+    if (covered) {
       continue;
     }
-    return fileToken;
+    return { fileToken, budgetExhausted };
   }
   return null;
 }
@@ -583,8 +674,9 @@ export function verifyToolIntent(
       };
     }
 
-    const unmatchedPath = findUnreferencedPath(toolCall.name, toolCall.arguments, verifiedSteps);
-    if (unmatchedPath) {
+    const unmatched = findUnreferencedPath(toolCall.name, toolCall.arguments, verifiedSteps);
+    if (unmatched) {
+      const unmatchedPath = unmatched.fileToken;
       // FR-012 / FR-066: the reason names the token as it was spelled.
       // A pattern token names itself — never a phantom expansion like
       // `id.md` — and points at the corrective action: reason about the
@@ -595,16 +687,23 @@ export function verifyToolIntent(
       // FR-070 (design D6): the reason names both accepted
       // corrective forms and the settle-then-retry instruction —
       // honest in both audit states, so the guard stays pure.
-      const reason = isPatternToken(unmatchedPath)
-        ? isGlobPatternRejected(unmatchedPath)
-          ? `Tool '${toolCall.name}' blocked by the file-path trace check: pattern '${unmatchedPath}' exceeds the compiler's complexity bounds (over ${MAX_GLOB_PATTERN_LENGTH} characters or ${MAX_GLOB_PATTERN_WILDCARDS} wildcards) and cannot be matched. Name the files it stands for concretely in verified steps, then retry once the audit settles.`
-          : `Tool '${toolCall.name}' blocked by the file-path trace check: pattern '${unmatchedPath}' is not satisfied by the verified reasoning trace. Reason about the files the pattern expands to, or name them concretely, in verified steps, then retry once the audit settles.`
-        : `Tool '${toolCall.name}' blocked by the file-path trace check: '${unmatchedPath}' is absent from the verified reasoning trace (no full-path, basename, or covering pattern match). Name the file in verified steps — explicitly (full path or basename) or with a path-scoped pattern like 'dir/*.md' — then retry once the audit settles rather than immediately in the same turn.`;
+      // Review iteration 4: a drained work budget is a third, distinct
+      // diagnosis — the scan stopped early, so "absent from the trace"
+      // would lie against a visible trace; the correction is concrete
+      // naming, which needs no glob work.
+      const reason = unmatched.budgetExhausted
+        ? `Tool '${toolCall.name}' blocked by the file-path trace check: '${unmatchedPath}' could not be checked against the trace patterns — the matcher's work budget was exhausted by this session's trace volume before the scan completed (fail closed). Name the file concretely in verified steps — explicitly (full path or basename) — then retry once the audit settles.`
+        : isPatternToken(unmatchedPath)
+          ? isGlobPatternRejected(unmatchedPath)
+            ? `Tool '${toolCall.name}' blocked by the file-path trace check: pattern '${unmatchedPath}' exceeds the compiler's complexity bounds (over ${MAX_GLOB_PATTERN_LENGTH} characters or ${MAX_GLOB_PATTERN_WILDCARDS} wildcards) and cannot be matched. Name the files it stands for concretely in verified steps, then retry once the audit settles.`
+            : `Tool '${toolCall.name}' blocked by the file-path trace check: pattern '${unmatchedPath}' is not satisfied by the verified reasoning trace. Reason about the files the pattern expands to, or name them concretely, in verified steps, then retry once the audit settles.`
+          : `Tool '${toolCall.name}' blocked by the file-path trace check: '${unmatchedPath}' is absent from the verified reasoning trace (no full-path, basename, or covering pattern match). Name the file in verified steps — explicitly (full path or basename) or with a path-scoped pattern like 'dir/*.md' — then retry once the audit settles rather than immediately in the same turn.`;
       return {
         allowed: false,
         reason,
         blockedCheck: 'trace',
         unmatchedToken: unmatchedPath,
+        budgetExhausted: unmatched.budgetExhausted || undefined,
       };
     }
   }

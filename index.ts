@@ -52,7 +52,13 @@ import {
 } from './src/auditor.ts';
 import { stripNarrative } from './src/stripper.ts';
 import { extractPathTokens } from './src/path-tokens.ts';
-import { checkProtectedState, isTokenCovered, verifyToolIntent, type ToolVerificationResult } from './src/tool-guard.ts';
+import {
+  checkProtectedState,
+  createGlobBudget,
+  isTokenCovered,
+  verifyToolIntent,
+  type ToolVerificationResult
+} from './src/tool-guard.ts';
 import {
   buildMemo,
   DEFAULT_MEMO_LIMITS,
@@ -2138,7 +2144,18 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
             // check inside the guard still applies to them.
             consoleTools
           );
+        // Review iteration 4 (FR-012): a budget-exhausted block is a
+        // distinct diagnosis — the matcher stopped early — so the
+        // engineer sees it in the log, not just the model in the reason.
+        const warnBudgetExhausted = (): void => {
+          if (!verification.allowed && verification.budgetExhausted === true) {
+            logger.warn(
+              `trace-check glob work budget exhausted; the scan stopped early and failed closed: tool '${hookInput.tool}'${verification.unmatchedToken !== undefined ? `, token '${verification.unmatchedToken}'` : ''}`
+            );
+          }
+        };
         verification = runGuard();
+        warnBudgetExhausted();
         // FR-067 (design D8) + FR-070 (design D4/D5): await-on-miss.
         // A trace block with an in-flight audit continuation means the
         // reasoning that would reference these paths may not have
@@ -2170,6 +2187,7 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           const wait = await waitForPendingAudits(state.pendingAudits);
           if (wait === 'settled') {
             verification = runGuard();
+            warnBudgetExhausted();
             // FR-070 (design D5): the correction was reasoned and
             // audited but did not record — say so instead of blaming
             // absent reasoning. Attribution follows the re-run
@@ -2182,9 +2200,13 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
               verification.blockedCheck === 'trace' &&
               freshUnmatched !== undefined
             ) {
+              // One budget for the whole eviction check (review
+              // iteration 4): a fresh budget per box would multiply
+              // the bound by pendingAudits.size.
+              const evictionBudget = createGlobBudget();
               const evicted = [...before.keys()]
                 .filter((promise) => !state.pendingAudits.has(promise))
-                .some((promise) => isTokenCovered(freshUnmatched, before.get(promise) ?? []));
+                .some((promise) => isTokenCovered(freshUnmatched, before.get(promise) ?? [], evictionBudget));
               if (evicted) {
                 verification = {
                   allowed: false,
@@ -2205,9 +2227,13 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
             // for this wait even if it settles before the timeout —
             // the correction was reasoned before the call blocked,
             // which is what relief is for.
+            // One budget for the whole coverage check (review
+            // iteration 4): the loop over in-flight audit boxes must
+            // share a single aggregate — the isTokenCovered idiom.
+            const coverageBudget = createGlobBudget();
             const covered =
               unmatched !== undefined &&
-              [...before.values()].some((tokens) => isTokenCovered(unmatched, tokens));
+              [...before.values()].some((tokens) => isTokenCovered(unmatched, tokens, coverageBudget));
             if (covered) {
               state.coveredTimeoutFailOpens += 1;
               if (state.coveredTimeoutFailOpens > guardConfig.maxCoveredTimeoutFailOpens) {

@@ -21,7 +21,13 @@
   tokens that are path-scoped (contain `/`) via the bounded DP
   matcher `globPathMatches` (parse-once, one any-suffix table
   pass, aggregate work budget) against the lowered full token;
-  reuse the lazy `traceTokens` array
+  reuse the lazy `traceTokens` array (review iterations 3-4:
+  the scan charges every pair — DP cells and pair sweeps alike —
+  against one per-scan budget, hoists the pattern/non-pattern
+  partition out of the per-token loop, and surfaces exhaustion
+  as a distinct `budgetExhausted` block reason; over-long
+  protected-state glob segments fail toward matching;
+  `extractPathTokens` deduplication is Set-backed)
 - [x] 2.2 `src/tool-guard.ts`: plain block reason names both
   corrective forms (explicit path/basename or path-scoped
   pattern) and the settle-then-retry instruction (FR-070 text)

@@ -40,14 +40,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   as `src/[\].md` used to crash the compiler into the hook's
   fail-open path) and runs in O(pattern × subject) instead of
   catastrophic backtracking. Both sides are capped (pattern over
-  512 characters or more than 32 wildcards, subject over 512
-  characters) and every match in one guard call shares a 4M-cell
-  aggregate work budget that fails closed when exhausted, so
-  agent-authored pattern counts cannot multiply the work. A
-  rejected *call* pattern names the complexity bounds in its
-  block reason; rejected trace-side patterns and over-cap
-  subjects match nothing (review hardening, iterations 1-3).
+  512 characters or more than 32 wildcards; full-path matches
+  reject subjects over 512 characters, suffix matches may match
+  via a slash-boundary suffix within that cap) and every match in
+  one guard call — DP cells and per-pair scan work alike —
+  shares a 4M-cell aggregate work budget that fails closed when
+  exhausted, so agent-authored pattern counts cannot multiply
+  the work. A rejected *call* pattern names the complexity bounds
+  in its block reason, and an exhausted budget gets its own
+  distinct block reason naming the exhaustion; rejected
+  trace-side patterns and over-cap subjects match nothing
+  (review hardening, iterations 1-4).
   Engineer-authored directive globs are unchanged.
+- Protected-state matching now fails toward blocking on over-long
+  glob segments: a glob-bearing segment over 4096 characters is
+  treated as a match for the protected supervisor paths rather
+  than a non-match, so an absurd segment cannot slip past the
+  protected-state check (review iteration 3).
 - `extractPathTokens` deduplication is now Set-backed (was
   `Array.includes`), O(n²) → O(n) in token count — adversarial
   reasoning parts carrying tens of thousands of distinct path

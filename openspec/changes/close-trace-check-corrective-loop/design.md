@@ -52,7 +52,12 @@ single table pass (`globTokensMatchAnySuffix`), and charges all
 matches in one call against an aggregate work budget
 (`MAX_GLOB_BUDGET_CELLS`, 4M DP cells) that fails closed, so
 agent-authored pattern counts cannot multiply the work. Neither
-matcher compiles untrusted input to a RegExp.)
+matcher compiles untrusted input to a RegExp. Iteration 4
+tightened the same budget: every scanned pair — DP cells and
+pair sweeps alike — is charged against it, the DP table is a
+flat `Uint8Array`, and an exhausted budget surfaces as a
+distinct `budgetExhausted` block reason rather than a silent
+non-match.)
 
 ### D2 Path-scoped guardrail
 
