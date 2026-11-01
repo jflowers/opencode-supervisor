@@ -1,0 +1,9 @@
+schema: spec-driven
+created: 2026-10-31
+goal: Close the trace check's corrective loop (trace-side pattern satisfaction and pending-audit awareness)
+affected_areas:
+  - src/tool-guard.ts
+  - index.ts
+  - src/config-file.ts
+  - test/audit.test.ts
+  - test/config-file.test.ts
