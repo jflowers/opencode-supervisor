@@ -14,7 +14,7 @@ import {
   type AuditConfig,
   type InvokeModel,
 } from '../src/auditor.ts';
-import { extractArgPaths, globPathMatches, isGlobPatternRejected, isTokenCovered, verifyToolIntent } from '../src/tool-guard.ts';
+import { createGlobBudget, extractArgPaths, globPathMatches, isGlobPatternRejected, isTokenCovered, verifyToolIntent } from '../src/tool-guard.ts';
 import { extractPathTokens, hasPathToken, isPatternToken } from '../src/path-tokens.ts';
 import { DEFAULT_MEMO_LIMITS } from '../src/memo.ts';
 import { silentPluginLogger } from '../src/plugin-log.ts';
@@ -739,10 +739,16 @@ test('pattern satisfaction fails closed when the aggregate glob budget is exhaus
   const blocked = verifyToolIntent(write, [...steps, 'Write kb/real/*.md.'], baseAuditConfig);
   assert.equal(blocked.allowed, false);
   assert.equal(blocked.unmatchedToken, callToken);
+  // The exhaustion is surfaced, not flattened into a generic miss
+  // (review iteration 4): a distinct flag and a distinct reason.
+  assert.equal(blocked.budgetExhausted, true);
+  assert.ok(blocked.reason.includes('could not be checked against the trace patterns'));
+  assert.ok(blocked.reason.includes('work budget was exhausted'));
   // Covering pattern first: the same steps pass, proving the
   // block above is the budget, not a matching defect.
   const allowed = verifyToolIntent(write, ['Write kb/real/*.md.', ...steps], baseAuditConfig);
   assert.equal(allowed.allowed, true);
+  assert.ok(!allowed.budgetExhausted);
   // The mirror through isTokenCovered: candidate order decides.
   assert.equal(isTokenCovered(callToken, [...decoys, 'kb/real/*.md']), false);
   assert.equal(isTokenCovered(callToken, ['kb/real/*.md', ...decoys]), true);
@@ -759,6 +765,29 @@ test('verifyToolIntent explains pattern non-satisfaction for pattern call tokens
   assert.ok(verdict.reason.includes('is not satisfied by the verified reasoning trace'));
   assert.ok(verdict.reason.includes('Reason about the files the pattern expands to'));
   assert.ok(verdict.reason.includes('retry once the audit settles'));
+});
+
+test('globPathMatches treats an unterminated bracket as a literal (review iteration 4)', () => {
+  // The parser is total: a stray '[' never throws and never opens a
+  // class — it matches itself, as in bash (testing finding).
+  assert.ok(globPathMatches('kb/[ab.md', 'kb/[ab.md'));
+  assert.ok(!globPathMatches('kb/[ab.md', 'kb/aab.md'));
+});
+
+test('extractPathTokens dedupes while preserving first-appearance order (review iteration 4)', () => {
+  // The Set-backed dedupe contract, pinned beside the performance
+  // test that motivated it (review iteration 4).
+  assert.deepEqual(extractPathTokens('a.md b.md a.md'), ['a.md', 'b.md']);
+});
+
+test('isTokenCovered fails closed on a drained shared budget (review iteration 4)', () => {
+  // Composition sites pass ONE budget per operation; when it is
+  // drained, glob work stops and the coverage question fails closed.
+  const drained = createGlobBudget();
+  drained.cellsRemaining = 0;
+  assert.ok(!isTokenCovered('kb/a.md', ['kb/*.md'], drained));
+  // Exact and basename matches stay budget-free (review iteration 4).
+  assert.ok(isTokenCovered('kb/a.md', ['kb/a.md'], drained));
 });
 
 test('verifyToolIntent treats authored content as data, not a touch (FR-064)', () => {
@@ -886,6 +915,7 @@ test('resolveHookConfig resolves hook knobs session → environment → defaults
             maxRegenerations: 5,
             blockRewardHacking: false,
             stripMode: 'strict',
+            maxCoveredTimeoutFailOpens: 4,
             memoLimits: { maxSolvedItems: 2, maxCritiques: 1, maxReminders: 1, maxReports: 1 },
           },
         },
@@ -895,6 +925,7 @@ test('resolveHookConfig resolves hook knobs session → environment → defaults
     assert.equal(fromSession.maxRegenerations, 5);
     assert.equal(fromSession.blockRewardHacking, false);
     assert.equal(fromSession.stripMode, 'strict');
+    assert.equal(fromSession.maxCoveredTimeoutFailOpens, 4);
     assert.deepEqual(fromSession.memoLimits, { maxSolvedItems: 2, maxCritiques: 1, maxReminders: 1, maxReports: 1 });
 
     // Environment applies when no session override exists.

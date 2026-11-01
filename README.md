@@ -597,10 +597,13 @@ cp skills/reasoning-auditor/skill.md ~/.config/opencode/skills/reasoning-auditor
   budgets are per-session and charged independently, so the
   combined worst case is their sum (9 by default). Trace-pattern
   matching (FR-069) runs a total bounded DP glob matcher, never a
-  RegExp: patterns over 512 characters or 32 wildcards, or match
-  subjects over 512 characters, are rejected fail-closed, and
-  every match in one guard call shares a 4M-cell work budget
-  that fails closed when exhausted. Only a rejected *call*
+  RegExp: patterns over 512 characters or 32 wildcards are
+  rejected fail-closed, and every match in one guard call — DP
+  cells and per-pair scan work alike — shares a 4M-cell work
+  budget that fails closed when exhausted, with a distinct block
+  reason naming the exhaustion. Full-path matches reject subjects
+  over 512 characters; suffix matches (coverage) may match via a
+  slash-boundary suffix within that cap. Only a rejected *call*
   pattern surfaces the complexity bounds in its block reason;
   rejected trace-side patterns and over-cap subjects simply
   match nothing. An empty trace never blocks. Directive
