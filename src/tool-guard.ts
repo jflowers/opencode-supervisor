@@ -103,44 +103,168 @@ export function extractArgPaths(args: Record<string, unknown> | undefined): stri
 const CONTENT_ARG_KEYS = ['content', 'oldString', 'newString'];
 
 /**
- * Compiles a pattern token into an anchored full-path regular
- * expression (FR-066, design D4/D5): `$name` spans translate to a
- * within-segment wildcard first — the runtime value is unknown, and
- * the token must never demand the phantom literal it spells — then
- * each segment compiles through `globSegmentToRegExp` and the
- * segments join on literal slashes. Cross-segment `**` for variables
- * was rejected (any `.md` mention would satisfy any `$var/*.md`
- * call, dissolving the filename-level check).
+ * Total, bounded glob matching for agent-authored path tokens
+ * (FR-066, FR-069; review iteration-2 hardening, learnings
+ * security-20261101T150645 / security-20261101T150647): the
+ * matcher is a dynamic-programming evaluator, never a RegExp
+ * compiled from untrusted input — a bracket body ending in a
+ * backslash (`src/[\].md`) used to throw out of the guard into
+ * the hook's blanket fail-open, and star-chain patterns could
+ * drive catastrophic backtracking synchronously on the event
+ * loop. Parsing follows POSIX glob semantics: `*` matches within
+ * a segment (never a `/`), `?` one non-slash character, `[...]`
+ * a character class with `-` ranges and `!`/`^` negation, and an
+ * unterminated `[` is a literal, as in bash. Class bodies are
+ * taken verbatim — a backslash inside a class is a literal
+ * member, so no spelling can escape or crash the parse.
  *
- * Complexity bounds (review hardening, learning
- * security-20261031T210504): pattern tokens are agent-authored and
- * untrusted, so the shared compiler rejects over-long or
- * wildcard-heavy tokens instead of compiling them — an adversarial
- * star-chain could otherwise drive catastrophic backtracking
- * synchronously on the event loop. Returning null fails closed at
- * every call site: a rejected pattern covers nothing.
+ * Complexity bounds (learning security-20261031T210504): pattern
+ * tokens are agent-authored and untrusted, so over-long or
+ * wildcard-heavy patterns are rejected outright, and subjects are
+ * capped as well — a within-bounds pattern against an over-long
+ * subject matches nothing (fail closed on both sides). The
+ * evaluator is O(pattern × subject) either way, so the bounds are
+ * a semantic signal — distinct block reasons (FR-012) — not the
+ * only defense against unbounded work.
  */
 const MAX_GLOB_PATTERN_LENGTH = 512;
 const MAX_GLOB_PATTERN_WILDCARDS = 32;
+const MAX_GLOB_SUBJECT_LENGTH = 512;
+/**
+ * Defense-in-depth cap for protected-state segment matching, where
+ * the subject is a short engineer-authored needle: bounds the
+ * evaluator's cost by the pattern alone.
+ */
+const MAX_GLOB_SEGMENT_PATTERN_LENGTH = 4096;
 
-const globPathToRegExp = (token: string): RegExp | null => {
-  const devaried = token.replace(/\$[a-zA-Z0-9_]+/g, '*');
-  if (devaried.length > MAX_GLOB_PATTERN_LENGTH) {
-    return null;
-  }
+type GlobToken =
+  | { kind: 'literal'; char: string }
+  | { kind: 'star' }
+  | { kind: 'question' }
+  | { kind: 'class'; negated: boolean; chars: Set<string> };
+
+const countGlobWildcards = (devaried: string): number => {
   let wildcards = 0;
   for (const char of devaried) {
     if (char === '*' || char === '?' || char === '[') {
       wildcards += 1;
-      if (wildcards > MAX_GLOB_PATTERN_WILDCARDS) {
-        return null;
+    }
+  }
+  return wildcards;
+};
+
+/**
+ * Whether a pattern token exceeds the shared compiler's complexity
+ * bounds — the distinct bound-rejection signal for block reasons
+ * (FR-012, review iteration 2): a rejected pattern must be
+ * distinguishable from an unmatched one, because its corrective
+ * action differs (name the files concretely, not reason in globs).
+ */
+export const isGlobPatternRejected = (token: string): boolean => {
+  const devaried = token.replace(/\$[a-zA-Z0-9_]+/g, '*');
+  return devaried.length > MAX_GLOB_PATTERN_LENGTH || countGlobWildcards(devaried) > MAX_GLOB_PATTERN_WILDCARDS;
+};
+
+const parseGlobPattern = (devaried: string): GlobToken[] => {
+  const tokens: GlobToken[] = [];
+  for (let i = 0; i < devaried.length; i += 1) {
+    const char = devaried[i];
+    if (char === '*') {
+      tokens.push({ kind: 'star' });
+    } else if (char === '?') {
+      tokens.push({ kind: 'question' });
+    } else if (char === '[') {
+      const close = devaried.indexOf(']', i + 1);
+      if (close === -1) {
+        // Unterminated bracket: a literal `[`, as in bash.
+        tokens.push({ kind: 'literal', char: '[' });
+      } else {
+        let body = devaried.slice(i + 1, close);
+        let negated = false;
+        if (body.startsWith('!') || body.startsWith('^')) {
+          negated = true;
+          body = body.slice(1);
+        }
+        const chars = new Set<string>();
+        for (let b = 0; b < body.length; b += 1) {
+          if (body[b] === '-' && b > 0 && b < body.length - 1) {
+            const lo = body.charCodeAt(b - 1);
+            const hi = body.charCodeAt(b + 1);
+            if (lo <= hi) {
+              for (let c = lo; c <= hi; c += 1) {
+                chars.add(String.fromCharCode(c));
+              }
+              continue;
+            }
+          }
+          chars.add(body[b]);
+        }
+        tokens.push({ kind: 'class', negated, chars });
+        i = close;
+      }
+    } else {
+      tokens.push({ kind: 'literal', char });
+    }
+  }
+  return tokens;
+};
+
+/**
+ * O(pattern × subject) glob evaluation — an iterative DP over
+ * suffix indexes, total by construction: no RegExp, no
+ * backtracking, no throw. `*` consumes any run of non-slash
+ * characters, `?` and classes consume exactly one non-slash
+ * character, literals (including `/`) consume themselves.
+ */
+const globTokensMatch = (tokens: readonly GlobToken[], subject: string): boolean => {
+  const p = tokens.length;
+  const s = subject.length;
+  const dp: boolean[][] = Array.from({ length: p + 1 }, () => new Array<boolean>(s + 1).fill(false));
+  dp[p][s] = true;
+  for (let i = p - 1; i >= 0; i -= 1) {
+    const token = tokens[i];
+    for (let j = s; j >= 0; j -= 1) {
+      if (token.kind === 'star') {
+        dp[i][j] = dp[i + 1][j] || (j < s && subject[j] !== '/' && dp[i][j + 1]);
+      } else if (j >= s) {
+        dp[i][j] = false;
+      } else {
+        const sc = subject[j];
+        if (token.kind === 'question') {
+          dp[i][j] = sc !== '/' && dp[i + 1][j + 1];
+        } else if (token.kind === 'class') {
+          const inClass = sc !== '/' && token.chars.has(sc);
+          dp[i][j] = inClass !== token.negated && dp[i + 1][j + 1];
+        } else {
+          dp[i][j] = token.char === sc && dp[i + 1][j + 1];
+        }
       }
     }
   }
-  const segments = devaried
-    .split('/')
-    .map((segment) => globSegmentToRegExp(segment).source.replace(/^\^/, '').replace(/\$$/, ''));
-  return new RegExp(`^${segments.join('\\/')}$`);
+  return dp[0][0];
+};
+
+/**
+ * Full-path glob match between an agent-authored pattern token
+ * and an agent-authored subject (FR-066, design D4/D5): `$name`
+ * spans devary to within-segment wildcards first — the runtime
+ * value is unknown, and the token must never demand the phantom
+ * literal it spells — then the total evaluator runs. Fails closed
+ * on either complexity bound: a rejected pattern or an over-long
+ * subject matches nothing. Cross-segment `**` for variables was
+ * rejected (any `.md` mention would satisfy any `$var/*.md` call,
+ * dissolving the filename-level check).
+ */
+const globPathMatches = (pattern: string, subject: string): boolean => {
+  const devaried = pattern.replace(/\$[a-zA-Z0-9_]+/g, '*');
+  if (
+    devaried.length > MAX_GLOB_PATTERN_LENGTH ||
+    countGlobWildcards(devaried) > MAX_GLOB_PATTERN_WILDCARDS ||
+    subject.length > MAX_GLOB_SUBJECT_LENGTH
+  ) {
+    return false;
+  }
+  return globTokensMatch(parseGlobPattern(devaried), subject);
 };
 
 /**
@@ -148,25 +272,22 @@ const globPathToRegExp = (token: string): RegExp | null => {
  * token (FR-069, design D1/D2): the pattern must be path-scoped
  * (at least one `/` — a bare filename glob like `*.md` must not
  * dissolve the filename-level check, the mirror of the
- * cross-segment `**` rejection), and its compiled pattern must
- * match the token's full lowercased path or a slash-boundary
- * suffix of it, bridging absolute tool arguments against relative
- * reasoning spellings.
+ * cross-segment `**` rejection), and it must match the token's
+ * full lowercased path or a slash-boundary suffix of it, bridging
+ * absolute tool arguments against relative reasoning spellings.
+ * A pattern rejected by the complexity bounds matches nothing —
+ * fail closed, exactly as an unmatched pattern does.
  */
 const patternCoversToken = (pattern: string, loweredToken: string): boolean => {
   if (!pattern.includes('/')) {
     return false;
   }
-  const patternRegExp = globPathToRegExp(pattern);
-  if (patternRegExp === null) {
-    return false;
-  }
-  if (patternRegExp.test(loweredToken)) {
+  if (globPathMatches(pattern, loweredToken)) {
     return true;
   }
   for (let index = loweredToken.indexOf('/'); index !== -1; index = loweredToken.indexOf('/', index + 1)) {
     const suffix = loweredToken.slice(index + 1);
-    if (suffix !== '' && patternRegExp.test(suffix)) {
+    if (suffix !== '' && globPathMatches(pattern, suffix)) {
       return true;
     }
   }
@@ -179,11 +300,11 @@ const patternCoversToken = (pattern: string, loweredToken: string): boolean => {
  * equality (a verbatim spelling, concrete or pattern), basename
  * equality in either direction (the guard's own basename
  * satisfaction — a step naming just `notes.md` covers a call on
- * `kb/topics/notes.md`), a candidate the token's compiled pattern
- * matches when the token is itself a pattern (the FR-066
- * direction), or a path-scoped candidate pattern covering a
- * concrete token (the FR-069 direction). The hook layer uses this
- * to relieve covered waits without prose-matching block reasons.
+ * `kb/topics/notes.md`), a candidate the token's pattern matches
+ * when the token is itself a pattern (the FR-066 direction), or a
+ * path-scoped candidate pattern covering a concrete token (the
+ * FR-069 direction). The hook layer uses this to relieve covered
+ * waits without prose-matching block reasons.
  *
  * @param token The unmatched call token as the guard named it.
  * @param candidateTokens Path tokens of an in-flight audit's step text.
@@ -203,8 +324,7 @@ export function isTokenCovered(token: string, candidateTokens: readonly string[]
     return true;
   }
   if (isPatternToken(lowered)) {
-    const pattern = globPathToRegExp(lowered);
-    return pattern !== null && loweredCandidates.some((candidate) => pattern.test(candidate));
+    return loweredCandidates.some((candidate) => globPathMatches(lowered, candidate));
   }
   return loweredCandidates.some((candidate) => isPatternToken(candidate) && patternCoversToken(candidate, lowered));
 }
@@ -224,7 +344,7 @@ export function isTokenCovered(token: string, candidateTokens: readonly string[]
  * (glob metacharacters or `$var` spans — its runtime expansion is
  * unknown) counts as referenced when the trace contains the pattern
  * verbatim (the model reasoned in the same spelling) or names a path
- * the compiled pattern matches; the trace side extracts tokens with
+ * the pattern matches; the trace side extracts tokens with
  * the same grammar (design D3), so "reason about X" and "the guard
  * checks X" recognize the same X.
  *
@@ -260,12 +380,12 @@ function findUnreferencedPath(
       traceTokens ??= verifiedSteps
         .flatMap((step) => extractPathTokens(step))
         .map((token) => token.toLowerCase());
-      const pattern = globPathToRegExp(lowered);
-      if (pattern !== null && traceTokens.some((token) => pattern.test(token))) {
+      // A rejected pattern (complexity bounds) matches nothing:
+      // it blocks naming itself, exactly as an unmatched pattern
+      // does — the reason layer distinguishes it (FR-012).
+      if (traceTokens.some((token) => globPathMatches(lowered, token))) {
         continue;
       }
-      // A rejected pattern (complexity bounds) blocks naming itself:
-      // fail closed, exactly as an unmatched pattern does.
       return fileToken;
     }
     const lowered = fileToken.toLowerCase();
@@ -376,12 +496,17 @@ export function verifyToolIntent(
       // FR-012 / FR-066: the reason names the token as it was spelled.
       // A pattern token names itself — never a phantom expansion like
       // `id.md` — and points at the corrective action: reason about the
-      // files it expands to, or name them concretely.
+      // files it expands to, or name them concretely. A pattern rejected
+      // by the complexity bounds says so distinctly (review iteration 2):
+      // its corrective action differs — glob reasoning cannot scale to
+      // that shape, so the files must be named.
       // FR-070 (design D6): the reason names both accepted
       // corrective forms and the settle-then-retry instruction —
       // honest in both audit states, so the guard stays pure.
       const reason = isPatternToken(unmatchedPath)
-        ? `Tool '${toolCall.name}' blocked by the file-path trace check: pattern '${unmatchedPath}' is not satisfied by the verified reasoning trace. Reason about the files the pattern expands to, or name them concretely, in verified steps, then retry once the audit settles.`
+        ? isGlobPatternRejected(unmatchedPath)
+          ? `Tool '${toolCall.name}' blocked by the file-path trace check: pattern '${unmatchedPath}' exceeds the compiler's complexity bounds (over ${MAX_GLOB_PATTERN_LENGTH} characters or ${MAX_GLOB_PATTERN_WILDCARDS} wildcards) and cannot be matched. Name the files it stands for concretely in verified steps, then retry once the audit settles.`
+          : `Tool '${toolCall.name}' blocked by the file-path trace check: pattern '${unmatchedPath}' is not satisfied by the verified reasoning trace. Reason about the files the pattern expands to, or name them concretely, in verified steps, then retry once the audit settles.`
         : `Tool '${toolCall.name}' blocked by the file-path trace check: '${unmatchedPath}' is absent from the verified reasoning trace (no full-path, basename, or covering pattern match). Name the file in verified steps — explicitly (full path or basename) or with a path-scoped pattern like 'dir/*.md' — then retry once the audit settles rather than immediately in the same turn.`;
       return {
         allowed: false,
@@ -453,44 +578,19 @@ export const hasProtectedSegmentRun = (normalized: string, run: string): boolean
  * (FR-061, review round 5): exact equality, or — when the segment
  * carries shell glob metacharacters — glob semantics where `*`
  * matches within a segment, `?` one character, and `[...]` a
- * character class.
+ * character class. Evaluation goes through the total DP matcher
+ * (review iteration 2): the segment is agent-authored, so it is
+ * never compiled into a RegExp; a segment beyond the
+ * defense-in-depth length cap matches nothing (fail closed).
  */
-const segmentMatches = (segment: string, needleSegment: string): boolean =>
-  segment === needleSegment || (/[*?[]/.test(segment) && globSegmentToRegExp(segment).test(needleSegment));
-
-/**
- * Converts a glob-bearing path segment into an anchored regular
- * expression (review round 5): `*` becomes `[^/]*`, `?` becomes
- * `[^/]`, and a balanced bracket expression passes through with the
- * glob negation marker (`!`) translated to `^`. An unterminated
- * bracket is a literal `[`, as in bash; every other character is
- * regex-escaped.
- */
-const globSegmentToRegExp = (segment: string): RegExp => {
-  let pattern = '';
-  for (let i = 0; i < segment.length; i += 1) {
-    const char = segment[i];
-    if (char === '*') {
-      pattern += '[^/]*';
-    } else if (char === '?') {
-      pattern += '[^/]';
-    } else if (char === '[') {
-      const close = segment.indexOf(']', i + 1);
-      if (close === -1) {
-        pattern += '\\[';
-      } else {
-        let body = segment.slice(i + 1, close);
-        if (body.startsWith('!')) {
-          body = `^${body.slice(1)}`;
-        }
-        pattern += `[${body}]`;
-        i = close;
-      }
-    } else {
-      pattern += char.replace(/[.*+?^${}()|[\]\\]/, '\\$&');
-    }
+const segmentMatches = (segment: string, needleSegment: string): boolean => {
+  if (segment === needleSegment) {
+    return true;
   }
-  return new RegExp(`^${pattern}$`);
+  if (!/[*?[]/.test(segment) || segment.length > MAX_GLOB_SEGMENT_PATTERN_LENGTH) {
+    return false;
+  }
+  return globTokensMatch(parseGlobPattern(segment), needleSegment);
 };
 
 /**

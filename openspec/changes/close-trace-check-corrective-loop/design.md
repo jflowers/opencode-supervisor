@@ -83,8 +83,12 @@ security learning on FR-067 applies — the supervised party can
 manufacture this trigger (name the path, stall the audit), so it
 must be bounded — but generously: each covered fail-open also
 ends an honest retry loop, and the path was explicitly reasoned.
-Uncovered waits are unchanged. Reward-hacking and directive
-checks never charge any wait.
+Coverage reads the PRE-WAIT snapshot deliberately (review
+iteration 2): an audit in flight when the wait began confers
+covered relief for that wait even if it settles before the
+timeout — the correction was reasoned before the call blocked,
+which is what relief is for. Uncovered waits are unchanged.
+Reward-hacking and directive checks never charge any wait.
 
 ### D5 Eviction detection by snapshot diff
 

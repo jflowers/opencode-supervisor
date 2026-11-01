@@ -37,7 +37,10 @@ export interface SupervisorFileConfig {
   maxOnDemandAudits?: number;
   /** Per-session cap on trace-check timeout fail-opens (FR-067). */
   maxTimeoutFailOpens?: number;
-  /** Per-session cap on covered timeout fail-opens — waits whose blocked token an in-flight audit names (FR-070). */
+  /**
+   * Per-session cap on covered timeout fail-opens — waits whose
+   * blocked token an in-flight audit names (FR-070).
+   */
   maxCoveredTimeoutFailOpens?: number;
   /** Supervisor mode: 'full' (default) or 'repair-only' (repair only, no other features). */
   mode?: SupervisorMode;

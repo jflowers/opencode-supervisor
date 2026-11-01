@@ -2199,7 +2199,12 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
             // then the strip has long filled the step-token box, and a
             // wait whose blocked token an in-flight audit provably
             // names charges its own bounded budget instead of the
-            // uncovered one.
+            // uncovered one. Coverage reads the PRE-WAIT snapshot
+            // deliberately (design D4, review iteration 2): an audit
+            // in flight when the wait began confers covered relief
+            // for this wait even if it settles before the timeout —
+            // the correction was reasoned before the call blocked,
+            // which is what relief is for.
             const covered =
               unmatched !== undefined &&
               [...before.values()].some((tokens) => isTokenCovered(unmatched, tokens));
@@ -2214,7 +2219,7 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
                 };
               } else {
                 logger.warn(
-                  `trace-check wait timed out on a covered token; failing open (${state.coveredTimeoutFailOpens}/${guardConfig.maxCoveredTimeoutFailOpens}): tool '${hookInput.tool}'`
+                  `trace-check wait timed out on a covered token; failing open (${state.coveredTimeoutFailOpens}/${guardConfig.maxCoveredTimeoutFailOpens}): tool '${hookInput.tool}', token '${unmatched}'`
                 );
                 verification = {
                   allowed: true,
@@ -2232,7 +2237,7 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
                 };
               } else {
                 logger.warn(
-                  `trace-check wait timed out; failing open (${state.timeoutFailOpens}/${guardConfig.maxTimeoutFailOpens}): tool '${hookInput.tool}'`
+                  `trace-check wait timed out; failing open (${state.timeoutFailOpens}/${guardConfig.maxTimeoutFailOpens}): tool '${hookInput.tool}'${unmatched !== undefined ? `, token '${unmatched}'` : ''}`
                 );
                 verification = {
                   allowed: true,
