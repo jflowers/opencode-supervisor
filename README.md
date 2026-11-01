@@ -595,7 +595,11 @@ cp skills/reasoning-auditor/skill.md ~/.config/opencode/skills/reasoning-auditor
   audit's step text names fail open against
   `maxCoveredTimeoutFailOpens` (default 6) instead (FR-070). Both
   budgets are per-session and charged independently, so the
-  combined worst case is their sum (9 by default). An
+  combined worst case is their sum (9 by default). Trace-pattern
+  matching (FR-069) runs a total bounded DP glob matcher, never a
+  RegExp: patterns over 512 characters or 32 wildcards, or match
+  subjects over 512 characters, are rejected fail-closed with a
+  block reason naming the complexity bounds. An
   empty trace never blocks. Directive
   globs are root-anchored and case-insensitive;
   `**/`-prefixed globs cover deeper spellings.

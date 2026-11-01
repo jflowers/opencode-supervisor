@@ -8,6 +8,11 @@
 - [x] 1.3 specs/trace-check/spec.md delta (MODIFIED FR-067;
   ADDED FR-069, FR-070)
 - [x] 1.4 tasks.md
+- [x] 1.5 `openspec/specs/trace-check/spec.md` baseline: sync
+  FR-062..FR-068 byte-identical from the archived
+  `repair-trace-check-pipeline` delta (that change had no main
+  spec to modify) so this change's FR-069/FR-070 additions and
+  FR-067 modification diff against a real base
 
 ## 2. Trace-side pattern satisfaction (FR-069)
 
@@ -65,4 +70,5 @@
 - [x] 5.2 docs: README (trace-check sections, knob table),
   CHANGELOG entry, AGENTS.md architecture bullets (FR-069,
   FR-070)
-- [ ] 5.3 `/uf.review-council`, documentation issue, PR
+- [ ] 5.3 `/uf.review-council` (docs #42, blog #43,
+  unbound-force/website capabilities issue), PR

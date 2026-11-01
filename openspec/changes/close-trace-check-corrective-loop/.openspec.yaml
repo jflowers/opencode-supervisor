@@ -7,3 +7,4 @@ affected_areas:
   - src/config-file.ts
   - test/audit.test.ts
   - test/config-file.test.ts
+  - openspec/specs/trace-check/spec.md

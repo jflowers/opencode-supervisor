@@ -14,7 +14,7 @@ import {
   type AuditConfig,
   type InvokeModel,
 } from '../src/auditor.ts';
-import { extractArgPaths, isTokenCovered, verifyToolIntent } from '../src/tool-guard.ts';
+import { extractArgPaths, isGlobPatternRejected, isTokenCovered, verifyToolIntent } from '../src/tool-guard.ts';
 import { extractPathTokens, hasPathToken, isPatternToken } from '../src/path-tokens.ts';
 import { DEFAULT_MEMO_LIMITS } from '../src/memo.ts';
 import { silentPluginLogger } from '../src/plugin-log.ts';
@@ -567,6 +567,98 @@ test('verifyToolIntent rejects a wildcard-heavy trace pattern instead of compili
   );
   assert.equal(blocked.allowed, false);
   assert.equal(blocked.unmatchedToken, 'kb/topics/gov-ci.md');
+});
+
+test('verifyToolIntent names the complexity bounds when the call pattern is rejected (FR-069 hardening)', () => {
+  // The rejected pattern is the unmatched CALL token, so the block
+  // reason must name the compiler's complexity bounds — its
+  // corrective action (name the files concretely) differs from a
+  // mere missing trace match.
+  const starChain = `kb/${'a*'.repeat(40)}.md`;
+  const blocked = verifyToolIntent(
+    { name: 'write', arguments: { filePath: starChain, content: 'topic notes' } },
+    ['Edit src/a.ts to export the helper.'],
+    baseAuditConfig
+  );
+  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.unmatchedToken, starChain);
+  assert.ok(blocked.reason.includes("exceeds the compiler's complexity bounds"));
+  assert.ok(blocked.reason.includes('Name the files it stands for concretely'));
+});
+
+test('verifyToolIntent rejects an over-long pattern token in both roles (FR-069 hardening)', () => {
+  // Over the 512-character LENGTH bound (not the wildcard bound),
+  // with a slash so the FR-069 path-scope gate passes and the
+  // length bound is what rejects it — in the call-token role the
+  // reason names the bounds; in the trace-candidate role the
+  // pattern covers nothing and the concrete call still blocks.
+  const longPattern = `kb/${'a'.repeat(600)}*.md`;
+  assert.ok(longPattern.includes('/'));
+  assert.ok(longPattern.length > 512);
+  const callBlocked = verifyToolIntent(
+    { name: 'write', arguments: { filePath: longPattern, content: 'topic notes' } },
+    ['Edit src/a.ts to export the helper.'],
+    baseAuditConfig
+  );
+  assert.equal(callBlocked.allowed, false);
+  assert.equal(callBlocked.unmatchedToken, longPattern);
+  assert.ok(callBlocked.reason.includes("exceeds the compiler's complexity bounds"));
+  const traceBlocked = verifyToolIntent(
+    { name: 'write', arguments: { filePath: 'kb/topics/gov-ci.md', content: 'topic notes' } },
+    [`Write the topic files as ${longPattern}.`],
+    baseAuditConfig
+  );
+  assert.equal(traceBlocked.allowed, false);
+  assert.equal(traceBlocked.unmatchedToken, 'kb/topics/gov-ci.md');
+  assert.equal(isTokenCovered('kb/topics/gov-ci.md', [longPattern]), false);
+});
+
+test('verifyToolIntent is total on adversarial bracket spellings (review iteration 2)', () => {
+  // A bracket body ending in a backslash used to compile to an
+  // unterminated RegExp character class and throw into the hook's
+  // blanket fail-open. The bounded matcher treats the backslash as
+  // a literal class member and returns a verdict for every
+  // spelling — total, no input throws.
+  const hostile = String.raw`src/[\].md`;
+  const callBlocked = verifyToolIntent(
+    { name: 'write', arguments: { filePath: hostile, content: 'topic notes' } },
+    ['Edit src/a.ts to export the helper.'],
+    baseAuditConfig
+  );
+  assert.equal(callBlocked.allowed, false);
+  // The shared token grammar treats `[` and `\` as boundaries, so
+  // the extractor tokenizes the hostile spelling down to `].md` —
+  // a plain unmatched token. The assertion under test is
+  // totality: every spelling yields a verdict, never a throw.
+  assert.equal(callBlocked.unmatchedToken, '].md');
+  const traceBlocked = verifyToolIntent(
+    { name: 'write', arguments: { filePath: 'src/other.md', content: 'topic notes' } },
+    [`Write the topic files as ${hostile}.`],
+    baseAuditConfig
+  );
+  assert.equal(traceBlocked.allowed, false);
+  assert.equal(isTokenCovered(hostile, ['src/other.md']), false);
+  assert.equal(isTokenCovered('src/other.md', [hostile]), false);
+});
+
+test('isGlobPatternRejected reports the compiler bounds directly (FR-069 hardening)', () => {
+  assert.equal(isGlobPatternRejected(`kb/${'a*'.repeat(40)}.md`), true);
+  assert.equal(isGlobPatternRejected(`kb/${'a'.repeat(600)}*.md`), true);
+  assert.equal(isGlobPatternRejected('kb/topics/*.md'), false);
+  assert.equal(isGlobPatternRejected('kb/topics/gov-ci.md'), false);
+});
+
+test('isTokenCovered stays bounded on long match subjects (FR-069 hardening)', () => {
+  // A within-bounds pattern (16 wildcards) against an over-long
+  // subject (over 512 characters) fails closed on the subject cap;
+  // the same pattern against a within-bounds ~500-character
+  // non-matching subject resolves in bounded DP time instead of
+  // catastrophic backtracking.
+  const pattern = `kb/${'a*'.repeat(16)}.md`;
+  const longSubject = `kb/${'a'.repeat(600)}.md`;
+  const boundedSubject = `kb/${'b'.repeat(495)}.md`;
+  assert.equal(isTokenCovered(longSubject, [pattern]), false);
+  assert.equal(isTokenCovered(boundedSubject, [pattern]), false);
 });
 
 test('isTokenCovered matches exact, basename, and pattern spellings in both directions (FR-070)', () => {
@@ -2792,26 +2884,88 @@ test('a settled wait whose correction was audited but evicted says so (FR-070)',
       hooks,
       completedReasoningPart({ sessionID, id: 'part-evicted', text: 'I will record the outcome in notes.md.' })
     );
-    const call = dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'notes.md', content: 'session summary' });
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    // Deterministic handshake: the parked model call proves the
+    // continuation registered in pendingAudits (registration is
+    // synchronous with the dispatch, strictly before the model
+    // call), so the tool call below always takes the wait branch —
+    // no wall-clock sleep to lose the interleaving.
+    for (let attempt = 0; harness.parkedResolvers.length === 0 && attempt < 500; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    assert.ok(harness.parkedResolvers.length > 0, 'audit should be parked and registered');
+    let call: Promise<void> | undefined;
+    try {
+      call = dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'notes.md', content: 'session summary' });
 
-    // The audit fails as a peer verdict — the step is evicted, so the
-    // settled wait still blocks, and the reason names the eviction
-    // instead of blaming absent reasoning (FR-070, design D5).
-    harness.parkedResolvers[0](PEER_FAILED_VERDICT);
-    await assert.rejects(
-      () => call,
-      (error: unknown) => {
-        assert.ok(error instanceof Error);
-        assert.ok(error.message.includes('recent reasoning named'));
-        assert.ok(error.message.includes('notes.md'));
-        assert.ok(error.message.includes('audit did not pass'));
-        return true;
-      }
+      // The audit fails as a peer verdict — the step is evicted, so the
+      // settled wait still blocks, and the reason names the eviction
+      // instead of blaming absent reasoning (FR-070, design D5).
+      harness.parkedResolvers[0](PEER_FAILED_VERDICT);
+      await assert.rejects(
+        () => call,
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.ok(error.message.includes('recent reasoning named'));
+          assert.ok(error.message.includes('notes.md'));
+          assert.ok(error.message.includes('audit did not pass'));
+          return true;
+        }
+      );
+      await dispatch;
+      assert.equal(sessionState.get(sessionID).timeoutFailOpens, 0);
+      assert.equal(sessionState.get(sessionID).coveredTimeoutFailOpens, 0);
+    } finally {
+      // Parked audit and in-flight promises never leak on failure.
+      harness.parkedResolvers[0]?.(PASSED_VERDICT);
+      await dispatch.catch(() => {});
+      await call?.catch(() => {});
+    }
+  });
+});
+
+test('a settled wait re-blocked on a different path names that path, not an eviction (FR-070)', async () => {
+  await withCleanAuditEnv(async () => {
+    const harness = raceHarness();
+    const hooks = await plugin.server(harness.input);
+    const sessionID = 'race-fresh-unmatched';
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
+
+    // The reasoning step names a.md only. The call touches a.md and
+    // b.md; the pre-wait block names a.md (the first unmatched
+    // token), the audit PASSES during the wait — recording a.md in
+    // the verified trace — so the re-run blocks on b.md. The
+    // eviction check must use the re-run's fresh unmatched token:
+    // b.md is not covered by the departed audit's [a.md], so the
+    // reason is the generic absent-path one naming b.md, never the
+    // stale-token eviction attribution blaming a.md.
+    const dispatch = dispatchPart(
+      hooks,
+      completedReasoningPart({ sessionID, id: 'part-fresh-unmatched', text: 'I will update a.md with the summary.' })
     );
-    await dispatch;
-    assert.equal(sessionState.get(sessionID).timeoutFailOpens, 0);
-    assert.equal(sessionState.get(sessionID).coveredTimeoutFailOpens, 0);
+    for (let attempt = 0; harness.parkedResolvers.length === 0 && attempt < 500; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    assert.ok(harness.parkedResolvers.length > 0, 'audit should be parked and registered');
+    let call: Promise<void> | undefined;
+    try {
+      call = dispatchToolBefore(hooks, sessionID, 'bash', { command: 'printf out > a.md && printf out > b.md' });
+      harness.parkedResolvers[0](PASSED_VERDICT);
+      await assert.rejects(
+        () => call,
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.ok(error.message.includes('b.md'));
+          assert.ok(error.message.includes('absent from the verified reasoning trace'));
+          assert.ok(!error.message.includes('recent reasoning named'));
+          return true;
+        }
+      );
+      await dispatch;
+    } finally {
+      harness.parkedResolvers[0]?.(PASSED_VERDICT);
+      await dispatch.catch(() => {});
+      await call?.catch(() => {});
+    }
   });
 });
 

@@ -58,6 +58,12 @@ file-path trace check. Two structural causes, both guard-side:
   (pendingAudits Map with step-token boxes, covered fail-open,
   eviction detection, knob resolution), `src/config-file.ts` (new
   numeric knob).
+- Specs: `openspec/specs/trace-check/spec.md` is the delta base —
+  340 lines syncing FR-062..FR-068 byte-identical from the
+  archived `repair-trace-check-pipeline` delta, which had no main
+  spec to modify. This change's FR-069/FR-070 additions and the
+  FR-067 modification sit in the change delta, as OpenSpec
+  requires pre-archive.
 - Docs: README trace-check sections and knob table, CHANGELOG,
   AGENTS.md architecture bullets.
 - Tests: guard cases for pattern satisfaction; hook-layer cases

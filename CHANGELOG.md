@@ -33,12 +33,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `pendingAudits` session state is a `Map` from each audit continuation
   to the path tokens of the stripped step it audits (was a `Set` of
   promises).
-- The shared path-pattern compiler (`globPathToRegExp`) rejects over-long
-  or wildcard-heavy pattern tokens (length over 512, or more than 32
-  wildcards) instead of compiling them: an adversarial star-chain could
-  otherwise stall the event loop with catastrophic backtracking, and
-  pattern tokens are agent-authored input. A rejected pattern covers
-  nothing — fail closed, like an unmatched pattern (review hardening).
+- Agent-authored path patterns no longer compile to regular
+  expressions at all. The shared matcher (`globPathMatches`) is a
+  total, bounded dynamic-programming glob match — it cannot throw
+  on adversarial spellings (an unterminated character class such
+  as `src/[\].md` used to crash the compiler into the hook's
+  fail-open path) and runs in O(pattern × subject) instead of
+  catastrophic backtracking. Both sides are capped (pattern over
+  512 characters or more than 32 wildcards, subject over 512
+  characters); a rejected pattern covers nothing — fail closed,
+  with a block reason naming the complexity bounds (review
+  hardening, iterations 1 and 2). Engineer-authored directive
+  globs are unchanged.
 
 Spec deltas: `openspec/changes/close-trace-check-corrective-loop/`
 (base synced to `openspec/specs/trace-check/spec.md`).
