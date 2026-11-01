@@ -37,6 +37,8 @@ export interface SupervisorFileConfig {
   maxOnDemandAudits?: number;
   /** Per-session cap on trace-check timeout fail-opens (FR-067). */
   maxTimeoutFailOpens?: number;
+  /** Per-session cap on covered timeout fail-opens — waits whose blocked token an in-flight audit names (FR-070). */
+  maxCoveredTimeoutFailOpens?: number;
   /** Supervisor mode: 'full' (default) or 'repair-only' (repair only, no other features). */
   mode?: SupervisorMode;
   /** Tool-argument repair overrides; unset keys fall through to the next tier. */
@@ -166,10 +168,11 @@ export const validateSupervisorConfig = (value: unknown): ParsedSupervisorConfig
     config.mode = modeRaw as SupervisorMode;
   }
 
-  const numeric: readonly ('maxRegenerations' | 'maxOnDemandAudits' | 'maxTimeoutFailOpens')[] = [
+  const numeric: readonly ('maxRegenerations' | 'maxOnDemandAudits' | 'maxTimeoutFailOpens' | 'maxCoveredTimeoutFailOpens')[] = [
     'maxRegenerations',
     'maxOnDemandAudits',
     'maxTimeoutFailOpens',
+    'maxCoveredTimeoutFailOpens',
   ];
   for (const key of numeric) {
     const parsed = optionalNumber(value, key);

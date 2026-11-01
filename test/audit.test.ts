@@ -508,6 +508,52 @@ test('verifyToolIntent still allows pattern tokens on an empty trace (FR-011, FR
   assert.equal(result.allowed, true);
 });
 
+test('verifyToolIntent satisfies a concrete write from a path-scoped trace pattern (FR-069)', () => {
+  const covered = verifyToolIntent(
+    { name: 'write', arguments: { filePath: 'kb/topics/gov-ci.md', content: 'topic notes' } },
+    ['Write the topic files as kb/topics/*.md.'],
+    baseAuditConfig
+  );
+  assert.equal(covered.allowed, true);
+});
+
+test('verifyToolIntent does not satisfy a concrete write from a bare filename glob (FR-069)', () => {
+  const blocked = verifyToolIntent(
+    { name: 'write', arguments: { filePath: 'kb/topics/gov-ci.md', content: 'topic notes' } },
+    ['Write the topic files as *.md.'],
+    baseAuditConfig
+  );
+  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.unmatchedToken, 'kb/topics/gov-ci.md');
+});
+
+test('verifyToolIntent does not satisfy a concrete write from a non-covering trace pattern (FR-069)', () => {
+  const blocked = verifyToolIntent(
+    { name: 'write', arguments: { filePath: 'kb/topics/gov-ci.md', content: 'topic notes' } },
+    ['Write the topic files as kb/other/*.md.'],
+    baseAuditConfig
+  );
+  assert.equal(blocked.allowed, false);
+});
+
+test('verifyToolIntent satisfies an absolute argument from a relative trace pattern by suffix (FR-069)', () => {
+  const covered = verifyToolIntent(
+    { name: 'bash', arguments: { command: 'cat /workspace/kb/topics/gov-ci.md' } },
+    ['Write the topic files as kb/topics/*.md.'],
+    baseAuditConfig
+  );
+  assert.equal(covered.allowed, true);
+});
+
+test('verifyToolIntent matches trace patterns case-insensitively (FR-069)', () => {
+  const covered = verifyToolIntent(
+    { name: 'write', arguments: { filePath: 'kb/topics/gov-ci.md', content: 'topic notes' } },
+    ['Write the topic files as KB/Topics/*.md.'],
+    baseAuditConfig
+  );
+  assert.equal(covered.allowed, true);
+});
+
 test('verifyToolIntent treats authored content as data, not a touch (FR-064)', () => {
   // The #33 field scenario: a write whose content quotes an
   // unreferenced filename is authored data — only the operational
@@ -906,6 +952,7 @@ const AUDIT_ENV_NAMES = [
   'OPENCODE_SUPERVISOR_MEMO_MAX_CRITIQUES',
   'OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS',
   'OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS',
+  'OPENCODE_SUPERVISOR_MAX_COVERED_TIMEOUT_FAIL_OPENS',
 ];
 
 /** Saves/deletes the auditor env knobs and isolates XDG_CONFIG_HOME around `run`, restoring after. */
@@ -2503,7 +2550,7 @@ test('a rejected in-flight audit settles the trace-check wait without throwing i
     // does the real observation), so no unhandled-rejection window.
     const poisoned = Promise.reject(new Error('audit continuation crashed'));
     poisoned.catch(() => {});
-    sessionState.get(sessionID).pendingAudits.add(poisoned);
+    sessionState.get(sessionID).pendingAudits.set(poisoned, []);
 
     // The call blocks with the trace reason — the live trace is
     // unchanged by the rejection — and the rejection never escapes
@@ -2525,7 +2572,7 @@ test('a rejected in-flight audit settles the trace-check wait without throwing i
   });
 });
 
-test('a trace-check wait that times out fails open within the per-session cap (FR-067)', async () => {
+test('a covered trace-check wait that times out fails open on its own budget (FR-067, FR-070)', async () => {
   await withCleanAuditEnv(async () => {
     const harness = raceHarness();
     const hooks = await plugin.server(harness.input);
@@ -2542,18 +2589,21 @@ test('a trace-check wait that times out fails open within the per-session cap (F
         hooks,
         completedReasoningPart({ sessionID, id: 'part-timeout', text: 'I will record the outcome in notes.md.' })
       );
-      // The call is allowed (fail-open, FR-005's conservatism: the
-      // live agent's progress outranks one unverified call)...
+      // The correction is provably in flight — the parked audit's
+      // step names notes.md — so the timeout is covered (FR-070):
+      // the call is allowed on the covered budget, and the uncovered
+      // budget is not charged.
       await assert.doesNotReject(() =>
         dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'notes.md', content: 'session summary' })
       );
-      // ...and exactly one warning names the delay and the budget.
       const warnings = harness.logEntries.filter(
         (entry) => entry.level === 'warn' && entry.message.includes('trace-check wait timed out')
       );
       assert.equal(warnings.length, 1);
-      assert.ok(warnings[0].message.includes('failing open (1/3)'));
-      assert.equal(sessionState.get(sessionID).timeoutFailOpens, 1);
+      assert.ok(warnings[0].message.includes('covered token'));
+      assert.ok(warnings[0].message.includes('failing open (1/6)'));
+      assert.equal(sessionState.get(sessionID).coveredTimeoutFailOpens, 1);
+      assert.equal(sessionState.get(sessionID).timeoutFailOpens, 0);
     } finally {
       // Release the parked audit and settle the fire-and-forget hook so
       // nothing leaks past the test.
@@ -2564,7 +2614,7 @@ test('a trace-check wait that times out fails open within the per-session cap (F
   });
 });
 
-test('repeated trace-check timeouts block at the per-session fail-open cap (FR-067)', async () => {
+test('repeated uncovered trace-check timeouts block at the per-session fail-open cap (FR-067)', async () => {
   await withCleanAuditEnv(async () => {
     // Cap 1 through the env tier: the first timeout fails open
     // (below the cap), the second blocks (past it).
@@ -2578,9 +2628,12 @@ test('repeated trace-check timeouts block at the per-session fail-open cap (FR-0
     traceAwaitState.timeoutMs = 15;
     let dispatch: Promise<void> | undefined;
     try {
+      // The parked audit's step names other.md, not notes.md — the
+      // waits below are uncovered, so they charge the original
+      // budget (FR-070's uncovered path).
       dispatch = dispatchPart(
         hooks,
-        completedReasoningPart({ sessionID, id: 'part-cap', text: 'I will record the outcome in notes.md.' })
+        completedReasoningPart({ sessionID, id: 'part-cap', text: 'I will record the outcome in other.md.' })
       );
       // First timeout — below the cap: allowed, one warning logged.
       await assert.doesNotReject(() =>
@@ -2591,6 +2644,7 @@ test('repeated trace-check timeouts block at the per-session fail-open cap (FR-0
           (entry) => entry.level === 'warn' && entry.message.includes('trace-check wait timed out') && entry.message.includes('failing open (1/1)')
         )
       );
+      assert.ok(!harness.logEntries.some((entry) => entry.message.includes('covered token')));
       // Second timeout — past the cap: the call blocks, the reason
       // names the still-unsettled audit and the corrective action.
       await assert.rejects(
@@ -2612,11 +2666,97 @@ test('repeated trace-check timeouts block at the per-session fail-open cap (FR-0
         )
       );
       assert.equal(sessionState.get(sessionID).timeoutFailOpens, 2);
+      assert.equal(sessionState.get(sessionID).coveredTimeoutFailOpens, 0);
     } finally {
       harness.parkedResolvers[0]?.(PASSED_VERDICT);
       await dispatch;
       traceAwaitState.timeoutMs = savedTimeoutMs;
     }
+  });
+});
+
+test('repeated covered timeouts block at the covered fail-open cap (FR-070)', async () => {
+  await withCleanAuditEnv(async () => {
+    // Covered cap 1 through the env tier: the first covered timeout
+    // fails open, the second blocks past it.
+    process.env.OPENCODE_SUPERVISOR_MAX_COVERED_TIMEOUT_FAIL_OPENS = '1';
+    const harness = raceHarness();
+    const hooks = await plugin.server(harness.input);
+    const sessionID = 'race-covered-cap';
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
+
+    const savedTimeoutMs = traceAwaitState.timeoutMs;
+    traceAwaitState.timeoutMs = 15;
+    let dispatch: Promise<void> | undefined;
+    try {
+      dispatch = dispatchPart(
+        hooks,
+        completedReasoningPart({ sessionID, id: 'part-covered-cap', text: 'I will record the outcome in notes.md.' })
+      );
+      // First covered timeout — below the covered cap: allowed, the
+      // warning names the covered budget.
+      await assert.doesNotReject(() =>
+        dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'notes.md', content: 'session summary' })
+      );
+      assert.ok(
+        harness.logEntries.some(
+          (entry) => entry.level === 'warn' && entry.message.includes('covered token') && entry.message.includes('failing open (1/1)')
+        )
+      );
+      // Second covered timeout — past the covered cap: the call
+      // blocks naming the still-unsettled audit.
+      await assert.rejects(
+        () => dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'notes.md', content: 'retry summary' }),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.ok(error.message.includes('still unsettled'));
+          assert.ok(error.message.includes('covered timeout fail-open cap (1)'));
+          assert.ok(error.message.includes('Wait for the audit to settle'));
+          return true;
+        }
+      );
+      assert.equal(sessionState.get(sessionID).coveredTimeoutFailOpens, 2);
+      assert.equal(sessionState.get(sessionID).timeoutFailOpens, 0);
+    } finally {
+      harness.parkedResolvers[0]?.(PASSED_VERDICT);
+      await dispatch;
+      traceAwaitState.timeoutMs = savedTimeoutMs;
+    }
+  });
+});
+
+test('a settled wait whose correction was audited but evicted says so (FR-070)', async () => {
+  await withCleanAuditEnv(async () => {
+    const harness = raceHarness();
+    const hooks = await plugin.server(harness.input);
+    const sessionID = 'race-evicted';
+    sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
+
+    const PEER_FAILED_VERDICT = '{"passed":false,"failedStep":0,"severity":"minor","critique":"The claim is not verifiable."}';
+    const dispatch = dispatchPart(
+      hooks,
+      completedReasoningPart({ sessionID, id: 'part-evicted', text: 'I will record the outcome in notes.md.' })
+    );
+    const call = dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'notes.md', content: 'session summary' });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    // The audit fails as a peer verdict — the step is evicted, so the
+    // settled wait still blocks, and the reason names the eviction
+    // instead of blaming absent reasoning (FR-070, design D5).
+    harness.parkedResolvers[0](PEER_FAILED_VERDICT);
+    await assert.rejects(
+      () => call,
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.ok(error.message.includes('recent reasoning named'));
+        assert.ok(error.message.includes('notes.md'));
+        assert.ok(error.message.includes('audit did not pass'));
+        return true;
+      }
+    );
+    await dispatch;
+    assert.equal(sessionState.get(sessionID).timeoutFailOpens, 0);
+    assert.equal(sessionState.get(sessionID).coveredTimeoutFailOpens, 0);
   });
 });
 
@@ -2678,7 +2818,7 @@ test('the corrective instruction loop closes end to end: block, prose re-stateme
       (error: unknown) => {
         assert.ok(error instanceof Error);
         assert.ok(error.message.includes('notes.md'));
-        assert.ok(error.message.includes('Reason about the file in verified steps'));
+        assert.ok(error.message.includes('Name the file in verified steps'));
         return true;
       }
     );

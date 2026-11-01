@@ -51,7 +51,8 @@ import {
   type VerifiedTraceEntry,
 } from './src/auditor.ts';
 import { stripNarrative } from './src/stripper.ts';
-import { checkProtectedState, verifyToolIntent, type ToolVerificationResult } from './src/tool-guard.ts';
+import { extractPathTokens } from './src/path-tokens.ts';
+import { checkProtectedState, isTokenCovered, verifyToolIntent, type ToolVerificationResult } from './src/tool-guard.ts';
 import {
   buildMemo,
   DEFAULT_MEMO_LIMITS,
@@ -119,6 +120,7 @@ const ENV_MEMO_MAX_REMINDERS = 'OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS';
 const ENV_MEMO_MAX_REPORTS = 'OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS';
 const ENV_MAX_ON_DEMAND_AUDITS = 'OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS';
 const ENV_MAX_TIMEOUT_FAIL_OPENS = 'OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS';
+const ENV_MAX_COVERED_TIMEOUT_FAIL_OPENS = 'OPENCODE_SUPERVISOR_MAX_COVERED_TIMEOUT_FAIL_OPENS';
 const ENV_MODE = 'OPENCODE_SUPERVISOR_MODE';
 const ENV_REPAIR_MODEL = 'OPENCODE_SUPERVISOR_REPAIR_MODEL';
 
@@ -136,6 +138,8 @@ export interface HookConfig extends AuditConfig {
   maxOnDemandAudits: number;
   /** Per-session cap on trace-check timeout fail-opens (FR-067, design D8): past it, a timed-out wait blocks. */
   maxTimeoutFailOpens: number;
+  /** Per-session cap on covered timeout fail-opens (FR-070, design D4): waits whose blocked token an in-flight audit names. */
+  maxCoveredTimeoutFailOpens: number;
   /** Supervisor mode: 'full' (everything) or 'repair-only' (tool-arg repair only). */
   mode: SupervisorMode;
   /** Tool-argument repair configuration (deterministic first, model tier second). */
@@ -158,6 +162,7 @@ export const pluginConfig: HookConfig = {
   memoLimits: { ...DEFAULT_MEMO_LIMITS },
   maxOnDemandAudits: 8,
   maxTimeoutFailOpens: 3,
+  maxCoveredTimeoutFailOpens: 6,
   mode: 'full',
   argRepair: { ...DEFAULT_ARG_REPAIR, tools: [...DEFAULT_ARG_REPAIR.tools] },
 };
@@ -168,7 +173,7 @@ export const pluginConfig: HookConfig = {
  * build. `package.json` cannot be imported from here without a build
  * step, so the constant is the source of truth for the log prefix.
  */
-export const PLUGIN_VERSION = '2.7.0';
+export const PLUGIN_VERSION = '2.8.0';
 
 /**
  * Log-identity state (FR-055): the module-identity line is emitted
@@ -375,6 +380,11 @@ export function resolveHookConfig(
       envNumber(ENV_MAX_TIMEOUT_FAIL_OPENS) ??
       tiered(sources.project?.maxTimeoutFailOpens, sources.options?.maxTimeoutFailOpens, sources.global?.maxTimeoutFailOpens) ??
       pluginConfig.maxTimeoutFailOpens,
+    maxCoveredTimeoutFailOpens:
+      pickNumber(overrides.maxCoveredTimeoutFailOpens) ??
+      envNumber(ENV_MAX_COVERED_TIMEOUT_FAIL_OPENS) ??
+      tiered(sources.project?.maxCoveredTimeoutFailOpens, sources.options?.maxCoveredTimeoutFailOpens, sources.global?.maxCoveredTimeoutFailOpens) ??
+      pluginConfig.maxCoveredTimeoutFailOpens,
     mode:
       pickSupervisorMode(overrides.mode) ??
       pickSupervisorMode(envText(ENV_MODE)) ??
@@ -448,14 +458,25 @@ export interface SessionState {
    * event hook registers after dedupe, resolving only after the trace
    * mutation (or the eviction/critique decision), so a waiting tool
    * call always re-reads a settled trace. Deregistered in a finally.
+   * Each entry carries the stripped step's path tokens (FR-070,
+   * design D3), so the guard can see whether a blocked token is
+   * provably named by reasoning still under audit.
    */
-  pendingAudits: Set<Promise<unknown>>;
+  pendingAudits: Map<Promise<unknown>, string[]>;
   /**
    * Trace-check waits that timed out and failed open this session
    * (FR-067, design D8); the cap is `maxTimeoutFailOpens`. Past the
    * cap a timed-out wait blocks naming the still-unsettled audit.
    */
   timeoutFailOpens: number;
+  /**
+   * Covered trace-check waits that timed out and failed open this
+   * session (FR-070, design D4) — the blocked token was named by an
+   * in-flight audit's step text; the cap is
+   * `maxCoveredTimeoutFailOpens`. Past the cap a timed-out covered
+   * wait blocks naming the still-unsettled audit.
+   */
+  coveredTimeoutFailOpens: number;
   /**
    * Provider/model identity captured from `chat.message` hook payloads
    * (tool-arg repair): drives the per-model tool-schema lookup so repair
@@ -485,8 +506,9 @@ function emptySessionState(): SessionState {
     triggeredDirectives: [],
     grantedGates: new Set(),
     seenParts: new Set(),
-    pendingAudits: new Set(),
+    pendingAudits: new Map(),
     timeoutFailOpens: 0,
+    coveredTimeoutFailOpens: 0,
     modelIdentity: undefined,
     repairAttempts: 0,
     repairNotices: new Set(),
@@ -1852,9 +1874,9 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
    * round-3 derived-lookup precedent). Returns 'settled' or 'timeout'.
    */
   const waitForPendingAudits = async (
-    pending: Set<Promise<unknown>>
+    pending: Map<Promise<unknown>, string[]>
   ): Promise<'settled' | 'timeout'> => {
-    const pendingList = [...pending];
+    const pendingList = [...pending.keys()];
     const settled = Promise.allSettled(pendingList);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<'timeout'>((resolve) => {
@@ -1918,15 +1940,20 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         // Task 3.2 — the live audit path. FR-002: strip narrative per
         // config.stripMode BEFORE the invariant checks, the audit, and
         // trace matching; each completed part contributes one step.
-        // FR-067 (design D8): the audit continuation (config → strip →
-        // audit → trace mutation / critique delivery) registers in
-        // `pendingAudits` so a concurrent tool call can await the
-        // settled trace instead of blocking on a partial one. The
-        // registered promise resolves only after the trace mutation,
-        // and the finally deregistration keeps the set from leaking.
+        // FR-070 (design D3): the entry carries the stripped step's
+        // path tokens in a box the continuation fills once the strip
+        // resolves — registration stays synchronous with the dispatch
+        // (FR-067's wait contract), and a waiter reading before the
+        // strip completes sees no coverage (fail-closed). The
+        // continuation (config → strip → audit → trace mutation /
+        // critique delivery) still resolves only after the trace
+        // mutation, and the finally deregistration keeps the map
+        // from leaking.
+        const stepTokens: string[] = [];
         const continuation = (async () => {
           const config = await buildConfig();
           const [stepText] = stripNarrative([part.text], config.stripMode);
+          stepTokens.push(...(stepText ? extractPathTokens(stepText) : []));
           // Nothing formal survives stripping: no audit, no model call,
           // nothing recorded (runPeerAudit would no-op; skip even that).
           if (stepText === undefined || stepText === '') {
@@ -1966,7 +1993,10 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
             });
           }
         })();
-        state.pendingAudits.add(continuation);
+        // FR-070 (design D3): the entry carries the stripped step's
+        // path tokens — the shared grammar, so "the step names the
+        // path" and "the guard demands the path" agree by construction.
+        state.pendingAudits.set(continuation, stepTokens);
         try {
           // Fire-and-forget contract (spike 1.3) preserved: the outer
           // catch observes any rejection; a waiting tool call observes
@@ -2104,43 +2134,99 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
             consoleTools
           );
         verification = runGuard();
-        // FR-067 (design D8): await-on-miss. A trace block with an
-        // in-flight audit continuation means the reasoning that would
-        // reference these paths may not have settled when the call
-        // arrived (same-turn interleave). One bounded wait per call
-        // (`traceAwaitState.timeoutMs`); a settled wait re-runs the
-        // guard against the settled trace, and a rejected continuation
-        // still counts as settled. Reward-hacking and directive blocks
-        // never charge the wait (their causes are not trace races), and
-        // the empty-trace allow (FR-011) never waits. A timed-out wait
-        // fails open — the live agent's progress outranks one
-        // unverified call — bounded per session by
-        // `maxTimeoutFailOpens`; past the cap it blocks, naming the
-        // still-unsettled audit so the model can wait and retry.
+        // FR-067 (design D8) + FR-070 (design D4/D5): await-on-miss.
+        // A trace block with an in-flight audit continuation means the
+        // reasoning that would reference these paths may not have
+        // settled when the call arrived (same-turn interleave). One
+        // bounded wait per call (`traceAwaitState.timeoutMs`); a
+        // settled wait re-runs the guard against the settled trace,
+        // and a rejected continuation still counts as settled.
+        // Reward-hacking and directive blocks never charge the wait
+        // (their causes are not trace races), and the empty-trace
+        // allow (FR-011) never waits. A timed-out wait fails open —
+        // the live agent's progress outranks one unverified call —
+        // bounded per session by `maxTimeoutFailOpens`; past the cap
+        // it blocks, naming the still-unsettled audit so the model
+        // can wait and retry. When the blocked token is provably
+        // named by an in-flight audit's step text (a covered wait),
+        // the timeout charges `maxCoveredTimeoutFailOpens` instead —
+        // the correction is in flight, so the retry loop ends rather
+        // than hard-blocking (FR-070, design D4).
         if (
           !verification.allowed &&
           verification.blockedCheck === 'trace' &&
           state.pendingAudits.size > 0
         ) {
+          // FR-070 (design D5): snapshot before the wait so a settled
+          // wait can distinguish an evicted correction from absent
+          // reasoning.
+          const before = new Map(state.pendingAudits);
+          const unmatched = verification.unmatchedToken;
           const wait = await waitForPendingAudits(state.pendingAudits);
           if (wait === 'settled') {
             verification = runGuard();
+            // FR-070 (design D5): the correction was reasoned and
+            // audited but did not record — say so instead of blaming
+            // absent reasoning.
+            if (
+              !verification.allowed &&
+              verification.blockedCheck === 'trace' &&
+              unmatched !== undefined
+            ) {
+              const evicted = [...before.keys()]
+                .filter((promise) => !state.pendingAudits.has(promise))
+                .some((promise) => isTokenCovered(unmatched, before.get(promise) ?? []));
+              if (evicted) {
+                verification = {
+                  allowed: false,
+                  reason: `Tool '${hookInput.tool}' blocked by the file-path trace check: recent reasoning named '${unmatched}' but its audit did not pass, so it is not in the verified trace. Restate the step factually so it survives audit, then retry once that audit settles.`,
+                  blockedCheck: 'trace',
+                };
+              }
+            }
           } else {
-            state.timeoutFailOpens += 1;
-            if (state.timeoutFailOpens > guardConfig.maxTimeoutFailOpens) {
-              verification = {
-                allowed: false,
-                reason: `Tool '${hookInput.tool}' blocked by the file-path trace check: an earlier reasoning audit is still unsettled after ${traceAwaitState.timeoutMs} ms and the session's timeout fail-open cap (${guardConfig.maxTimeoutFailOpens}) is reached. Wait for the audit to settle, then retry.`,
-                blockedCheck: 'trace',
-              };
+            // FR-070 (design D4): coverage is decided at timeout — by
+            // then the strip has long filled the step-token box, and a
+            // wait whose blocked token an in-flight audit provably
+            // names charges its own bounded budget instead of the
+            // uncovered one.
+            const covered =
+              unmatched !== undefined &&
+              [...before.values()].some((tokens) => isTokenCovered(unmatched, tokens));
+            if (covered) {
+              state.coveredTimeoutFailOpens += 1;
+              if (state.coveredTimeoutFailOpens > guardConfig.maxCoveredTimeoutFailOpens) {
+                verification = {
+                  allowed: false,
+                  reason: `Tool '${hookInput.tool}' blocked by the file-path trace check: an earlier reasoning audit is still unsettled after ${traceAwaitState.timeoutMs} ms and the session's covered timeout fail-open cap (${guardConfig.maxCoveredTimeoutFailOpens}) is reached. Wait for the audit to settle, then retry.`,
+                  blockedCheck: 'trace',
+                };
+              } else {
+                logger.warn(
+                  `trace-check wait timed out on a covered token; failing open (${state.coveredTimeoutFailOpens}/${guardConfig.maxCoveredTimeoutFailOpens}): tool '${hookInput.tool}'`
+                );
+                verification = {
+                  allowed: true,
+                  reason: 'Trace-check wait timed out; the blocked path is named by an in-flight audit and the call failed open within the covered per-session cap.',
+                };
+              }
             } else {
-              logger.warn(
-                `trace-check wait timed out; failing open (${state.timeoutFailOpens}/${guardConfig.maxTimeoutFailOpens}): tool '${hookInput.tool}'`
-              );
-              verification = {
-                allowed: true,
-                reason: 'Trace-check wait timed out; the call failed open within the per-session cap.',
-              };
+              state.timeoutFailOpens += 1;
+              if (state.timeoutFailOpens > guardConfig.maxTimeoutFailOpens) {
+                verification = {
+                  allowed: false,
+                  reason: `Tool '${hookInput.tool}' blocked by the file-path trace check: an earlier reasoning audit is still unsettled after ${traceAwaitState.timeoutMs} ms and the session's timeout fail-open cap (${guardConfig.maxTimeoutFailOpens}) is reached. Wait for the audit to settle, then retry.`,
+                  blockedCheck: 'trace',
+                };
+              } else {
+                logger.warn(
+                  `trace-check wait timed out; failing open (${state.timeoutFailOpens}/${guardConfig.maxTimeoutFailOpens}): tool '${hookInput.tool}'`
+                );
+                verification = {
+                  allowed: true,
+                  reason: 'Trace-check wait timed out; the call failed open within the per-session cap.',
+                };
+              }
             }
           }
         }

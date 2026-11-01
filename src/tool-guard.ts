@@ -30,6 +30,13 @@ export interface ToolVerificationResult {
    * idiom). Absent when allowed.
    */
   blockedCheck?: BlockedCheck;
+  /**
+   * The unmatched path token (FR-070, design D4/D5): set on every
+   * trace block so the hook layer can check in-flight audit coverage
+   * without prose-matching the reason — the `blockedCheck` idiom.
+   * Names the token as the guard spelled it.
+   */
+  unmatchedToken?: string;
 }
 
 /**
@@ -114,6 +121,59 @@ const globPathToRegExp = (token: string): RegExp => {
 };
 
 /**
+ * Whether a trace-side pattern token satisfies a concrete call
+ * token (FR-069, design D1/D2): the pattern must be path-scoped
+ * (at least one `/` — a bare filename glob like `*.md` must not
+ * dissolve the filename-level check, the mirror of the
+ * cross-segment `**` rejection), and its compiled pattern must
+ * match the token's full lowercased path or a slash-boundary
+ * suffix of it, bridging absolute tool arguments against relative
+ * reasoning spellings.
+ */
+const patternCoversToken = (pattern: string, loweredToken: string): boolean => {
+  if (!pattern.includes('/')) {
+    return false;
+  }
+  const patternRegExp = globPathToRegExp(pattern);
+  if (patternRegExp.test(loweredToken)) {
+    return true;
+  }
+  for (let index = loweredToken.indexOf('/'); index !== -1; index = loweredToken.indexOf('/', index + 1)) {
+    const suffix = loweredToken.slice(index + 1);
+    if (suffix !== '' && patternRegExp.test(suffix)) {
+      return true;
+    }
+  }
+  return false;
+};
+
+/**
+ * Whether a token is covered by candidate tokens from in-flight
+ * audit step text (FR-070, design D3/D4): exact case-insensitive
+ * equality (a verbatim spelling, concrete or pattern), a candidate
+ * the token's compiled pattern matches when the token is itself a
+ * pattern (the FR-066 direction), or a path-scoped candidate
+ * pattern covering a concrete token (the FR-069 direction). The
+ * hook layer uses this to relieve covered waits without
+ * prose-matching block reasons.
+ *
+ * @param token The unmatched call token as the guard named it.
+ * @param candidateTokens Path tokens of an in-flight audit's step text.
+ */
+export function isTokenCovered(token: string, candidateTokens: readonly string[]): boolean {
+  const lowered = token.toLowerCase();
+  const loweredCandidates = candidateTokens.map((candidate) => candidate.toLowerCase());
+  if (loweredCandidates.includes(lowered)) {
+    return true;
+  }
+  if (isPatternToken(lowered)) {
+    const pattern = globPathToRegExp(lowered);
+    return loweredCandidates.some((candidate) => pattern.test(candidate));
+  }
+  return loweredCandidates.some((candidate) => isPatternToken(candidate) && patternCoversToken(candidate, lowered));
+}
+
+/**
  * Finds the first operational file path in the tool arguments that is
  * absent from the verified trace (FR-010, FR-064, FR-066). The lens
  * (design D6) matches the round-4 protected-state idiom: for tools
@@ -123,7 +183,8 @@ const globPathToRegExp = (token: string): RegExp => {
  * unknown and custom names like `target`, stays scanned (coverage
  * fails closed); bash command strings remain operational in full.
  * A concrete token counts as referenced when the trace contains either
- * the full token or its basename, case-insensitively. A pattern token
+ * the full token or its basename, case-insensitively, or a path-scoped
+ * trace pattern that covers it (FR-069). A pattern token
  * (glob metacharacters or `$var` spans — its runtime expansion is
  * unknown) counts as referenced when the trace contains the pattern
  * verbatim (the model reasoned in the same spelling) or names a path
@@ -169,10 +230,21 @@ function findUnreferencedPath(
       }
       return fileToken;
     }
-    const base = fileToken.split('/').pop()?.toLowerCase() || fileToken.toLowerCase();
-    if (!combinedSteps.includes(base) && !combinedSteps.includes(fileToken.toLowerCase())) {
-      return fileToken;
+    const lowered = fileToken.toLowerCase();
+    const base = lowered.split('/').pop() || lowered;
+    if (combinedSteps.includes(base) || combinedSteps.includes(lowered)) {
+      continue;
     }
+    // FR-069 (design D1/D2): a path-scoped trace pattern covers the
+    // concrete token — glob-form reasoning satisfies the writes it
+    // describes.
+    traceTokens ??= verifiedSteps
+      .flatMap((step) => extractPathTokens(step))
+      .map((token) => token.toLowerCase());
+    if (traceTokens.some((token) => isPatternToken(token) && patternCoversToken(token, lowered))) {
+      continue;
+    }
+    return fileToken;
   }
   return null;
 }
@@ -267,13 +339,17 @@ export function verifyToolIntent(
       // A pattern token names itself — never a phantom expansion like
       // `id.md` — and points at the corrective action: reason about the
       // files it expands to, or name them concretely.
+      // FR-070 (design D6): the reason names both accepted
+      // corrective forms and the settle-then-retry instruction —
+      // honest in both audit states, so the guard stays pure.
       const reason = isPatternToken(unmatchedPath)
-        ? `Tool '${toolCall.name}' blocked by the file-path trace check: pattern '${unmatchedPath}' is not satisfied by the verified reasoning trace. Reason about the files the pattern expands to, or name them concretely, in verified steps, then retry.`
-        : `Tool '${toolCall.name}' blocked by the file-path trace check: '${unmatchedPath}' is absent from the verified reasoning trace (no full-path or basename match). Reason about the file in verified steps, then retry.`;
+        ? `Tool '${toolCall.name}' blocked by the file-path trace check: pattern '${unmatchedPath}' is not satisfied by the verified reasoning trace. Reason about the files the pattern expands to, or name them concretely, in verified steps, then retry once the audit settles.`
+        : `Tool '${toolCall.name}' blocked by the file-path trace check: '${unmatchedPath}' is absent from the verified reasoning trace (no full-path, basename, or covering pattern match). Name the file in verified steps — explicitly (full path or basename) or with a path-scoped pattern like 'dir/*.md' — then retry once the audit settles rather than immediately in the same turn.`;
       return {
         allowed: false,
         reason,
         blockedCheck: 'trace',
+        unmatchedToken: unmatchedPath,
       };
     }
   }
