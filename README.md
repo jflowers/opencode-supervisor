@@ -593,7 +593,9 @@ cp skills/reasoning-auditor/skill.md ~/.config/opencode/skills/reasoning-auditor
   timed-out waits per session, past which the call blocks naming
   the still-unsettled audit. Waits whose blocked path an in-flight
   audit's step text names fail open against
-  `maxCoveredTimeoutFailOpens` (default 6) instead (FR-070). An
+  `maxCoveredTimeoutFailOpens` (default 6) instead (FR-070). Both
+  budgets are per-session and charged independently, so the
+  combined worst case is their sum (9 by default). An
   empty trace never blocks. Directive
   globs are root-anchored and case-insensitive;
   `**/`-prefixed globs cover deeper spellings.

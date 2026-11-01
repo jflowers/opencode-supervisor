@@ -111,9 +111,32 @@ const CONTENT_ARG_KEYS = ['content', 'oldString', 'newString'];
  * segments join on literal slashes. Cross-segment `**` for variables
  * was rejected (any `.md` mention would satisfy any `$var/*.md`
  * call, dissolving the filename-level check).
+ *
+ * Complexity bounds (review hardening, learning
+ * security-20261031T210504): pattern tokens are agent-authored and
+ * untrusted, so the shared compiler rejects over-long or
+ * wildcard-heavy tokens instead of compiling them — an adversarial
+ * star-chain could otherwise drive catastrophic backtracking
+ * synchronously on the event loop. Returning null fails closed at
+ * every call site: a rejected pattern covers nothing.
  */
-const globPathToRegExp = (token: string): RegExp => {
+const MAX_GLOB_PATTERN_LENGTH = 512;
+const MAX_GLOB_PATTERN_WILDCARDS = 32;
+
+const globPathToRegExp = (token: string): RegExp | null => {
   const devaried = token.replace(/\$[a-zA-Z0-9_]+/g, '*');
+  if (devaried.length > MAX_GLOB_PATTERN_LENGTH) {
+    return null;
+  }
+  let wildcards = 0;
+  for (const char of devaried) {
+    if (char === '*' || char === '?' || char === '[') {
+      wildcards += 1;
+      if (wildcards > MAX_GLOB_PATTERN_WILDCARDS) {
+        return null;
+      }
+    }
+  }
   const segments = devaried
     .split('/')
     .map((segment) => globSegmentToRegExp(segment).source.replace(/^\^/, '').replace(/\$$/, ''));
@@ -135,6 +158,9 @@ const patternCoversToken = (pattern: string, loweredToken: string): boolean => {
     return false;
   }
   const patternRegExp = globPathToRegExp(pattern);
+  if (patternRegExp === null) {
+    return false;
+  }
   if (patternRegExp.test(loweredToken)) {
     return true;
   }
@@ -150,12 +176,14 @@ const patternCoversToken = (pattern: string, loweredToken: string): boolean => {
 /**
  * Whether a token is covered by candidate tokens from in-flight
  * audit step text (FR-070, design D3/D4): exact case-insensitive
- * equality (a verbatim spelling, concrete or pattern), a candidate
- * the token's compiled pattern matches when the token is itself a
- * pattern (the FR-066 direction), or a path-scoped candidate
- * pattern covering a concrete token (the FR-069 direction). The
- * hook layer uses this to relieve covered waits without
- * prose-matching block reasons.
+ * equality (a verbatim spelling, concrete or pattern), basename
+ * equality in either direction (the guard's own basename
+ * satisfaction — a step naming just `notes.md` covers a call on
+ * `kb/topics/notes.md`), a candidate the token's compiled pattern
+ * matches when the token is itself a pattern (the FR-066
+ * direction), or a path-scoped candidate pattern covering a
+ * concrete token (the FR-069 direction). The hook layer uses this
+ * to relieve covered waits without prose-matching block reasons.
  *
  * @param token The unmatched call token as the guard named it.
  * @param candidateTokens Path tokens of an in-flight audit's step text.
@@ -166,9 +194,17 @@ export function isTokenCovered(token: string, candidateTokens: readonly string[]
   if (loweredCandidates.includes(lowered)) {
     return true;
   }
+  // Basename equality (either direction) mirrors the guard's own
+  // basename satisfaction: trace text naming `kb/topics/notes.md`
+  // passes a call blocked on `notes.md`, so the pending audit's
+  // step tokens must cover the same way.
+  const base = lowered.split('/').pop() || lowered;
+  if (loweredCandidates.some((candidate) => candidate.split('/').pop() === base)) {
+    return true;
+  }
   if (isPatternToken(lowered)) {
     const pattern = globPathToRegExp(lowered);
-    return loweredCandidates.some((candidate) => pattern.test(candidate));
+    return pattern !== null && loweredCandidates.some((candidate) => pattern.test(candidate));
   }
   return loweredCandidates.some((candidate) => isPatternToken(candidate) && patternCoversToken(candidate, lowered));
 }
@@ -225,9 +261,11 @@ function findUnreferencedPath(
         .flatMap((step) => extractPathTokens(step))
         .map((token) => token.toLowerCase());
       const pattern = globPathToRegExp(lowered);
-      if (traceTokens.some((token) => pattern.test(token))) {
+      if (pattern !== null && traceTokens.some((token) => pattern.test(token))) {
         continue;
       }
+      // A rejected pattern (complexity bounds) blocks naming itself:
+      // fail closed, exactly as an unmatched pattern does.
       return fileToken;
     }
     const lowered = fileToken.toLowerCase();

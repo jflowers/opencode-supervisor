@@ -1953,7 +1953,12 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         const continuation = (async () => {
           const config = await buildConfig();
           const [stepText] = stripNarrative([part.text], config.stripMode);
-          stepTokens.push(...(stepText ? extractPathTokens(stepText) : []));
+          // A bounded loop, never spread-into-push: an adversarial
+          // step could otherwise exceed the argument-count limit
+          // (review iteration 2).
+          for (const token of stepText ? extractPathTokens(stepText) : []) {
+            stepTokens.push(token);
+          }
           // Nothing formal survives stripping: no audit, no model call,
           // nothing recorded (runPeerAudit would no-op; skip even that).
           if (stepText === undefined || stepText === '') {
@@ -2167,20 +2172,25 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
             verification = runGuard();
             // FR-070 (design D5): the correction was reasoned and
             // audited but did not record — say so instead of blaming
-            // absent reasoning.
+            // absent reasoning. Attribution follows the re-run
+            // verdict's own token (review iteration 2): it names
+            // what is blocked NOW, where the pre-wait token names
+            // what was blocked before the wait.
+            const freshUnmatched = verification.unmatchedToken ?? unmatched;
             if (
               !verification.allowed &&
               verification.blockedCheck === 'trace' &&
-              unmatched !== undefined
+              freshUnmatched !== undefined
             ) {
               const evicted = [...before.keys()]
                 .filter((promise) => !state.pendingAudits.has(promise))
-                .some((promise) => isTokenCovered(unmatched, before.get(promise) ?? []));
+                .some((promise) => isTokenCovered(freshUnmatched, before.get(promise) ?? []));
               if (evicted) {
                 verification = {
                   allowed: false,
-                  reason: `Tool '${hookInput.tool}' blocked by the file-path trace check: recent reasoning named '${unmatched}' but its audit did not pass, so it is not in the verified trace. Restate the step factually so it survives audit, then retry once that audit settles.`,
+                  reason: `Tool '${hookInput.tool}' blocked by the file-path trace check: recent reasoning named '${freshUnmatched}' but its audit did not pass, so it is not in the verified trace. Restate the step factually so it survives audit, then retry once that audit settles.`,
                   blockedCheck: 'trace',
+                  unmatchedToken: freshUnmatched
                 };
               }
             }
@@ -2200,6 +2210,7 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
                   allowed: false,
                   reason: `Tool '${hookInput.tool}' blocked by the file-path trace check: an earlier reasoning audit is still unsettled after ${traceAwaitState.timeoutMs} ms and the session's covered timeout fail-open cap (${guardConfig.maxCoveredTimeoutFailOpens}) is reached. Wait for the audit to settle, then retry.`,
                   blockedCheck: 'trace',
+                  unmatchedToken: unmatched
                 };
               } else {
                 logger.warn(
@@ -2217,6 +2228,7 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
                   allowed: false,
                   reason: `Tool '${hookInput.tool}' blocked by the file-path trace check: an earlier reasoning audit is still unsettled after ${traceAwaitState.timeoutMs} ms and the session's timeout fail-open cap (${guardConfig.maxTimeoutFailOpens}) is reached. Wait for the audit to settle, then retry.`,
                   blockedCheck: 'trace',
+                  unmatchedToken: unmatched
                 };
               } else {
                 logger.warn(

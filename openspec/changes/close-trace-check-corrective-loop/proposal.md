@@ -55,9 +55,9 @@ file-path trace check. Two structural causes, both guard-side:
 ## Impact
 
 - Code: `src/tool-guard.ts` (FR-069 and reason text), `index.ts`
-  (pendingAudits Map, hoisted strip, covered fail-open, eviction
-  detection, knob resolution), `src/config-file.ts` (new numeric
-  knob).
+  (pendingAudits Map with step-token boxes, covered fail-open,
+  eviction detection, knob resolution), `src/config-file.ts` (new
+  numeric knob).
 - Docs: README trace-check sections and knob table, CHANGELOG,
   AGENTS.md architecture bullets.
 - Tests: guard cases for pattern satisfaction; hook-layer cases

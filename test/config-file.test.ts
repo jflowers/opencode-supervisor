@@ -222,6 +222,15 @@ test('resolveHookConfig tiers the auditor model project → options → global �
     // project tier is absent, and with neither set the pluginConfig
     // default (6) holds.
     assert.equal(tiered.maxCoveredTimeoutFailOpens, 9);
+    // The options tier applies when no file tier set the knob
+    // (review iteration 2): the full chain, not just files+default.
+    assert.equal(
+      resolveHookConfig(
+        undefined,
+        { ...sources, project: undefined, global: undefined, options: { maxCoveredTimeoutFailOpens: 4 } as SupervisorFileConfig }
+      ).maxCoveredTimeoutFailOpens,
+      4
+    );
     assert.equal(
       resolveHookConfig(undefined, { ...sources, project: undefined, global: { maxCoveredTimeoutFailOpens: 8 } as SupervisorFileConfig }).maxCoveredTimeoutFailOpens,
       8
