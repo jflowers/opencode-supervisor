@@ -3,6 +3,37 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.8.0] - 2026-11-01
+
+### Added
+
+- Trace-side pattern satisfaction (FR-069): a concrete file-path tool
+  argument now passes the trace check when the verified reasoning trace
+  carries a path-scoped pattern (at least one directory segment, e.g.
+  `kb/topics/*.md`) whose compiled glob matches the argument's full path
+  or a slash-boundary suffix of it, case-insensitively. Bulk workflows
+  that reason in globs before batched writes no longer block on every
+  concrete file. Bare filename globs (`*.md`) still cover nothing, and
+  explicit full-path/basename matching is unchanged.
+- Pending-audit-aware relief and reasons (FR-070): in-flight audits now
+  register with the path tokens of the stripped step they are auditing.
+  A trace block whose unmatched path is provably named by an in-flight
+  audit (a covered wait) fails open on timeout against a separate
+  per-session cap — `maxCoveredTimeoutFailOpens` (default 6, full
+  precedence chain) — blocking past the cap with the still-unsettled
+  audit named; uncovered timeouts keep charging `maxTimeoutFailOpens`.
+  Trace-check block reasons are now honest about audit state: the plain
+  reason names both corrective forms (explicit path/basename or a
+  path-scoped pattern) and directs a retry after the audit settles
+  rather than in the same turn, and a settled wait whose correction was
+  audited but evicted says so instead of blaming absent reasoning.
+
+### Changed
+
+- `pendingAudits` session state is a `Map` from each audit continuation
+  to the path tokens of the stripped step it audits (was a `Set` of
+  promises).
+
 ## [2.7.0] - 2026-10-31
 
 ### Added

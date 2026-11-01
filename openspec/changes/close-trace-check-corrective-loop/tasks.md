@@ -11,37 +11,37 @@
 
 ## 2. Trace-side pattern satisfaction (FR-069)
 
-- [ ] 2.1 `src/tool-guard.ts`: in `findUnreferencedPath`'s
+- [x] 2.1 `src/tool-guard.ts`: in `findUnreferencedPath`'s
   concrete branch, on full/basename miss test trace pattern
   tokens that are path-scoped (contain `/`) via
   `globPathToRegExp` against the lowered full token and its
   slash-boundary suffixes; reuse the lazy `traceTokens` array
-- [ ] 2.2 `src/tool-guard.ts`: plain block reason names both
+- [x] 2.2 `src/tool-guard.ts`: plain block reason names both
   corrective forms (explicit path/basename or path-scoped
   pattern) and the settle-then-retry instruction (FR-070 text)
-- [ ] 2.3 guard tests: path-scoped glob covers a concrete
+- [x] 2.3 guard tests: path-scoped glob covers a concrete
   write; bare `*.md` does not; absolute argument matches by
   suffix; case-insensitive; empty-trace allow unchanged;
   concrete full/basename matching unchanged
 
 ## 3. Pending-audit awareness (FR-070, FR-067)
 
-- [ ] 3.1 `index.ts`: `pendingAudits` becomes
+- [x] 3.1 `index.ts`: `pendingAudits` becomes
   `Map<Promise<unknown>, string[]>`; hoist `buildConfig` +
   `stripNarrative` above continuation registration so step
   tokens exist at registration; deregister in the finally as
   today
-- [ ] 3.2 `index.ts`: covered-wait branch — when the trace
+- [x] 3.2 `index.ts`: covered-wait branch — when the trace
   block's unmatched token is named by an in-flight audit's
   tokens, a timed-out wait fails open against
   `state.coveredTimeoutFailOpens` (new) up to
   `maxCoveredTimeoutFailOpens`, blocking past the cap with the
   audit named; uncovered waits unchanged; both paths logged
-- [ ] 3.3 `index.ts`: eviction detection — snapshot the map
+- [x] 3.3 `index.ts`: eviction detection — snapshot the map
   before the wait; after a settled wait that still blocks, a
   departed entry whose tokens covered the unmatched token
   yields the honest evicted-correction reason
-- [ ] 3.4 hook-layer tests: covered timeout fails open
+- [x] 3.4 hook-layer tests: covered timeout fails open
   uncharged; covered timeout past the cap blocks; uncovered
   timeout still charges `maxTimeoutFailOpens`; settled-evicted
   reason; migrate existing `pendingAudits` Set-API tests to the
@@ -49,19 +49,19 @@
 
 ## 4. Config knob (maxCoveredTimeoutFailOpens)
 
-- [ ] 4.1 `src/config-file.ts`: add the numeric key (project +
+- [x] 4.1 `src/config-file.ts`: add the numeric key (project +
   global tiers, non-negative integer validation)
-- [ ] 4.2 `index.ts`: `pluginConfig` default 6; resolution
+- [x] 4.2 `index.ts`: `pluginConfig` default 6; resolution
   through the full precedence chain next to
   `maxTimeoutFailOpens`
-- [ ] 4.3 `test/config-file.test.ts`: validation failures and
+- [x] 4.3 `test/config-file.test.ts`: validation failures and
   tier resolution for the new knob
 
 ## 5. Integration and release
 
-- [ ] 5.1 both runners green: `bun test` and
+- [x] 5.1 both runners green: `bun test` and
   `node --test test/*.test.ts`
-- [ ] 5.2 docs: README (trace-check sections, knob table),
+- [x] 5.2 docs: README (trace-check sections, knob table),
   CHANGELOG entry, AGENTS.md architecture bullets (FR-069,
   FR-070)
 - [ ] 5.3 `/uf.review-council`, documentation issue, PR

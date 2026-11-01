@@ -193,7 +193,13 @@ wildcard- or variable-bearing argument (`kb/topics/*.md`,
 it passes when the verified trace references a satisfying path or
 the pattern spelling itself, and otherwise blocks naming the
 pattern (never a phantom expansion like `id.md`); extension matches
-carry a trailing boundary, so `config.json` tokenizes whole. A
+carry a trailing boundary, so `config.json` tokenizes whole. The
+reverse direction holds too (FR-069): a concrete path passes when
+the trace carries a path-scoped pattern (`kb/topics/*.md` — at
+least one directory segment) whose compiled glob covers it, by
+full path or slash-boundary suffix, case-insensitively — so
+glob-form reasoning covers the batch of writes it describes,
+while a bare filename glob (`*.md`) covers nothing. A
 trace block never fires on a partial trace while the session's
 audit is still in flight: the guard waits for the audit
 continuation to settle — bounded at 10 seconds, one wait per call —
@@ -203,7 +209,13 @@ into the guard). On timeout the call fails open — the live agent's
 progress outranks one unverified call — up to `maxTimeoutFailOpens`
 per session (default 3, Section 7); past the cap a timed-out wait
 blocks naming the still-unsettled audit, so the model can wait and
-retry. Passing calls, the empty-trace allow, and reward-hacking or
+retry. When the blocked path is provably named by an in-flight
+audit's step text (a covered wait — the corrective reasoning is
+already under audit), timeout fail-opens charge a separate
+`maxCoveredTimeoutFailOpens` budget (default 6) instead, and a
+settled wait that still blocks while the correction was audited
+but evicted says so in the reason rather than blaming absent
+reasoning (FR-070). Passing calls, the empty-trace allow, and reward-hacking or
 directive blocks never charge the wait — their causes are not trace
 races. `approve` gates hold matching calls for engineer
 approval; `review` gates hold calls until a passed peer audit
@@ -485,6 +497,7 @@ when unset, the side-session prompt omits it.
 | `memoLimits.maxReports` | `OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS` | `5` | Cap on agent reports kept in state and shown in the memo (the most recent are kept). |
 | `maxOnDemandAudits` | `OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS` | `8` | Per-session cap on audits requested through the `request_audit` tool. The automatic audit loop is unaffected. |
 | `maxTimeoutFailOpens` | `OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS` | `3` | Per-session cap on trace-check waits that time out and fail open (the wait itself is bounded at 10 seconds). Past the cap a timed-out wait blocks naming the still-unsettled audit. |
+| `maxCoveredTimeoutFailOpens` | `OPENCODE_SUPERVISOR_MAX_COVERED_TIMEOUT_FAIL_OPENS` | `6` | Per-session cap on covered timeout fail-opens — waits whose blocked path an in-flight audit's step text names (the corrective reasoning is under audit). Past the cap a covered timed-out wait blocks naming the still-unsettled audit. |
 | `mode` | `OPENCODE_SUPERVISOR_MODE` | `full` | `full` runs everything; `repair-only` registers only the tool-arg repair pass (Section 4.5). |
 | `argRepair.enabled` | *(config file/options only)* | `true` | Master switch for the tool-arg repair pass. |
 | `argRepair.model` | `OPENCODE_SUPERVISOR_REPAIR_MODEL` | *(the resolved auditor model)* | Repair-model slug, `<provider>/<model-id>` (for example, `openrouter/deepseek/deepseek-v4-pro`). Inherits the auditor's derived host-model fallback. |
@@ -578,7 +591,10 @@ cp skills/reasoning-auditor/skill.md ~/.config/opencode/skills/reasoning-auditor
   an in-flight audit waits up to 10 seconds for the audit to
   settle, then fails open — up to `maxTimeoutFailOpens` (default 3)
   timed-out waits per session, past which the call blocks naming
-  the still-unsettled audit. An empty trace never blocks. Directive
+  the still-unsettled audit. Waits whose blocked path an in-flight
+  audit's step text names fail open against
+  `maxCoveredTimeoutFailOpens` (default 6) instead (FR-070). An
+  empty trace never blocks. Directive
   globs are root-anchored and case-insensitive;
   `**/`-prefixed globs cover deeper spellings.
 - Path-bearing survival (Section 7.1) is mode-scoped and

@@ -26,6 +26,7 @@ test('validateSupervisorConfig accepts a full valid config', () => {
     memoLimits: { maxSolvedItems: 10, maxCritiques: 4, maxReminders: 6, maxReports: 3 },
     maxOnDemandAudits: 5,
     maxTimeoutFailOpens: 5,
+    maxCoveredTimeoutFailOpens: 7,
   });
   assert.equal(parsed.error, null);
   assert.equal(parsed.config.auditorModel, 'enmaas/rits/deepseek-ai/DeepSeek-V4.1-Flash-1017');
@@ -37,6 +38,7 @@ test('validateSupervisorConfig accepts a full valid config', () => {
   assert.deepEqual(parsed.config.memoLimits, { maxSolvedItems: 10, maxCritiques: 4, maxReminders: 6, maxReports: 3 });
   assert.equal(parsed.config.maxOnDemandAudits, 5);
   assert.equal(parsed.config.maxTimeoutFailOpens, 5);
+  assert.equal(parsed.config.maxCoveredTimeoutFailOpens, 7);
 });
 
 test('validateSupervisorConfig accepts any subset and ignores unknown keys', () => {
@@ -70,6 +72,8 @@ test('validateSupervisorConfig rejects wrong-typed known keys wholesale', () => 
     [{ maxOnDemandAudits: Number.POSITIVE_INFINITY }, /"maxOnDemandAudits" must be a non-negative integer/],
     [{ maxTimeoutFailOpens: Number.NaN }, /"maxTimeoutFailOpens" must be a non-negative integer/],
     [{ maxTimeoutFailOpens: Number.POSITIVE_INFINITY }, /"maxTimeoutFailOpens" must be a non-negative integer/],
+    [{ maxCoveredTimeoutFailOpens: Number.NaN }, /"maxCoveredTimeoutFailOpens" must be a non-negative integer/],
+    [{ maxCoveredTimeoutFailOpens: Number.POSITIVE_INFINITY }, /"maxCoveredTimeoutFailOpens" must be a non-negative integer/],
     [{ blockRewardHacking: 'yes' }, /"blockRewardHacking" must be a boolean/],
     [{ requireStepReferenceInTools: 1 }, /"requireStepReferenceInTools" must be a boolean/],
     [{ memoLimits: [] }, /"memoLimits" must be an object/],
@@ -120,6 +124,7 @@ const CONFIG_ENV_NAMES = [
   'OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS',
   'OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS',
   'OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS',
+  'OPENCODE_SUPERVISOR_MAX_COVERED_TIMEOUT_FAIL_OPENS',
 ];
 
 /** Cleans every supervisor env knob and log-identity flag, isolating XDG_CONFIG_HOME, around one tier test. */
@@ -168,6 +173,7 @@ test('resolveHookConfig tiers the auditor model project → options → global �
       maxRegenerations: 5,
       memoLimits: { maxReminders: 3 },
       maxTimeoutFailOpens: 6,
+      maxCoveredTimeoutFailOpens: 9,
     };
     const sources = {
       project: all,
@@ -211,6 +217,16 @@ test('resolveHookConfig tiers the auditor model project → options → global �
       7
     );
     assert.equal(resolveHookConfig(undefined, { ...sources, project: undefined, options: undefined, global: undefined }).maxTimeoutFailOpens, 3);
+    // FR-070's covered cap is a full per-knob tier citizen too: the
+    // project file's value wins, the global file applies when the
+    // project tier is absent, and with neither set the pluginConfig
+    // default (6) holds.
+    assert.equal(tiered.maxCoveredTimeoutFailOpens, 9);
+    assert.equal(
+      resolveHookConfig(undefined, { ...sources, project: undefined, global: { maxCoveredTimeoutFailOpens: 8 } as SupervisorFileConfig }).maxCoveredTimeoutFailOpens,
+      8
+    );
+    assert.equal(resolveHookConfig(undefined, { ...sources, project: undefined, options: undefined, global: undefined }).maxCoveredTimeoutFailOpens, 6);
   });
 });
 
@@ -219,12 +235,14 @@ test('resolveHookConfig keeps the environment above the file tiers', async () =>
     process.env.OPENCODE_SUPERVISOR_MODEL = 'env/model';
     process.env.OPENCODE_SUPERVISOR_MAX_REGENERATIONS = '9';
     process.env.OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS = '7';
+    process.env.OPENCODE_SUPERVISOR_MAX_COVERED_TIMEOUT_FAIL_OPENS = '11';
     const config = resolveHookConfig(undefined, {
-      project: { auditorModel: 'project/model', maxRegenerations: 5, maxTimeoutFailOpens: 5 },
+      project: { auditorModel: 'project/model', maxRegenerations: 5, maxTimeoutFailOpens: 5, maxCoveredTimeoutFailOpens: 5 },
     });
     assert.equal(config.auditorModel, 'env/model');
     assert.equal(config.maxRegenerations, 9);
     assert.equal(config.maxTimeoutFailOpens, 7);
+    assert.equal(config.maxCoveredTimeoutFailOpens, 11);
   });
 });
 
