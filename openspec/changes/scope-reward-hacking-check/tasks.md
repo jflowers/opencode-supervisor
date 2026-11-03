@@ -25,4 +25,4 @@
   `node --test test/*.test.ts`
 - [x] 3.2 docs: README (knob table, tool-guard section),
   CHANGELOG entry, AGENTS.md architecture note
-- [ ] 3.3 `/uf.review-council`, docs issue, PR
+- [ ] 3.3 `/uf.review-council` (docs #50; draft PR #49)
