@@ -1,0 +1,10 @@
+schema: spec-driven
+created: 2026-11-03
+originating_issue: 46
+goal: Scope the reward-hacking check to execution surfaces so authored prose and read-only queries that mention a marker are not blocked
+affected_areas:
+  - src/tool-guard.ts
+  - test/audit.test.ts
+  - README.md
+  - CHANGELOG.md
+  - AGENTS.md
