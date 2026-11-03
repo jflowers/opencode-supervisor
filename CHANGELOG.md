@@ -3,6 +3,25 @@
 All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- Reward-hacking check scope (FR-071, #46): the markers (`--no-verify`,
+  `.skip(`, `expect(true).toBe(true)`, `rm -rf tests`) are now looked
+  for on execution surfaces only, so a mention is no longer a use.
+  Bash stays scanned in full. Read-only builtins (`read`, `glob`,
+  `grep`, `webfetch`, `websearch`) are not scanned. Other tools keep
+  every non-content key scanned (custom and MCP key names fail
+  closed), never scan `oldString` (removing a skip is no longer
+  blocked), and scan `content` / `newString` unless the call has no
+  file target or every target is a prose document (`.md`, `.mdx`,
+  `.markdown`, `.txt`, `.rst`, `.adoc`). Writing about `--no-verify`
+  in a note or Markdown page passes; writing it into a script, test,
+  hook, workflow, or other non-prose file still blocks.
+  Knowledge-curation sessions no longer need
+  `blockRewardHacking: false`.
+
 ## [2.8.0] - 2026-11-01
 
 ### Added

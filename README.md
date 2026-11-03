@@ -224,7 +224,18 @@ blocks, and the plugin's own console tools are exempt from the
 trace check — derived from the registered tool map, so
 `request_audit` stays reachable and a future console tool is
 covered automatically; the reward-hacking check still applies to
-them. After each tool completes, a solved item (tool name +
+them. The reward-hacking check looks for its markers on execution
+surfaces only (FR-071), so a mention is not a use: bash is scanned
+in full; the read-only builtins (`read`, `glob`, `grep`, `webfetch`,
+`websearch`) are not scanned; every other tool keeps every
+non-content key scanned (custom and MCP names fail closed), never
+scans `oldString` (removing a `.skip(` is the fix), and scans
+`content` / `newString` unless the call has no file target or every
+target is a prose document (`.md`, `.mdx`, `.markdown`, `.txt`,
+`.rst`, `.adoc`). Writing `--no-verify` into a note or a Markdown
+page passes; writing it into a script, test, hook, or workflow
+still blocks, and so does a bash `grep` for it — use the `grep`
+tool. After each tool completes, a solved item (tool name +
 short outcome) joins a bounded log.
 
 ### 4.3 The Supervisor Memo
@@ -489,7 +500,7 @@ when unset, the side-session prompt omits it.
 | `auditorVariant` | `OPENCODE_SUPERVISOR_VARIANT` | *(unset — omitted)* | The reasoning effort passed to the auditor model. Allowed values: `minimal`, `low`, `medium`, `high`, `default`. Omitted from the side-session prompt when unset. |
 | `maxRegenerations` | `OPENCODE_SUPERVISOR_MAX_REGENERATIONS` | `2` | The maximum number of interventions per session — delivered critiques and severe interrupts share this bound. Past the bound, critiques (severe included) are recorded without delivery or interrupt. |
 | `stripMode` | `OPENCODE_SUPERVISOR_STRIP_MODE` | `code_and_math` | Controls how `stripNarrative()` filters the Chain-of-Thought before the audit. See Section 7.1 below. |
-| `blockRewardHacking` | `OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING` | `true` | When `true`, the tool guard blocks tool calls that contain `--no-verify`, `.skip(`, `expect(true).toBe(true)`, or test deletion commands. |
+| `blockRewardHacking` | `OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING` | `true` | When `true`, the tool guard blocks tool calls that contain `--no-verify`, `.skip(`, `expect(true).toBe(true)`, or test deletion commands on an execution surface (FR-071, Section 4.2): prose documents, target-less content payloads, `oldString`, and read-only builtin queries are not scanned, so the knob can stay on for knowledge-curation work. |
 | `requireStepReferenceInTools` | `OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS` | `true` | When `true`, the tool guard blocks tool calls whose file-path arguments do not appear in the verified reasoning trace. Never blocks when the trace is empty. |
 | `memoLimits.maxSolvedItems` | `OPENCODE_SUPERVISOR_MEMO_MAX_SOLVED_ITEMS` | `5` | Cap on solved items shown in the memo. Storage retains more (50) for `recall`; this knob bounds the rendered view. |
 | `memoLimits.maxCritiques` | `OPENCODE_SUPERVISOR_MEMO_MAX_CRITIQUES` | `3` | Cap on critiques shown in the memo. Storage retains more (30) for `recall`; this knob bounds the rendered view. |
