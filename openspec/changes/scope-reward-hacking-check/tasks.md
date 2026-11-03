@@ -10,19 +10,19 @@
 
 ## 2. Scan surfaces (FR-071)
 
-- [ ] 2.1 `src/tool-guard.ts`: pure `rewardHackingScanArgs`
+- [x] 2.1 `src/tool-guard.ts`: pure `rewardHackingScanArgs`
   (read-only builtins → null; bash → full args; others →
   non-content keys, plus `content`/`newString` unless
   target-less or all-prose; never `oldString`)
-- [ ] 2.2 `src/tool-guard.ts`: `verifyToolIntent` feeds the
+- [x] 2.2 `src/tool-guard.ts`: `verifyToolIntent` feeds the
   helper's serialization to `matchRewardHackingMarker`
-- [ ] 2.3 guard tests: every FR-071 scenario, plus the
+- [x] 2.3 guard tests: every FR-071 scenario, plus the
   existing FR-009 cases unchanged
 
 ## 3. Integration and release
 
-- [ ] 3.1 both runners green: `bun test` and
+- [x] 3.1 both runners green: `bun test` and
   `node --test test/*.test.ts`
-- [ ] 3.2 docs: README (knob table, tool-guard section),
+- [x] 3.2 docs: README (knob table, tool-guard section),
   CHANGELOG entry, AGENTS.md architecture note
 - [ ] 3.3 `/uf.review-council`, docs issue, PR

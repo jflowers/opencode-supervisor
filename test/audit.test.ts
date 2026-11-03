@@ -14,7 +14,7 @@ import {
   type AuditConfig,
   type InvokeModel,
 } from '../src/auditor.ts';
-import { createGlobBudget, extractArgPaths, globPathMatches, isGlobPatternRejected, isTokenCovered, verifyToolIntent } from '../src/tool-guard.ts';
+import { createGlobBudget, extractArgPaths, globPathMatches, isGlobPatternRejected, isTokenCovered, rewardHackingScanArgs, verifyToolIntent } from '../src/tool-guard.ts';
 import { extractPathTokens, hasPathToken, isPatternToken } from '../src/path-tokens.ts';
 import { DEFAULT_MEMO_LIMITS } from '../src/memo.ts';
 import { silentPluginLogger } from '../src/plugin-log.ts';
@@ -384,6 +384,110 @@ test('verifyToolIntent blocks reward-hacking patterns and names the failed check
     baseAuditConfig
   );
   assert.equal(emptyTrace.allowed, false);
+});
+
+test('verifyToolIntent lets prose that quotes a marker through (FR-071)', () => {
+  const prose = verifyToolIntent(
+    {
+      name: 'write',
+      arguments: { filePath: 'kb/topics/git-commit.md', content: 'Never commit with `--no-verify`; never add `.skip(`.' },
+    },
+    [],
+    baseAuditConfig
+  );
+  assert.equal(prose.allowed, true);
+
+  const proseEdit = verifyToolIntent(
+    { name: 'edit', arguments: { filePath: 'docs/TESTING.MDX', oldString: 'x', newString: 'avoid expect(true).toBe(true)' } },
+    [],
+    baseAuditConfig
+  );
+  assert.equal(proseEdit.allowed, true);
+});
+
+test('verifyToolIntent still blocks markers written to code, tests, and scripts (FR-071)', () => {
+  const testSkip = verifyToolIntent(
+    { name: 'edit', arguments: { filePath: 'test/audit.test.ts', oldString: "it('flaky'", newString: "it.skip('flaky'" } },
+    [],
+    baseAuditConfig
+  );
+  assert.equal(testSkip.allowed, false);
+  assert.equal(testSkip.blockedCheck, 'reward-hacking');
+
+  const script = verifyToolIntent(
+    { name: 'write', arguments: { filePath: 'scripts/commit.sh', content: 'git commit -m wip --no-verify' } },
+    [],
+    baseAuditConfig
+  );
+  assert.equal(script.allowed, false);
+  assert.ok(script.reason.includes('--no-verify'));
+
+  // Path-named keys are read whole: an extensionless target is not prose.
+  const hook = verifyToolIntent(
+    { name: 'write', arguments: { filePath: '.husky/pre-commit', content: 'git commit --no-verify' } },
+    [],
+    baseAuditConfig
+  );
+  assert.equal(hook.allowed, false);
+
+  // A prose target alongside a non-prose one does not exempt the payload.
+  const mixed = verifyToolIntent(
+    { name: 'custom_write', arguments: { path: 'notes.md', mirror: 'src/a.ts', content: 'expect(true).toBe(true);' } },
+    [],
+    baseAuditConfig
+  );
+  assert.equal(mixed.allowed, false);
+});
+
+test('verifyToolIntent does not scan oldString, so removing a skip is allowed (FR-071)', () => {
+  const result = verifyToolIntent(
+    { name: 'edit', arguments: { filePath: 'test/audit.test.ts', oldString: "it.skip('flaky'", newString: "it('flaky'" } },
+    [],
+    baseAuditConfig
+  );
+  assert.equal(result.allowed, true);
+});
+
+test('verifyToolIntent does not scan read-only builtin queries (FR-071)', () => {
+  for (const name of ['read', 'glob', 'grep', 'webfetch', 'websearch']) {
+    const result = verifyToolIntent({ name, arguments: { pattern: '\\.skip\\(|--no-verify' } }, [], baseAuditConfig);
+    assert.equal(result.allowed, true, name);
+  }
+
+  // Bash stays scanned in full, including a grep for the marker.
+  const bashGrep = verifyToolIntent(
+    { name: 'bash', arguments: { command: 'grep -rn -- "--no-verify" kb/' } },
+    [],
+    baseAuditConfig
+  );
+  assert.equal(bashGrep.allowed, false);
+});
+
+test('verifyToolIntent keeps custom keys covered and treats target-less content as data (FR-071)', () => {
+  const customFlag = verifyToolIntent(
+    { name: 'git_commit', arguments: { message: 'wip', flags: '--no-verify' } },
+    [],
+    baseAuditConfig
+  );
+  assert.equal(customFlag.allowed, false);
+
+  const note = verifyToolIntent(
+    { name: 'note_save', arguments: { type: 'finding', title: 'Test discipline', content: 'expect(true).toBe(true) is a tautology' } },
+    [],
+    baseAuditConfig
+  );
+  assert.equal(note.allowed, true);
+});
+
+test('rewardHackingScanArgs selects the FR-071 scan surface', () => {
+  assert.equal(rewardHackingScanArgs('grep', { pattern: '.skip(' }), null);
+  assert.deepEqual(rewardHackingScanArgs('bash', { command: 'ls', description: 'list' }), { command: 'ls', description: 'list' });
+  assert.deepEqual(rewardHackingScanArgs('write', { filePath: 'README.md', content: 'quoted' }), { filePath: 'README.md' });
+  assert.deepEqual(
+    rewardHackingScanArgs('edit', { filePath: 'src/a.ts', oldString: 'old', newString: 'new' }),
+    { filePath: 'src/a.ts', newString: 'new' }
+  );
+  assert.deepEqual(rewardHackingScanArgs('note_save', undefined), {});
 });
 
 test('verifyToolIntent counts a basename match as referenced', () => {

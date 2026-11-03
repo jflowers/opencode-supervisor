@@ -4,7 +4,8 @@
  * tool calls whose arguments contradict or are absent from the
  * verified reasoning trace. The trace check is best-effort (design
  * D5): when the verified trace is empty it MUST NOT block (FR-011)
- * — only the reward-hacking patterns still apply (FR-009).
+ * — only the reward-hacking patterns still apply (FR-009), looked
+ * for on execution surfaces only (FR-071).
  * Directive enforcement (FR-028) applies whenever compiled engineer
  * rules exist and never blocks when the rule set is empty. Block
  * reasons are actionable (FR-012): they name the failed check and,
@@ -51,8 +52,9 @@ export interface ToolVerificationResult {
  * Reward-hacking marker set (FR-009): `--no-verify`, skipped-test markers,
  * tautological assertions, and test-directory deletion. Mirrors the marker
  * set in auditor.ts's deterministic invariants. `rawArgs` is the
- * JSON-serialized tool arguments and `lowerArgs` its lowercased form; the
- * rm -rf regex carries its own case-insensitive flag against rawArgs.
+ * JSON-serialized scan surface (FR-071, `rewardHackingScanArgs`) and
+ * `lowerArgs` its lowercased form; the rm -rf regex carries its own
+ * case-insensitive flag against rawArgs.
  *
  * @returns The matched marker so the block reason can name it (FR-012), or null when the arguments are clean.
  */
@@ -109,6 +111,69 @@ export function extractArgPaths(args: Record<string, unknown> | undefined): stri
  * class, accepted.
  */
 const CONTENT_ARG_KEYS = ['content', 'oldString', 'newString'];
+
+/**
+ * Builtin tools that cannot act on the workspace (FR-071, design
+ * D1): a marker in a read or search query is never a hack. Exact
+ * names only — MCP and plugin tools are never assumed read-only.
+ */
+const READ_ONLY_TOOLS = ['read', 'glob', 'grep', 'webfetch', 'websearch'];
+
+/**
+ * Argument keys whose whole string value names a file target
+ * (FR-071, design D3). Read whole, not through a path grammar, so
+ * extensionless targets (`Makefile`, `.husky/pre-commit`) count as
+ * targets — and as non-prose.
+ */
+const TARGET_ARG_KEYS = ['filePath', 'path', 'file', 'filename', 'target'];
+
+/** Prose-document extensions (FR-071, design D3), matched case-insensitively. */
+const PROSE_EXTENSIONS = ['.md', '.mdx', '.markdown', '.txt', '.rst', '.adoc'];
+
+/**
+ * Selects the argument values the reward-hacking check scans
+ * (FR-071, design D1-D3): only surfaces that can act on the
+ * workspace. Bash is scanned in full. Read-only builtins are not
+ * scanned. Every other tool keeps every non-content key (fail
+ * closed for custom and MCP key names, the FR-064 stance); never
+ * `oldString` — removing a marker is the fix; and `content` /
+ * `newString` unless the call has no file target or every target
+ * is a prose document, where a marker is a mention, not a use.
+ *
+ * @param toolName The tool about to execute.
+ * @param args The tool-call arguments.
+ * @returns The object to serialize and scan, or null when the tool is not scanned.
+ */
+export function rewardHackingScanArgs(
+  toolName: string,
+  args: Record<string, unknown> | undefined
+): Record<string, unknown> | null {
+  if (READ_ONLY_TOOLS.includes(toolName)) {
+    return null;
+  }
+  const allArgs = args ?? {};
+  if (toolName === 'bash') {
+    return allArgs;
+  }
+  const operational = Object.fromEntries(Object.entries(allArgs).filter(([key]) => !CONTENT_ARG_KEYS.includes(key)));
+  const targets = [
+    ...TARGET_ARG_KEYS.map((key) => operational[key]).filter(
+      (value): value is string => typeof value === 'string' && value.trim() !== ''
+    ),
+    ...extractPolicyPaths(Object.fromEntries(Object.entries(operational).filter(([key]) => !TARGET_ARG_KEYS.includes(key)))),
+  ];
+  const proseOnly = targets.every((target) => {
+    const lowered = target.trim().toLowerCase();
+    return PROSE_EXTENSIONS.some((extension) => lowered.endsWith(extension));
+  });
+  if (proseOnly) {
+    return operational;
+  }
+  const written = Object.fromEntries(
+    Object.entries(allArgs).filter(([key]) => key === 'content' || key === 'newString')
+  );
+  return { ...operational, ...written };
+}
 
 /**
  * Total, bounded glob matching for agent-authored path tokens
@@ -593,7 +658,7 @@ function findUnreferencedPath(
 /**
  * Verifies a tool call's intent before execution (FR-009..FR-012).
  * Reward-hacking argument patterns block unconditionally when enabled
- * (FR-009). The file-path trace check is best-effort (design D5): it
+ * (FR-009), scanned on execution surfaces only (FR-071). The file-path trace check is best-effort (design D5): it
  * applies only when a verified trace exists — an empty trace MUST NOT
  * block (FR-011). Blocked results carry an actionable reason naming the
  * failed check and, for trace mismatches, the unmatched path (FR-012).
@@ -617,10 +682,12 @@ export function verifyToolIntent(
   consoleTools?: ReadonlySet<string>
 ): ToolVerificationResult {
   const rawArgs = JSON.stringify(toolCall.arguments || {});
-  const lowerArgs = rawArgs.toLowerCase();
 
-  if (config.blockRewardHacking) {
-    const marker = matchRewardHackingMarker(rawArgs, lowerArgs);
+  // FR-071: the markers are looked for on execution surfaces only.
+  const scanArgs = config.blockRewardHacking ? rewardHackingScanArgs(toolCall.name, toolCall.arguments) : null;
+  if (scanArgs !== null) {
+    const scanned = JSON.stringify(scanArgs);
+    const marker = matchRewardHackingMarker(scanned, scanned.toLowerCase());
     if (marker) {
       return {
         allowed: false,
