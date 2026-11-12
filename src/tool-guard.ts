@@ -672,6 +672,9 @@ function findUnreferencedPath(
  *   supervision loop open — while the reward-hacking check above still applies to them.
  *   Default none: fail-closed for direct callers, who pass the set derived from the
  *   registered tool map.
+ * @param traceExemptReason When set, the call skips the file-path trace check and
+ *   this is the verdict's reason (FR-074: a global per-agent override matched).
+ *   Reward-hacking and directive checks run first and still apply.
  * @returns The verdict; `reason` is the model's corrective signal when blocked.
  */
 export function verifyToolIntent(
@@ -679,7 +682,8 @@ export function verifyToolIntent(
   verifiedSteps: string[],
   config: Pick<AuditConfig, 'blockRewardHacking' | 'requireStepReferenceInTools'>,
   enforcement?: CompiledEnforcement,
-  consoleTools?: ReadonlySet<string>
+  consoleTools?: ReadonlySet<string>,
+  traceExemptReason?: string | null
 ): ToolVerificationResult {
   const rawArgs = JSON.stringify(toolCall.arguments || {});
 
@@ -730,6 +734,12 @@ export function verifyToolIntent(
         allowed: true,
         reason: 'Console tool exempt from the file-path trace check; reward-hacking checks still applied.',
       };
+    }
+    // FR-074 (design D3): a global per-agent override exempts this
+    // tool from the trace check only — reward-hacking (FR-071) and
+    // directive enforcement (FR-028) above already ran.
+    if (traceExemptReason !== undefined && traceExemptReason !== null) {
+      return { allowed: true, reason: traceExemptReason };
     }
     // FR-011 / design D5: an empty trace means no audited reasoning exists
     // yet (first call, auditor unavailable, audit still in flight) — the
