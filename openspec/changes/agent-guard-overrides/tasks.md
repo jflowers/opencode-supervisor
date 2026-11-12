@@ -33,14 +33,14 @@
 - [x] 4.1 spec artifacts: FR-072 session context (agent,
   command, parent), FR-073 `profiles`, FR-074 matching with
   inheritance; design D1, D2, D4, D7
-- [ ] 4.2 `src/guard-profiles.ts` (renamed from
+- [x] 4.2 `src/guard-profiles.ts` (renamed from
   `agent-overrides.ts`): profile validation, command
   normalization, ancestor-chain matching, grant union
-- [ ] 4.3 `index.ts`: record command (`command.execute.before`)
+- [x] 4.3 `index.ts`: record command (`command.execute.before`)
   and parent (`session.created`/`session.updated`, cached
   lookup fallback); resolve profiles per tool call
-- [ ] 4.4 tests for every new scenario on both runners
-- [ ] 4.5 docs: README, CHANGELOG, AGENTS.md
+- [x] 4.4 tests for every new scenario on both runners
+- [x] 4.5 docs: README, CHANGELOG, AGENTS.md
 
 ## 5. Integration and release
 

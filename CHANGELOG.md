@@ -7,19 +7,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- Per-agent guard overrides (FR-072..FR-074, #48, #47): the supervisor
-  records each session's agent from its latest user message, and the
-  global config file's `agentOverrides` can grant one agent
-  `traceCheck.exemptTools` — tool-name globs (for example
-  `["dewey_*"]`) whose calls skip the file-path trace check in that
-  agent's sessions. Reward-hacking, directive, protected-state, and
-  gate checks still apply, and an applied exemption logs once per
-  agent and tool. Overrides only narrow: entries matching a file-mutating
-  builtin (`bash`, `edit`, `write`, `patch`, `multiedit`,
-  `apply_patch`, so `*` too) and unknown keys are dropped with a
-  warning, without rejecting the rest of the global file.
-  `agentOverrides` in the project config file or plugin options is
-  ignored with a warning.
+- Task-scoped guard profiles (FR-072..FR-074, #48, #47): the supervisor
+  records each session's slash command (`command.execute.before`, kept
+  until another command runs), agent (latest user message), and parent
+  session, and the global config file's `profiles` can grant a task —
+  matched on `command` and/or `agent` — `traceCheck.exemptTools`:
+  tool-name globs (for example `["dewey_*"]`) whose calls skip the
+  file-path trace check. Subagent sessions inherit their ancestors'
+  grants (up to 8 levels), so unattended dispatch that starts every
+  session as one agent can still scope grants per command.
+  Reward-hacking, directive, protected-state, and gate checks still
+  apply, and an applied exemption logs once per profile and tool.
+  Profiles only narrow: entries matching a file-mutating builtin
+  (`bash`, `edit`, `write`, `patch`, `multiedit`, `apply_patch`, so
+  `*` too) and unknown keys drop the profile with a warning, without
+  rejecting the rest of the global file. `profiles` in the project
+  config file or plugin options is ignored with a warning.
 - Guard lock (FR-075, #48): `lockGuards: true` in the global config
   file makes `blockRewardHacking: false`,
   `requireStepReferenceInTools: false`, and `mode: "repair-only"`
@@ -27,7 +30,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   warning — the guards cannot be turned off or unregistered from a
   committed project config. The environment and
   the global file stay authoritative. The identity log line reports
-  `lockGuards` and the agents carrying overrides.
+  `lockGuards` and the profile names.
 
 ### Changed
 

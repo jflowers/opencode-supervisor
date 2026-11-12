@@ -6,7 +6,7 @@
  * A file may set any subset of the hook configuration; unknown keys
  * are ignored; a value of the wrong type, or malformed JSON, rejects
  * the whole file with an error string so the caller can skip the
- * tier and warn once. `agentOverrides` entries are the deliberate
+ * tier and warn once. `profiles` entries are the deliberate
  * exception (FR-073): a bad entry is dropped with a warning carried
  * in `ParsedSupervisorConfig.warnings` so one rogue override cannot
  * reject the rest of the file. File I/O lives in index.ts
@@ -14,7 +14,7 @@
  * parsing and validation are pure here.
  */
 
-import { validateAgentOverrides, type AgentOverrides } from './agent-overrides.ts';
+import { validateProfiles, type GuardProfile } from './guard-profiles.ts';
 import { SUPERVISOR_MODES, type ArgRepairConfig, type SupervisorMode } from './arg-repair.ts';
 import type { AuditorVariant } from './auditor.ts';
 import type { MemoLimits } from './memo.ts';
@@ -51,10 +51,10 @@ export interface SupervisorFileConfig {
   /** Tool-argument repair overrides; unset keys fall through to the next tier. */
   argRepair?: Partial<ArgRepairConfig>;
   /**
-   * Per-agent narrowing overrides (FR-073). Parsed from any tier but
-   * honored only from the global file — index.ts drops it elsewhere.
+   * Task-scoped narrowing profiles (FR-073). Parsed from any tier but
+   * honored only from the global file — index.ts drops them elsewhere.
    */
-  agentOverrides?: AgentOverrides;
+  profiles?: GuardProfile[];
   /** Global-file only: lower tiers cannot turn guards off (FR-075). */
   lockGuards?: boolean;
 }
@@ -64,7 +64,7 @@ export interface ParsedSupervisorConfig {
   config: SupervisorFileConfig;
   error: string | null;
   /**
-   * Non-fatal problems (FR-073, design D2): dropped agentOverrides
+   * Non-fatal problems (FR-073, design D2): dropped profiles
    * entries. Absent when there are none.
    */
   warnings?: string[];
@@ -270,12 +270,12 @@ export const validateSupervisorConfig = (value: unknown): ParsedSupervisorConfig
     config.argRepair = argRepair;
   }
 
-  // FR-073 (design D2): agentOverrides validate per entry — a bad
-  // entry is dropped with a warning instead of rejecting the file, so
-  // a typo in one override cannot also drop lockGuards.
-  if (value.agentOverrides !== undefined) {
-    const parsed = validateAgentOverrides(value.agentOverrides);
-    config.agentOverrides = parsed.overrides;
+  // FR-073 (design D2): profiles validate one by one — a bad
+  // profile is dropped with a warning instead of rejecting the file,
+  // so a typo in one profile cannot also drop lockGuards.
+  if (value.profiles !== undefined) {
+    const parsed = validateProfiles(value.profiles);
+    config.profiles = parsed.profiles;
     if (parsed.warnings.length > 0) {
       return { config, error: null, warnings: parsed.warnings };
     }
