@@ -673,7 +673,7 @@ function findUnreferencedPath(
  *   Default none: fail-closed for direct callers, who pass the set derived from the
  *   registered tool map.
  * @param traceExemptReason When set, the call skips the file-path trace check and
- *   this is the verdict's reason (FR-074: a global per-agent override matched).
+ *   this is the verdict's reason (FR-074: a global guard profile matched).
  *   Reward-hacking and directive checks run first and still apply.
  * @returns The verdict; `reason` is the model's corrective signal when blocked.
  */
@@ -735,7 +735,7 @@ export function verifyToolIntent(
         reason: 'Console tool exempt from the file-path trace check; reward-hacking checks still applied.',
       };
     }
-    // FR-074 (design D3): a global per-agent override exempts this
+    // FR-074 (design D3): a global guard profile exempts this
     // tool from the trace check only — reward-hacking (FR-071) and
     // directive enforcement (FR-028) above already ran.
     if (traceExemptReason !== undefined && traceExemptReason !== null) {

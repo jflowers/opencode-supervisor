@@ -112,7 +112,13 @@ import {
   type SupervisorFileConfig,
 } from './src/config-file.ts';
 import { createPluginLogger, silentPluginLogger, type PluginLogger } from './src/plugin-log.ts';
-import { sanitizeNonGlobalTier, traceExemptReason } from './src/agent-overrides.ts';
+import {
+  MAX_PROFILE_ANCESTRY,
+  normalizeCommand,
+  sanitizeNonGlobalTier,
+  traceExemption,
+  type SessionContext,
+} from './src/guard-profiles.ts';
 
 // ── Configuration (session plugin config → environment → defaults) ──
 
@@ -454,7 +460,7 @@ export interface SessionState {
   triggeredDirectives: string[];
   /** Gate keys approved this session (FR-046), deduped so each grant logs once. */
   grantedGates: Set<string>;
-  /** Agent+tool pairs whose trace-check exemption has logged (FR-074), deduped per session. */
+  /** Profile+tool pairs whose trace-check exemption has logged (FR-074), deduped per session. */
   traceExemptionNotices: Set<string>;
   /**
    * Reasoning-part identities already observed, keyed
@@ -498,9 +504,20 @@ export interface SessionState {
   repairNotices: Set<string>;
   /**
    * The session's agent (FR-072): the `agent` of the latest user
-   * message seen by `chat.message`. Keys global agentOverrides.
+   * message seen by `chat.message`. Matched by global profiles.
    */
   agent: string | undefined;
+  /**
+   * The session's task command (FR-072): the latest slash command seen
+   * by `command.execute.before`, without a leading `/`, kept until
+   * another command runs. Matched by global profiles.
+   */
+  command: string | undefined;
+  /**
+   * The parent session (FR-072, design D4): a session ID, `null` for a
+   * root session (or a failed lookup), `undefined` while unknown.
+   */
+  parentID: string | null | undefined;
 }
 
 /** Module-level state (design D4), keyed by session ID. */
@@ -528,6 +545,8 @@ function emptySessionState(): SessionState {
     repairAttempts: 0,
     repairNotices: new Set(),
     agent: undefined,
+    command: undefined,
+    parentID: undefined,
   };
 }
 
@@ -1494,11 +1513,11 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
   if (optionsParsed.error !== null) {
     bootstrapWarnings.push(`plugin options supervisor config ignored: ${optionsParsed.error}`);
   }
-  // FR-073..FR-075 (design D2/D4/D5): agentOverrides and lockGuards
-  // are honored only from the global file. Lower-trust tiers lose
-  // both keys (with a warning), and under the lock they also lose
-  // guard-disabling `false` values. Dropped global override entries
-  // warn without rejecting the global file.
+  // FR-073..FR-075 (design D2/D5/D6): profiles and lockGuards are
+  // honored only from the global file. Lower-trust tiers lose both
+  // keys (with a warning), and under the lock they also lose
+  // guard-disabling `false` values and `mode: "repair-only"`. Dropped
+  // global profiles warn without rejecting the global file.
   const guardsLocked = globalFile.config.lockGuards === true;
   bootstrapWarnings.push(...(globalFile.warnings ?? []).map((w) => `global supervisor config: ${w}`));
   const projectTier = sanitizeNonGlobalTier(projectFile.config, 'project supervisor config file', guardsLocked);
@@ -1506,7 +1525,50 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
   const optionsTier = sanitizeNonGlobalTier(optionsParsed.config, 'plugin options supervisor config', guardsLocked);
   bootstrapWarnings.push(...projectTier.warnings, ...optionsTier.warnings);
   const optionsConfig = optionsTier.config;
-  const agentOverrides = globalFile.config.agentOverrides;
+  const profiles = globalFile.config.profiles;
+  // FR-072 (design D1/D4): a session's lineage — its own context, then
+  // each ancestor's — for profile matching. A parent unknown from
+  // session events is looked up once (bounded) and cached; a failed
+  // lookup is treated as a root session (fail closed: no inherited
+  // grant).
+  const PARENT_LOOKUP_TIMEOUT_MS = 2000;
+  const resolveParent = async (sessionID: string): Promise<string | null> => {
+    const state = sessionState.get(sessionID);
+    if (state.parentID !== undefined) {
+      return state.parentID;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const response = await Promise.race([
+        input.client.session.get({ path: { id: sessionID } }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('session.get timed out')), PARENT_LOOKUP_TIMEOUT_MS);
+          timer.unref?.();
+        }),
+      ]);
+      const parent = (response as { data?: { parentID?: unknown } } | undefined)?.data?.parentID;
+      state.parentID = typeof parent === 'string' && parent !== '' ? parent : null;
+    } catch {
+      state.parentID = null;
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+    }
+    return state.parentID;
+  };
+  const sessionLineage = async (sessionID: string): Promise<SessionContext[]> => {
+    const lineage: SessionContext[] = [];
+    const seen = new Set<string>();
+    let current: string | null = sessionID;
+    while (current !== null && !seen.has(current) && lineage.length <= MAX_PROFILE_ANCESTRY) {
+      seen.add(current);
+      const state = sessionState.get(current);
+      lineage.push({ agent: state.agent, command: state.command });
+      current = lineage.length <= MAX_PROFILE_ANCESTRY ? await resolveParent(current) : null;
+    }
+    return lineage;
+  };
   // Tool-arg repair mode (static registration-time tier): 'full' keeps the
   // whole supervision pipeline; 'repair-only' disables the audit/guard/memo
   // features so the plugin only repairs malformed tool arguments. Same tier
@@ -1646,8 +1708,8 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         }, guards: blockRewardHacking=${config.blockRewardHacking}, stepReference=${
           config.requireStepReferenceInTools
         }, lockGuards=${guardsLocked}${
-          agentOverrides !== undefined && Object.keys(agentOverrides).length > 0
-            ? `, agentOverrides: ${Object.keys(agentOverrides).join(', ')}`
+          profiles !== undefined && profiles.length > 0
+            ? `, profiles: ${profiles.map((profile) => profile.name).join(', ')}`
             : ''
         }${configTiers.length > 0 ? `, config: ${configTiers.join(' + ')}` : ''})`
       );
@@ -1944,6 +2006,16 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
      */
     event: async ({ event }) => {
       try {
+        // FR-072 (design D1/D4): record each session's parent so guard
+        // profiles reach the subagent sessions a task starts.
+        if (event.type === 'session.created' || event.type === 'session.updated') {
+          const info = event.properties.info;
+          if (typeof info?.id === 'string' && !isAuditorSessionId(info.id)) {
+            sessionState.get(info.id).parentID =
+              typeof info.parentID === 'string' && info.parentID !== '' ? info.parentID : null;
+          }
+          return;
+        }
         // Switch on event.type: undeclared types (message.part.delta
         // and friends) arrive at runtime and are not errors (spike 1.1).
         if (event.type !== 'message.part.updated') {
@@ -2069,8 +2141,8 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           return; // not a user message (or an odd payload) — no goal
         }
         const state = sessionState.get(hookInput.sessionID);
-        // FR-072 (design D1): the latest user message's agent keys the
-        // global agentOverrides; recorded in every mode.
+        // FR-072 (design D1): the latest user message's agent is matched
+        // by global profiles; recorded in every mode.
         if (typeof hookInput.agent === 'string' && hookInput.agent !== '') {
           state.agent = hookInput.agent;
         }
@@ -2158,9 +2230,14 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         // live trace after a settled wait without re-resolving config.
         const guardConfig = await buildConfig();
         const consoleTools = new Set(hooks.tool !== undefined ? Object.keys(hooks.tool) : []);
-        // FR-074 (design D3): a global per-agent override may exempt
-        // this tool from the trace check only.
-        const exemptReason = traceExemptReason(state.agent, hookInput.tool, agentOverrides);
+        // FR-074 (design D3/D4): a global profile matching this session
+        // or an ancestor may exempt this tool from the trace check only.
+        // Lineage resolves only when profiles exist (no lookups otherwise).
+        const exemption =
+          profiles !== undefined && profiles.length > 0
+            ? traceExemption(await sessionLineage(hookInput.sessionID), hookInput.tool, profiles)
+            : null;
+        const exemptReason = exemption?.reason ?? null;
         const runGuard = () =>
           verifyToolIntent(
             { name: hookInput.tool, arguments: output.args },
@@ -2191,16 +2268,16 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         };
         verification = runGuard();
         warnBudgetExhausted();
-        // FR-074 (design D6): an applied exemption is observable per call —
-        // logged once per agent+tool pair per session (the FR-046
+        // FR-074 (design D7): an applied exemption is observable per call —
+        // logged once per profile+tool pair per session (the FR-046
         // first-grant precedent), so an engineer reviewing logs can
         // distinguish a skipped trace check from one that passed on merits.
-        if (
-          exemptReason !== null &&
-          !state.traceExemptionNotices.has(`${state.agent}:${hookInput.tool}`)
-        ) {
-          state.traceExemptionNotices.add(`${state.agent}:${hookInput.tool}`);
-          logger.info(exemptReason);
+        if (exemption !== null) {
+          const noticeKey = `${exemption.profile}:${hookInput.tool}`;
+          if (!state.traceExemptionNotices.has(noticeKey)) {
+            state.traceExemptionNotices.add(noticeKey);
+            logger.info(exemption.reason);
+          }
         }
         // FR-067 (design D8) + FR-070 (design D4/D5): await-on-miss.
         // A trace block with an in-flight audit continuation means the
@@ -2704,6 +2781,26 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
      * Dispose (design D4): supervision state is in-process only; clear
      * it when the plugin unloads so a re-register starts clean.
      */
+    /**
+     * Task context (FR-072, design D1): records the slash command a
+     * session runs so global guard profiles can match it. The command
+     * stays until another command runs in the session. Fail-open: an
+     * odd payload is ignored.
+     */
+    'command.execute.before': async (hookInput) => {
+      try {
+        if (isAuditorSessionId(hookInput.sessionID) || typeof hookInput.command !== 'string') {
+          return;
+        }
+        const command = normalizeCommand(hookInput.command);
+        if (command !== '') {
+          sessionState.get(hookInput.sessionID).command = command;
+        }
+      } catch (error) {
+        logger.error(`command.execute.before hook failed open: ${errorText(error)}`);
+      }
+    },
+
     dispose: async () => {
       sessionState.clearAll();
     },
