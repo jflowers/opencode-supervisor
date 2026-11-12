@@ -3,7 +3,7 @@
 ## 1. Spec artifacts (FR-072..FR-075)
 
 - [x] 1.1 proposal.md
-- [x] 1.2 design.md (D1..D6, risks, rollback)
+- [x] 1.2 design.md (D1..D7, risks, rollback)
 - [x] 1.3 specs/supervisor-config/spec.md delta
 - [x] 1.4 tasks.md
 
@@ -28,11 +28,25 @@
   `tool.execute.before`
 - [x] 3.4 hook-layer tests for every spec scenario
 
-## 4. Integration and release
+## 4. Task-scoped profiles (fleet dispatch, review follow-up)
 
-- [x] 4.1 both runners green: `bun test` and
+- [x] 4.1 spec artifacts: FR-072 session context (agent,
+  command, parent), FR-073 `profiles`, FR-074 matching with
+  inheritance; design D1, D2, D4, D7
+- [ ] 4.2 `src/guard-profiles.ts` (renamed from
+  `agent-overrides.ts`): profile validation, command
+  normalization, ancestor-chain matching, grant union
+- [ ] 4.3 `index.ts`: record command (`command.execute.before`)
+  and parent (`session.created`/`session.updated`, cached
+  lookup fallback); resolve profiles per tool call
+- [ ] 4.4 tests for every new scenario on both runners
+- [ ] 4.5 docs: README, CHANGELOG, AGENTS.md
+
+## 5. Integration and release
+
+- [x] 5.1 both runners green: `bun test` and
   `node --test test/*.test.ts`
-- [x] 4.2 docs: README, CHANGELOG, AGENTS.md
-- [ ] 4.3 `/uf.review-council` (runs inside OpenCode; draft PR until
+- [x] 5.2 docs: README, CHANGELOG, AGENTS.md
+- [ ] 5.3 `/uf.review-council` (runs inside OpenCode; draft PR until
   then; docs issue #50, website capabilities issue
   unbound-force/website#412, blog issue #52)
