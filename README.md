@@ -224,7 +224,9 @@ blocks, and the plugin's own console tools are exempt from the
 trace check — derived from the registered tool map, so
 `request_audit` stays reachable and a future console tool is
 covered automatically; the reward-hacking check still applies to
-them. The reward-hacking check looks for its markers on execution
+them. A global per-agent override can exempt a tool from the trace
+check for one agent only (Section 7.2). The reward-hacking check
+looks for its markers on execution
 surfaces only (FR-071), so a mention is not a use: bash is scanned
 in full; the read-only builtins (`read`, `glob`, `grep`, `webfetch`,
 `websearch`) are not scanned; every other tool keeps every
@@ -258,8 +260,8 @@ tuple registration — Section 6):
 | Hook | Purpose |
 | :--- | :--- |
 | `event` | Observes completed reasoning parts (`message.part.updated`), deduplicates them, strips narrative, runs the invariants and the side-session peer audit, records steps in the verified trace (passed, or minor deterministic findings marked unpassed), and routes failures to critique delivery. |
-| `chat.message` | Captures the session's model identity (drives the tool-arg repair schema lookup) and the first user message of the session as the goal. The goal is never replaced. |
-| `tool.execute.before` | Tool-arg repair first: validates raw arguments against the tool's JSON schema and repairs malformed ones in place (Section 4.5). Then the tool guard: blocks reward-hacking tool calls, engineer-directive violations, and file paths absent from the verified trace (never blocks when the trace is empty; a trace block with an audit in flight waits up to 10 s for the settled trace, failing open up to the per-session `maxTimeoutFailOpens` cap — Section 4.2); holds approve-gated calls for engineer approval and review-gated calls for a passed peer audit (agent-console tools are exempt so `request_audit` stays reachable); records directive triggers. |
+| `chat.message` | Captures the session's model identity (drives the tool-arg repair schema lookup) and the first user message of the session as the goal. The goal is never replaced. Also records the session's agent — the `agent` of the latest user message (Section 7.2). |
+| `tool.execute.before` | Tool-arg repair first: validates raw arguments against the tool's JSON schema and repairs malformed ones in place (Section 4.5). Then the tool guard: blocks reward-hacking tool calls, engineer-directive violations, and file paths absent from the verified trace (never blocks when the trace is empty; a trace block with an audit in flight waits up to 10 s for the settled trace, failing open up to the per-session `maxTimeoutFailOpens` cap — Section 4.2); holds approve-gated calls for engineer approval and review-gated calls for a passed peer audit (agent-console tools are exempt so `request_audit` stays reachable); records directive triggers. A global per-agent override may exempt a tool from the trace check only (Section 7.2). |
 | `tool.execute.after` | Appends a solved item (tool name + short outcome) to a bounded log. |
 | `tool` | Agent console: registers `remind_me` / `forget_reminder` (durable reminders), `recall` (full retained state), `report` (self-reported events), and `request_audit` (on-demand peer audit) (Section 5). |
 | `experimental.chat.messages.transform` | Appends the supervisor memo to the conversation as one trailing user message per user prompt. Degrades gracefully (memo-less operation) when the hook is absent. |
@@ -515,7 +517,7 @@ when unset, the side-session prompt omits it.
 | `argRepair.tools` | *(config file/options only)* | builtin tool ids | Tools in the repair scope; `"*"` covers everything including MCP and plugin tools. |
 | `argRepair.maxPerSession` | *(config file/options only)* | `8` | Per-session bound on repair-model attempts; deterministic repairs are unbounded. |
 | `argRepair.timeoutMs` | *(config file/options only)* | `15000` | Timeout on the repair side session. |
-| `lockGuards` | *(global config file only)* | `false` | When `true`, `blockRewardHacking: false` and `requireStepReferenceInTools: false` from the project config file or plugin options are ignored with a warning, so a committed project config cannot turn the guards off. The environment and the global file stay authoritative (Section 7.2). |
+| `lockGuards` | *(global config file only)* | `false` | When `true`, `blockRewardHacking: false`, `requireStepReferenceInTools: false`, and `mode: "repair-only"` from the project config file or plugin options are ignored with a warning, so a committed project config cannot turn the guards off or unregister them. The environment and the global file stay authoritative (Section 7.2). |
 | `agentOverrides` | *(global config file only)* | *(none)* | Per-agent overrides that narrow where a guard applies (Section 7.2). |
 
 Gate approvals are not a knob: `approve` rules read the approvals file
@@ -551,8 +553,6 @@ at the first hook invocation.
 - **`strict`** — only fenced code blocks and explicit equations.
   Zero natural language.
 
----
-
 ### 7.2 Per-Agent Overrides and the Guard Lock
 
 A session's agent is the `agent` of its latest user message. The
@@ -572,7 +572,8 @@ knowledge-store MCP calls touch no workspace file:
 - `traceCheck.exemptTools` lists tool-name globs (`*` any run, `?` one
   character, anchored, case-sensitive). Matching calls in that agent's
   sessions skip the file-path trace check. The reward-hacking check,
-  directive enforcement, and approve/review gates still apply.
+  directive enforcement, the protected-state check, and approve/review
+  gates still apply.
 - Overrides only narrow. An entry that matches a file-mutating builtin
   (`bash`, `edit`, `write`, `patch`, `multiedit`, `apply_patch`) — `*`
   included — is rejected, and so is any key other than `traceCheck`,
@@ -588,7 +589,9 @@ knowledge-store MCP calls touch no workspace file:
   (FR-069) covers bulk reads, and you may list them for an agent.
 
 The identity log line reports `lockGuards=<bool>` and the agents that
-carry overrides.
+carry overrides. An applied exemption logs once per agent and tool.
+
+---
 
 ## 8. Middleware or Skill?
 

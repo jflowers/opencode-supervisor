@@ -1,5 +1,12 @@
 # Spec Delta
 
+## Purpose
+
+Grant one agent a narrow exemption from the file-path trace check
+(#47) and stop committed project config from disabling or
+unregistering the guards (#48), without weakening any check for
+any other agent.
+
 ## ADDED Requirements
 
 ### Requirement: FR-072 Session agent tracking
@@ -48,8 +55,8 @@ An override's `traceCheck.exemptTools` SHALL be a list of
 tool-name globs (`*`, `?`, anchored, case-sensitive). A call
 from a session whose recorded agent has a matching entry
 SHALL skip the file-path trace check; the reward-hacking
-check, directive enforcement, and approve/review gates SHALL
-still apply. An entry matching `bash`, `edit`, `write`,
+check, directive enforcement, the protected-state check
+(FR-061), and approve/review gates SHALL still apply. An entry matching `bash`, `edit`, `write`,
 `patch`, `multiedit`, or `apply_patch` SHALL be rejected.
 
 #### Scenario: Granted agent passes
@@ -73,6 +80,13 @@ still apply. An entry matching `bash`, `edit`, `write`,
   `--no-verify` in a non-content argument
 - **THEN** it is blocked by the reward-hacking check
 
+#### Scenario: Protected state still blocks
+
+- **GIVEN** the same override
+- **WHEN** a `curator` session calls an exempt tool touching
+  `.opencode/supervisor/approvals.json`
+- **THEN** it is blocked by the protected-state check
+
 #### Scenario: Catch-alls are rejected
 
 - **GIVEN** a global override whose `exemptTools` is `["*"]`
@@ -85,7 +99,10 @@ still apply. An entry matching `bash`, `edit`, `write`,
 When the global config file sets `lockGuards: true`, a
 `false` value for `blockRewardHacking` or
 `requireStepReferenceInTools` from the project config file or
-plugin options SHALL be ignored with a warning. Environment
+plugin options SHALL be ignored with a warning. A `mode:
+"repair-only"` from the project config file or plugin options
+SHALL likewise be ignored with a warning, so a committed
+project config cannot unregister the guards. Environment
 and global-file values SHALL still apply. `lockGuards` from
 any tier other than the global file SHALL be ignored with a
 warning.
@@ -106,3 +123,11 @@ warning.
   false`
 - **WHEN** the same call is made
 - **THEN** it is not blocked by the trace check
+
+#### Scenario: Project cannot unregister the guards
+
+- **GIVEN** a global file with `lockGuards: true`
+- **AND** a project file with `mode: "repair-only"`
+- **WHEN** the plugin loads
+- **THEN** the guards stay registered and a warning reports the
+  ignored mode

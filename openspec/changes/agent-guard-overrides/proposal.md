@@ -103,3 +103,12 @@ carry overrides.
 
 All rules are pure functions in `src/agent-overrides.ts`,
 covered in both directions; hook tests cover the wiring.
+
+### V. Security by Default
+
+**Assessment**: PASS
+
+Grants come only from the user's global file, validate per
+entry, and only narrow: unknown keys and file-mutating builtin
+globs are rejected, and the guard lock drops guard-disabling
+values from lower-trust tiers.
