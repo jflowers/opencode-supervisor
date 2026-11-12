@@ -112,6 +112,7 @@ import {
   type SupervisorFileConfig,
 } from './src/config-file.ts';
 import { createPluginLogger, silentPluginLogger, type PluginLogger } from './src/plugin-log.ts';
+import { sanitizeNonGlobalTier, traceExemptReason } from './src/agent-overrides.ts';
 
 // ── Configuration (session plugin config → environment → defaults) ──
 
@@ -493,6 +494,11 @@ export interface SessionState {
   repairAttempts: number;
   /** Log-once keys for repair notices, so repeated skips do not spam the plugin log. */
   repairNotices: Set<string>;
+  /**
+   * The session's agent (FR-072): the `agent` of the latest user
+   * message seen by `chat.message`. Keys global agentOverrides.
+   */
+  agent: string | undefined;
 }
 
 /** Module-level state (design D4), keyed by session ID. */
@@ -518,6 +524,7 @@ function emptySessionState(): SessionState {
     modelIdentity: undefined,
     repairAttempts: 0,
     repairNotices: new Set(),
+    agent: undefined,
   };
 }
 
@@ -1484,7 +1491,19 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
   if (optionsParsed.error !== null) {
     bootstrapWarnings.push(`plugin options supervisor config ignored: ${optionsParsed.error}`);
   }
-  const optionsConfig = optionsParsed.config;
+  // FR-073..FR-075 (design D2/D4/D5): agentOverrides and lockGuards
+  // are honored only from the global file. Lower-trust tiers lose
+  // both keys (with a warning), and under the lock they also lose
+  // guard-disabling `false` values. Dropped global override entries
+  // warn without rejecting the global file.
+  const guardsLocked = globalFile.config.lockGuards === true;
+  bootstrapWarnings.push(...(globalFile.warnings ?? []).map((w) => `global supervisor config: ${w}`));
+  const projectTier = sanitizeNonGlobalTier(projectFile.config, 'project supervisor config file', guardsLocked);
+  projectFile.config = projectTier.config;
+  const optionsTier = sanitizeNonGlobalTier(optionsParsed.config, 'plugin options supervisor config', guardsLocked);
+  bootstrapWarnings.push(...projectTier.warnings, ...optionsTier.warnings);
+  const optionsConfig = optionsTier.config;
+  const agentOverrides = globalFile.config.agentOverrides;
   // Tool-arg repair mode (static registration-time tier): 'full' keeps the
   // whole supervision pipeline; 'repair-only' disables the audit/guard/memo
   // features so the plugin only repairs malformed tool arguments. Same tier
@@ -1623,6 +1642,10 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           directives.length > 0 ? `, directives: ${directives.length}` : ''
         }, guards: blockRewardHacking=${config.blockRewardHacking}, stepReference=${
           config.requireStepReferenceInTools
+        }, lockGuards=${guardsLocked}${
+          agentOverrides !== undefined && Object.keys(agentOverrides).length > 0
+            ? `, agentOverrides: ${Object.keys(agentOverrides).join(', ')}`
+            : ''
         }${configTiers.length > 0 ? `, config: ${configTiers.join(' + ')}` : ''})`
       );
       logIdentityState.identitySaidNoModel = config.auditorModel === undefined;
@@ -2043,6 +2066,11 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           return; // not a user message (or an odd payload) — no goal
         }
         const state = sessionState.get(hookInput.sessionID);
+        // FR-072 (design D1): the latest user message's agent keys the
+        // global agentOverrides; recorded in every mode.
+        if (typeof hookInput.agent === 'string' && hookInput.agent !== '') {
+          state.agent = hookInput.agent;
+        }
         // Tool-arg repair: capture the session's model identity in every
         // mode — it drives the per-model tool-schema lookup.
         const model = hookInput.model;
@@ -2127,6 +2155,9 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         // live trace after a settled wait without re-resolving config.
         const guardConfig = await buildConfig();
         const consoleTools = new Set(hooks.tool !== undefined ? Object.keys(hooks.tool) : []);
+        // FR-074 (design D3): a global per-agent override may exempt
+        // this tool from the trace check only.
+        const exemptReason = traceExemptReason(state.agent, hookInput.tool, agentOverrides);
         const runGuard = () =>
           verifyToolIntent(
             { name: hookInput.tool, arguments: output.args },
@@ -2142,7 +2173,8 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
             // the same source the gate exemption below uses — so a future
             // console tool is exempt automatically; the reward-hacking
             // check inside the guard still applies to them.
-            consoleTools
+            consoleTools,
+            exemptReason
           );
         // Review iteration 4 (FR-012): a budget-exhausted block is a
         // distinct diagnosis — the matcher stopped early — so the

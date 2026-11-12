@@ -11,6 +11,7 @@
  * parsing and validation are pure here.
  */
 
+import { validateAgentOverrides, type AgentOverrides } from './agent-overrides.ts';
 import { SUPERVISOR_MODES, type ArgRepairConfig, type SupervisorMode } from './arg-repair.ts';
 import type { AuditorVariant } from './auditor.ts';
 import type { MemoLimits } from './memo.ts';
@@ -46,12 +47,24 @@ export interface SupervisorFileConfig {
   mode?: SupervisorMode;
   /** Tool-argument repair overrides; unset keys fall through to the next tier. */
   argRepair?: Partial<ArgRepairConfig>;
+  /**
+   * Per-agent narrowing overrides (FR-073). Parsed from any tier but
+   * honored only from the global file — index.ts drops it elsewhere.
+   */
+  agentOverrides?: AgentOverrides;
+  /** Global-file only: lower tiers cannot turn guards off (FR-075). */
+  lockGuards?: boolean;
 }
 
 /** Parse outcome: the accepted subset, or an error when rejected. */
 export interface ParsedSupervisorConfig {
   config: SupervisorFileConfig;
   error: string | null;
+  /**
+   * Non-fatal problems (FR-073, design D2): dropped agentOverrides
+   * entries. Absent when there are none.
+   */
+  warnings?: string[];
 }
 
 const STRIP_MODES: readonly StripMode[] = ['code_and_math', 'balanced', 'strict'];
@@ -185,9 +198,10 @@ export const validateSupervisorConfig = (value: unknown): ParsedSupervisorConfig
     }
   }
 
-  const booleanKeys: readonly ('blockRewardHacking' | 'requireStepReferenceInTools')[] = [
+  const booleanKeys: readonly ('blockRewardHacking' | 'requireStepReferenceInTools' | 'lockGuards')[] = [
     'blockRewardHacking',
     'requireStepReferenceInTools',
+    'lockGuards',
   ];
   for (const key of booleanKeys) {
     const parsed = optionalBoolean(value, key);
@@ -251,6 +265,17 @@ export const validateSupervisorConfig = (value: unknown): ParsedSupervisorConfig
     if (timeoutMs.error !== null) return reject('"argRepair.timeoutMs" must be a non-negative integer');
     if (timeoutMs.value !== undefined) argRepair.timeoutMs = timeoutMs.value;
     config.argRepair = argRepair;
+  }
+
+  // FR-073 (design D2): agentOverrides validate per entry — a bad
+  // entry is dropped with a warning instead of rejecting the file, so
+  // a typo in one override cannot also drop lockGuards.
+  if (value.agentOverrides !== undefined) {
+    const parsed = validateAgentOverrides(value.agentOverrides);
+    config.agentOverrides = parsed.overrides;
+    if (parsed.warnings.length > 0) {
+      return { config, error: null, warnings: parsed.warnings };
+    }
   }
 
   return { config, error: null };

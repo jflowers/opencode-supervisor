@@ -515,6 +515,8 @@ when unset, the side-session prompt omits it.
 | `argRepair.tools` | *(config file/options only)* | builtin tool ids | Tools in the repair scope; `"*"` covers everything including MCP and plugin tools. |
 | `argRepair.maxPerSession` | *(config file/options only)* | `8` | Per-session bound on repair-model attempts; deterministic repairs are unbounded. |
 | `argRepair.timeoutMs` | *(config file/options only)* | `15000` | Timeout on the repair side session. |
+| `lockGuards` | *(global config file only)* | `false` | When `true`, `blockRewardHacking: false` and `requireStepReferenceInTools: false` from the project config file or plugin options are ignored with a warning, so a committed project config cannot turn the guards off. The environment and the global file stay authoritative (Section 7.2). |
+| `agentOverrides` | *(global config file only)* | *(none)* | Per-agent overrides that narrow where a guard applies (Section 7.2). |
 
 Gate approvals are not a knob: `approve` rules read the approvals file
 fresh at each gated call, so approving or revoking takes effect on
@@ -550,6 +552,43 @@ at the first hook invocation.
   Zero natural language.
 
 ---
+
+### 7.2 Per-Agent Overrides and the Guard Lock
+
+A session's agent is the `agent` of its latest user message. The
+global config file can grant one agent a narrow exemption from the
+file-path trace check — for example, a knowledge-curation agent whose
+knowledge-store MCP calls touch no workspace file:
+
+```json
+{
+  "lockGuards": true,
+  "agentOverrides": {
+    "curator": { "traceCheck": { "exemptTools": ["dewey_*"] } }
+  }
+}
+```
+
+- `traceCheck.exemptTools` lists tool-name globs (`*` any run, `?` one
+  character, anchored, case-sensitive). Matching calls in that agent's
+  sessions skip the file-path trace check. The reward-hacking check,
+  directive enforcement, and approve/review gates still apply.
+- Overrides only narrow. An entry that matches a file-mutating builtin
+  (`bash`, `edit`, `write`, `patch`, `multiedit`, `apply_patch`) — `*`
+  included — is rejected, and so is any key other than `traceCheck`,
+  so `{ "curator": { "blockRewardHacking": false } }` warns instead of
+  silently doing nothing. A rejected entry is dropped with a warning;
+  other entries and the rest of the file stay in force.
+- `agentOverrides` and `lockGuards` are honored only from the global
+  config file. Agent names are a weak key — any repository can ship
+  `.opencode/agents/curator.md` — so a project config file or plugin
+  options cannot grant one; they are ignored there with a warning.
+- Agent names match exactly. Read-only builtins (`read`, `grep`,
+  `glob`) are not exempt by default; path-scoped glob reasoning
+  (FR-069) covers bulk reads, and you may list them for an agent.
+
+The identity log line reports `lockGuards=<bool>` and the agents that
+carry overrides.
 
 ## 8. Middleware or Skill?
 
