@@ -2,19 +2,23 @@
 
 ## Purpose
 
-Grant one agent a narrow exemption from the file-path trace check
-(#47) and stop committed project config from disabling or
-unregistering the guards (#48), without weakening any check for
-any other agent.
+Grant one task — a slash command, an agent, or both — a narrow
+exemption from the file-path trace check (#47), carried into the
+subagent sessions it starts, and stop committed project config
+from disabling or unregistering the guards (#48), without
+weakening any check for any other session.
 
 ## ADDED Requirements
 
-### Requirement: FR-072 Session agent tracking
+### Requirement: FR-072 Session context tracking
 
-The supervisor SHALL record a session's agent from the
-`agent` field of each `chat.message` hook input for a user
-message; a later user message SHALL replace the recorded
-agent. Auditor side sessions SHALL NOT be recorded.
+The supervisor SHALL record, per session: the `agent` of the
+latest user message seen by `chat.message`; the latest slash
+command seen by `command.execute.before`, without a leading
+`/`, kept until another command runs; and the session's
+`parentID` from `session.created` / `session.updated` events,
+falling back to one cached session lookup when unknown.
+Auditor side sessions SHALL NOT be recorded.
 
 #### Scenario: Latest user message wins
 
@@ -22,76 +26,114 @@ agent. Auditor side sessions SHALL NOT be recorded.
 - **WHEN** a later user message runs `curator`
 - **THEN** the session's recorded agent is `curator`
 
-### Requirement: FR-073 Agent overrides from the global file only
+#### Scenario: The command persists for the task
 
-`agentOverrides` SHALL be honored only from the global config
-file. When present in the project config file or plugin
-options it SHALL be ignored with a warning. An invalid entry
-(non-object, unknown key, invalid value) SHALL be dropped
-with a warning naming the agent, without rejecting other
-entries or other keys of the file. Agent names SHALL match
-exactly.
+- **GIVEN** a session that ran `/dewey-distill`
+- **WHEN** a later plain user message arrives
+- **THEN** the session's recorded command is still
+  `dewey-distill`
 
-#### Scenario: Project overrides are ignored
+### Requirement: FR-073 Profiles from the global file only
 
-- **GIVEN** a project config file with `agentOverrides`
-  exempting `dewey_*` for `curator`
+`profiles` SHALL be honored only from the global config file.
+When present in the project config file or plugin options it
+SHALL be ignored with a warning. Each profile SHALL hold a
+`match` with `agent` and/or `command` (exact strings; a
+leading `/` on `command` ignored) and a `traceCheck` grant,
+plus an optional `name`. An invalid profile (non-object,
+unknown key, missing or invalid `match`, missing or invalid
+grant) SHALL be dropped with a warning naming it, without
+rejecting other profiles or other keys of the file.
+
+#### Scenario: Project profiles are ignored
+
+- **GIVEN** a project config file with a profile exempting
+  `dewey_*` for agent `curator`
 - **WHEN** a `curator` session calls `dewey_store_learning`
   with a path absent from a non-empty verified trace
 - **THEN** the trace check applies and a warning reports the
   ignored key
 
-#### Scenario: A bad entry does not drop the lock
+#### Scenario: A bad profile does not drop the lock
 
-- **GIVEN** a global file with `lockGuards: true` and an
-  `agentOverrides` entry with an unknown key
+- **GIVEN** a global file with `lockGuards: true` and a
+  profile with an unknown key
 - **WHEN** the plugin loads
-- **THEN** the entry is dropped with a warning and
+- **THEN** the profile is dropped with a warning and
   `lockGuards` stays in force
 
 ### Requirement: FR-074 Trace-check exempt tools
 
-An override's `traceCheck.exemptTools` SHALL be a list of
-tool-name globs (`*`, `?`, anchored, case-sensitive). A call
-from a session whose recorded agent has a matching entry
-SHALL skip the file-path trace check; the reward-hacking
-check, directive enforcement, the protected-state check
-(FR-061), and approve/review gates SHALL still apply. An entry matching `bash`, `edit`, `write`,
+A profile's `traceCheck.exemptTools` SHALL be a list of
+tool-name globs (`*`, `?`, anchored, case-sensitive). A
+profile SHALL apply to a session when every `match` key
+equals the context of the session or of one of its ancestors
+(up to 8 levels). A call from a session with an applicable
+profile whose globs match the tool SHALL skip the file-path
+trace check; the reward-hacking check, directive enforcement,
+the protected-state check (FR-061), and approve/review gates
+SHALL still apply. An entry matching `bash`, `edit`, `write`,
 `patch`, `multiedit`, or `apply_patch` SHALL be rejected.
+
+#### Scenario: A granted command passes under any agent
+
+- **GIVEN** a global profile matching command `dewey-distill`
+  and exempting `dewey_*`
+- **WHEN** an `autonomy` session that ran `/dewey-distill`
+  calls `dewey_store_learning` with a path absent from a
+  non-empty verified trace
+- **THEN** the call is not blocked by the trace check
 
 #### Scenario: Granted agent passes
 
-- **GIVEN** a global override exempting `dewey_*` for
-  `curator`
-- **WHEN** a `curator` session calls `dewey_store_learning`
-  with a path absent from a non-empty verified trace
+- **GIVEN** a global profile matching agent `curator` and
+  exempting `dewey_*`
+- **WHEN** a `curator` session makes the same call
 - **THEN** the call is not blocked by the trace check
 
-#### Scenario: Other agents are unchanged
+#### Scenario: Subagents inherit the task's grant
 
-- **GIVEN** the same override
-- **WHEN** a `build` session makes the same call
+- **GIVEN** the command profile above
+- **AND** a child session (agent `general`, no command) whose
+  parent ran `/dewey-distill`
+- **WHEN** the child makes the same call
+- **THEN** the call is not blocked by the trace check
+
+#### Scenario: Other sessions are unchanged
+
+- **GIVEN** the same profiles
+- **WHEN** a `build` session with no command, or an
+  `autonomy` session that ran `/uf.fix-ci`, makes the same
+  call
+- **THEN** it is blocked by the trace check
+
+#### Scenario: Both keys must match
+
+- **GIVEN** a profile matching agent `autonomy` and command
+  `dewey-distill`
+- **WHEN** an `autonomy` session that ran `/uf.fix-ci` makes
+  the same call
 - **THEN** it is blocked by the trace check
 
 #### Scenario: Reward-hacking still applies
 
-- **GIVEN** the same override
+- **GIVEN** the agent profile above
 - **WHEN** a `curator` session calls an exempt tool with
   `--no-verify` in a non-content argument
 - **THEN** it is blocked by the reward-hacking check
 
 #### Scenario: Protected state still blocks
 
-- **GIVEN** the same override
+- **GIVEN** the agent profile above
 - **WHEN** a `curator` session calls an exempt tool touching
   `.opencode/supervisor/approvals.json`
 - **THEN** it is blocked by the protected-state check
 
 #### Scenario: Catch-alls are rejected
 
-- **GIVEN** a global override whose `exemptTools` is `["*"]`
+- **GIVEN** a global profile whose `exemptTools` is `["*"]`
 - **WHEN** the plugin loads
-- **THEN** the entry is dropped with a warning naming the
+- **THEN** the profile is dropped with a warning naming the
   matched builtin
 
 ### Requirement: FR-075 Guard lock

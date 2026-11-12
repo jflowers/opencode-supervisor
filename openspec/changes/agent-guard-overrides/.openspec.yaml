@@ -3,13 +3,13 @@ created: 2026-11-12
 originating_issue: 48
 related_issues:
   - 47
-goal: Per-agent trace-check exemptions granted only from the global config file, and a global guard lock that stops project config from disabling guards
+goal: Per-task (slash command and/or agent) trace-check exemption profiles granted only from the global config file and inherited by subagent sessions, and a global guard lock that stops project config from disabling guards
 affected_areas:
   - src/config-file.ts
-  - src/agent-overrides.ts
+  - src/guard-profiles.ts
   - src/tool-guard.ts
   - index.ts
-  - test/agent-overrides.test.ts
+  - test/guard-profiles.test.ts
   - README.md
   - CHANGELOG.md
   - AGENTS.md
