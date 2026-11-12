@@ -12,17 +12,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   global config file's `agentOverrides` can grant one agent
   `traceCheck.exemptTools` — tool-name globs (for example
   `["dewey_*"]`) whose calls skip the file-path trace check in that
-  agent's sessions. Reward-hacking, directive, and gate checks still
-  apply. Overrides only narrow: entries matching a file-mutating
+  agent's sessions. Reward-hacking, directive, protected-state, and
+  gate checks still apply, and an applied exemption logs once per
+  agent and tool. Overrides only narrow: entries matching a file-mutating
   builtin (`bash`, `edit`, `write`, `patch`, `multiedit`,
   `apply_patch`, so `*` too) and unknown keys are dropped with a
   warning, without rejecting the rest of the global file.
   `agentOverrides` in the project config file or plugin options is
   ignored with a warning.
 - Guard lock (FR-075, #48): `lockGuards: true` in the global config
-  file makes `blockRewardHacking: false` and
-  `requireStepReferenceInTools: false` from the project config file
-  or plugin options ineffective, with a warning. The environment and
+  file makes `blockRewardHacking: false`,
+  `requireStepReferenceInTools: false`, and `mode: "repair-only"`
+  from the project config file or plugin options ineffective, with a
+  warning — the guards cannot be turned off or unregistered from a
+  committed project config. The environment and
   the global file stay authoritative. The identity log line reports
   `lockGuards` and the agents carrying overrides.
 

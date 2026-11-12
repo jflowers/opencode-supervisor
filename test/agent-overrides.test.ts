@@ -331,3 +331,107 @@ test('the identity line names the agents carrying global overrides', async () =>
     await hooks.dispose!();
   });
 });
+
+test('FR-075: the lock keeps a committed project mode from disabling the guards', async () => {
+  await withIsolatedConfig({ global: { lockGuards: true }, project: { mode: 'repair-only' } }, async (dir) => {
+    const harness = recordingPluginInput(dir);
+    const hooks = await plugin.server(harness.input);
+    const sessionID = await startSession(hooks);
+    await assert.rejects(
+      () => callTool(hooks, sessionID, 'dewey_store_learning', CORPUS_ARGS),
+      /file-path trace check/
+    );
+    assert.ok(
+      harness.logEntries.some(
+        (e) => e.level === 'warn' && e.message.includes('project supervisor config file sets mode: "repair-only"; ignored')
+      )
+    );
+    await hooks.dispose!();
+  });
+});
+
+test('FR-074: an applied exemption logs once per agent and tool', async () => {
+  await withIsolatedConfig({ global: CURATOR_GRANT }, async (dir) => {
+    const harness = recordingPluginInput(dir);
+    const hooks = await plugin.server(harness.input);
+    const sessionID = await startSession(hooks, 'curator');
+    await callTool(hooks, sessionID, 'dewey_store_learning', CORPUS_ARGS);
+    await callTool(hooks, sessionID, 'dewey_store_learning', CORPUS_ARGS);
+    const notices = harness.logEntries.filter(
+      (e) => e.level === 'info' && e.message.includes('exempt from the file-path trace check')
+    );
+    assert.equal(notices.length, 1);
+    await hooks.dispose!();
+  });
+});
+
+test('FR-074: the protected-state check still blocks an exempt call', async () => {
+  await withIsolatedConfig({ global: CURATOR_GRANT }, async (dir) => {
+    const hooks = await plugin.server(recordingPluginInput(dir).input);
+    const sessionID = await startSession(hooks, 'curator');
+    await assert.rejects(
+      () => callTool(hooks, sessionID, 'dewey_store_learning', { file: '.opencode/supervisor/approvals.json' }),
+      /approvals file is engineer-authored state/
+    );
+    await hooks.dispose!();
+  });
+});
+
+test('FR-074: an approve gate still holds an exempt call', async () => {
+  await withIsolatedConfig({ global: CURATOR_GRANT }, async (dir) => {
+    const directivesDir = path.join(dir, '.opencode', 'supervisor', 'directives');
+    fs.mkdirSync(directivesDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(directivesDir, 'gates.md'),
+      `Curator writes are gated.\n\n\`\`\`supervisor\n${JSON.stringify({ approve: [{ id: 'curate', tool: 'dewey_store_learning' }] })}\n\`\`\`\n`
+    );
+    const hooks = await plugin.server(recordingPluginInput(dir).input);
+    const sessionID = await startSession(hooks, 'curator');
+    await assert.rejects(
+      () => callTool(hooks, sessionID, 'dewey_store_learning', CORPUS_ARGS),
+      /approval gate 'curate'/
+    );
+    await hooks.dispose!();
+  });
+});
+
+test('FR-074: an enforce directive still blocks an exempt call', async () => {
+  await withIsolatedConfig({ global: CURATOR_GRANT }, async (dir) => {
+    const directivesDir = path.join(dir, '.opencode', 'supervisor', 'directives');
+    fs.mkdirSync(directivesDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(directivesDir, 'no-corpus.md'),
+      `The corpus is engineer-curated.\n\n\`\`\`supervisor\n${JSON.stringify({ enforce: [{ forbidPath: 'docs/corpus/**' }] })}\n\`\`\`\n`
+    );
+    const hooks = await plugin.server(recordingPluginInput(dir).input);
+    const sessionID = await startSession(hooks, 'curator');
+    await assert.rejects(
+      () => callTool(hooks, sessionID, 'dewey_store_learning', CORPUS_ARGS),
+      /blocked by engineer directive 'no-corpus'/
+    );
+    await hooks.dispose!();
+  });
+});
+
+test('validateAgentOverrides drops a __proto__-keyed entry with a warning', () => {
+  const parsed = validateAgentOverrides(JSON.parse('{"__proto__": {"traceCheck": {"exemptTools": ["x"]}}}'));
+  assert.equal(parsed.warnings.length, 1);
+  assert.match(parsed.warnings[0], /__proto__/);
+  assert.equal(Object.keys(parsed.overrides).length, 0);
+});
+
+test('validateAgentOverrides drops an over-complex glob', () => {
+  const parsed = validateAgentOverrides({ a: { traceCheck: { exemptTools: [`dewey_${'*'.repeat(33)}`] } } });
+  assert.equal(parsed.warnings.length, 1);
+  assert.match(parsed.warnings[0], /complexity bounds/);
+});
+
+test('sanitizeNonGlobalTier strips a guard-unregistering mode only when locked', () => {
+  const unlocked = sanitizeNonGlobalTier({ mode: 'repair-only' }, 'project supervisor config file', false);
+  assert.equal(unlocked.config.mode, 'repair-only');
+  assert.equal(unlocked.warnings.length, 0);
+  const locked = sanitizeNonGlobalTier({ mode: 'repair-only' }, 'project supervisor config file', true);
+  assert.equal(locked.config.mode, undefined);
+  assert.equal(locked.warnings.length, 1);
+  assert.match(locked.warnings[0], /sets mode: "repair-only"; ignored/);
+});

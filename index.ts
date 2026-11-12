@@ -454,6 +454,8 @@ export interface SessionState {
   triggeredDirectives: string[];
   /** Gate keys approved this session (FR-046), deduped so each grant logs once. */
   grantedGates: Set<string>;
+  /** Agent+tool pairs whose trace-check exemption has logged (FR-074), deduped per session. */
+  traceExemptionNotices: Set<string>;
   /**
    * Reasoning-part identities already observed, keyed
    * `sessionID:messageID:partID` (spike 1.1), so duplicate audits are
@@ -517,6 +519,7 @@ function emptySessionState(): SessionState {
     onDemandAuditCount: 0,
     triggeredDirectives: [],
     grantedGates: new Set(),
+    traceExemptionNotices: new Set(),
     seenParts: new Set(),
     pendingAudits: new Map(),
     timeoutFailOpens: 0,
@@ -2188,6 +2191,17 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         };
         verification = runGuard();
         warnBudgetExhausted();
+        // FR-074 (design D6): an applied exemption is observable per call —
+        // logged once per agent+tool pair per session (the FR-046
+        // first-grant precedent), so an engineer reviewing logs can
+        // distinguish a skipped trace check from one that passed on merits.
+        if (
+          exemptReason !== null &&
+          !state.traceExemptionNotices.has(`${state.agent}:${hookInput.tool}`)
+        ) {
+          state.traceExemptionNotices.add(`${state.agent}:${hookInput.tool}`);
+          logger.info(exemptReason);
+        }
         // FR-067 (design D8) + FR-070 (design D4/D5): await-on-miss.
         // A trace block with an in-flight audit continuation means the
         // reasoning that would reference these paths may not have

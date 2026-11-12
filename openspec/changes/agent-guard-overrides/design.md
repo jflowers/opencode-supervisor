@@ -66,7 +66,8 @@ matches any file-mutating builtin — `bash`, `edit`, `write`,
 `patch`, `multiedit`, `apply_patch` — is rejected; that also
 rejects `*` and other catch-alls. An exempt call skips only
 the file-path trace check: reward-hacking (FR-071), directive
-enforcement (FR-028), and approve/review gates still run.
+enforcement (FR-028), the protected-state check (FR-061), and
+approve/review gates still run.
 
 Read-only builtins (`read`, `grep`, `glob`) are not exempted
 by default (#47's open question): their path arguments are
@@ -90,7 +91,10 @@ error-prone, and the global file is the user-controlled tier.
 `blockRewardHacking: false` and
 `requireStepReferenceInTools: false` from the project file
 and plugin options tiers before resolution, with one warning
-per removed key. `true` values pass through. The environment
+per removed key. A `mode: "repair-only"` from those tiers is
+removed the same way — mode selects which hooks register, so a
+committed project config cannot unregister the guards under the
+lock. `true` values pass through. The environment
 and the global file are user-controlled and stay
 authoritative. `lockGuards` from any other tier is ignored
 with a warning (a project cannot lock or unlock itself).
@@ -100,8 +104,11 @@ with a warning (a project cannot lock or unlock itself).
 The identity line adds `lockGuards=<bool>` and, when present,
 `agentOverrides: <names>`. An exempt verdict's reason reads
 "exempt from the file-path trace check for agent '<a>' by
-global agentOverrides". Warnings from D2, D4, and D5 join the
-deferred bootstrap warnings.
+global agentOverrides". An applied exemption logs that reason
+once per agent+tool pair per session (the FR-046 first-grant
+precedent), so a skipped trace check is distinguishable in the
+log from one that passed on merits. Warnings from D2, D4, and
+D5 join the deferred bootstrap warnings.
 
 ## Risks
 

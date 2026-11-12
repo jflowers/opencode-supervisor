@@ -33,4 +33,6 @@
 - [x] 4.1 both runners green: `bun test` and
   `node --test test/*.test.ts`
 - [x] 4.2 docs: README, CHANGELOG, AGENTS.md
-- [ ] 4.3 `/uf.review-council` (runs inside OpenCode; draft PR until then)
+- [ ] 4.3 `/uf.review-council` (runs inside OpenCode; draft PR until
+  then; docs issue #50, website capabilities issue
+  unbound-force/website#412, blog issue #52)

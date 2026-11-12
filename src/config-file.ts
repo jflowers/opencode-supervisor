@@ -6,7 +6,10 @@
  * A file may set any subset of the hook configuration; unknown keys
  * are ignored; a value of the wrong type, or malformed JSON, rejects
  * the whole file with an error string so the caller can skip the
- * tier and warn once. File I/O lives in index.ts
+ * tier and warn once. `agentOverrides` entries are the deliberate
+ * exception (FR-073): a bad entry is dropped with a warning carried
+ * in `ParsedSupervisorConfig.warnings` so one rogue override cannot
+ * reject the rest of the file. File I/O lives in index.ts
  * (`readSupervisorConfigFile`), mirroring the approvals reader;
  * parsing and validation are pure here.
  */

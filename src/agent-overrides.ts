@@ -36,6 +36,22 @@ export const FILE_MUTATING_BUILTINS: readonly string[] = [
 const OVERRIDE_KEYS: readonly string[] = ['traceCheck'];
 const TRACE_CHECK_KEYS: readonly string[] = ['exemptTools'];
 
+/**
+ * Complexity bounds for one exempt-tool glob, mirroring the trace-check
+ * glob compiler (src/tool-guard.ts): a pathological pattern cannot blow
+ * the synchronous regex budget.
+ */
+export const MAX_TOOL_GLOB_LENGTH = 512;
+export const MAX_TOOL_GLOB_WILDCARDS = 32;
+
+const countToolGlobWildcards = (glob: string): number => {
+  let count = 0;
+  for (const ch of glob) {
+    if (ch === '*' || ch === '?') count += 1;
+  }
+  return count;
+};
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
@@ -92,6 +108,11 @@ const validateEntry = (raw: unknown): { override?: AgentOverride; error?: string
     }
     const globs = tools.map((entry) => (entry as string).trim());
     for (const glob of globs) {
+      if (glob.length > MAX_TOOL_GLOB_LENGTH || countToolGlobWildcards(glob) > MAX_TOOL_GLOB_WILDCARDS) {
+        return {
+          error: `"traceCheck.exemptTools" entry exceeds the compiler's complexity bounds (over ${MAX_TOOL_GLOB_LENGTH} characters or ${MAX_TOOL_GLOB_WILDCARDS} wildcards)`,
+        };
+      }
       const hit = FILE_MUTATING_BUILTINS.find((builtin) => compileToolGlob(glob).test(builtin));
       if (hit !== undefined) {
         return {
@@ -119,6 +140,10 @@ export const validateAgentOverrides = (value: unknown): ParsedAgentOverrides => 
   for (const [agent, raw] of Object.entries(value)) {
     if (agent.trim() === '') {
       warnings.push('agentOverrides entry with an empty agent name dropped');
+      continue;
+    }
+    if (agent === '__proto__') {
+      warnings.push('agentOverrides entry keyed "__proto__" dropped');
       continue;
     }
     const { override, error } = validateEntry(raw);
@@ -174,15 +199,16 @@ export const applyGuardLock = <T extends GuardToggles>(
   return { config, warnings };
 };
 
-type NonGlobalTier = GuardToggles & { agentOverrides?: unknown; lockGuards?: unknown };
+type NonGlobalTier = GuardToggles & { agentOverrides?: unknown; lockGuards?: unknown; mode?: unknown };
 
 /**
  * Prepares a lower-trust tier (project file or plugin options) for
  * resolution (FR-073, FR-075; design D4/D5): `agentOverrides` and
  * `lockGuards` are honored only from the global file, so both are
  * removed with a warning, and the guard lock then removes
- * guard-disabling `false` values. Returns a copy; the input is not
- * mutated.
+ * guard-disabling `false` values — and a `mode: "repair-only"` that
+ * would unregister the guards entirely. Returns a copy; the input is
+ * not mutated.
  */
 export const sanitizeNonGlobalTier = <T extends NonGlobalTier>(
   tier: T,
@@ -198,6 +224,10 @@ export const sanitizeNonGlobalTier = <T extends NonGlobalTier>(
   if (config.lockGuards !== undefined) {
     delete config.lockGuards;
     warnings.push(`${tierName} sets lockGuards; ignored — the guard lock is honored only from the global config file`);
+  }
+  if (locked && config.mode === 'repair-only') {
+    delete config.mode;
+    warnings.push(`${tierName} sets mode: "repair-only"; ignored because the global config sets lockGuards: true`);
   }
   const lock = applyGuardLock(config, tierName, locked);
   return { config: lock.config, warnings: [...warnings, ...lock.warnings] };
