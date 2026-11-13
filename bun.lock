@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "opencode-supervisor",
+      "name": "opencode-agent-supervisor",
       "devDependencies": {
         "@opencode-ai/plugin": "^1.19.4",
         "bun-types": "^1.4.4",

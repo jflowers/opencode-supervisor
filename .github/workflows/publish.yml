@@ -1,19 +1,21 @@
 name: Publish
 
-# Publishes to npm when package.json carries a version that is not on npm
-# yet, so a release is a version bump merged to main. Uses npm trusted
-# publishing (OIDC): no npm token is stored in the repository. The package
-# must exist on npm and have this workflow registered as its trusted
-# publisher first; see "Releasing" in README.md.
-
+# Publishes to npm when a version tag is pushed
+# (git tag v2.9.1 && git push origin v2.9.1). The tag must match
+# package.json's version; a version already on npm is skipped.
+#
+# Auth: npm trusted publishing (OIDC). npmjs.com trusts this repository and
+# this workflow file for the package, so no npm token is used; id-token: write
+# below lets the job request the OIDC token. Renaming this file breaks
+# publishing until the trusted publisher on npmjs.com is updated to match.
 on:
   push:
-    branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
-  contents: write # push the release tag
-  id-token: write # npm trusted publishing and provenance
+  contents: read
+  id-token: write
 
 concurrency:
   group: publish
@@ -21,8 +23,11 @@ concurrency:
 
 jobs:
   npm:
+    name: Publish to npm
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
+      # Keep tests from reading a global supervisor config.
       XDG_CONFIG_HOME: ${{ github.workspace }}/.ci-xdg
     steps:
       - uses: actions/checkout@v4
@@ -32,35 +37,37 @@ jobs:
           node-version: "24.x"
           registry-url: https://registry.npmjs.org
 
-      - name: Check whether this version is published
+      - name: Check version
         id: package
         run: |
           NAME=$(node -p "require('./package.json').name")
           VERSION=$(node -p "require('./package.json').version")
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${VERSION}"
+            exit 1
+          fi
           if npm view "${NAME}@${VERSION}" version >/dev/null 2>&1; then
             echo "published=true" >> "$GITHUB_OUTPUT"
-            echo "${NAME}@${VERSION} is already on npm."
+            echo "${NAME}@${VERSION} is already on npm; nothing to do."
           else
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
 
       - if: steps.package.outputs.published == 'false'
         run: bun install --frozen-lockfile
-      - if: steps.package.outputs.published == 'false'
+      - name: Typecheck
+        if: steps.package.outputs.published == 'false'
         run: bun run typecheck
-      - if: steps.package.outputs.published == 'false'
+      - name: Test (Bun)
+        if: steps.package.outputs.published == 'false'
         run: bun test
-      - if: steps.package.outputs.published == 'false'
+      - name: Test (Node)
+        if: steps.package.outputs.published == 'false'
         run: npm run test:node
+      - name: Verify package
+        if: steps.package.outputs.published == 'false'
+        run: npm run verify:package
 
       - name: Publish
         if: steps.package.outputs.published == 'false'
-        run: npx --yes npm@11 publish --provenance --access public
-
-      - name: Tag the release
-        if: steps.package.outputs.published == 'false'
-        run: |
-          TAG="v${{ steps.package.outputs.version }}"
-          git tag "$TAG"
-          git push origin "$TAG"
+        run: npx --yes --package npm@11 npm publish --access public --provenance --ignore-scripts
