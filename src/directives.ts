@@ -94,6 +94,12 @@ export const MAX_DIRECTIVES = 20;
 export const MAX_DIRECTIVE_TEXT = 1000;
 export const MAX_RULES_PER_DIRECTIVE = 10;
 export const MAX_DIRECTIVES_RENDER_BUDGET = 4000;
+/**
+ * Read-time cap on directive files (FR-079): the loader reads at most
+ * this many `.md` files in name order and never parses the rest. Set
+ * above MAX_DIRECTIVES so a few malformed files cannot starve the set.
+ */
+export const MAX_DIRECTIVE_FILES = 25;
 
 const FENCE_PATTERN = /```supervisor\r?\n([\s\S]*?)```/;
 
@@ -115,106 +121,45 @@ interface RawRules {
   repair?: unknown;
 }
 
-const normalizeEnforcementRules = (
-  raw: unknown
-): { rules: EnforcementRule[]; dropped: number } => {
-  if (raw === undefined || raw === null) return { rules: [], dropped: 0 };
-  if (!Array.isArray(raw)) return { rules: [], dropped: 1 };
-  const rules: EnforcementRule[] = [];
-  let dropped = 0;
-  for (const entry of raw.slice(0, MAX_RULES_PER_DIRECTIVE)) {
-    if (typeof entry !== 'object' || entry === null) {
-      dropped += 1;
-      continue;
-    }
-    const record = entry as Record<string, unknown>;
-    const rule: EnforcementRule = {};
-    if (typeof record.forbidPath === 'string' && record.forbidPath.trim().length > 0) {
-      rule.forbidPath = record.forbidPath.trim();
-    }
-    if (typeof record.forbidPattern === 'string' && record.forbidPattern.trim().length > 0) {
-      rule.forbidPattern = record.forbidPattern.trim();
-    }
-    if (rule.forbidPath === undefined && rule.forbidPattern === undefined) {
-      dropped += 1;
-      continue;
-    }
-    rules.push(rule);
-  }
-  if (raw.length > MAX_RULES_PER_DIRECTIVE) {
-    dropped += raw.length - MAX_RULES_PER_DIRECTIVE;
-  }
-  return { rules, dropped };
-};
+/** Normalized rules of one kind plus the count of entries dropped. */
+interface NormalizedRules<T> {
+  rules: T[];
+  dropped: number;
+}
 
-const normalizeTriggerRules = (
-  raw: unknown
-): { rules: TriggerRule[]; dropped: number } => {
-  if (raw === undefined || raw === null) return { rules: [], dropped: 0 };
-  if (!Array.isArray(raw)) return { rules: [], dropped: 1 };
-  const rules: TriggerRule[] = [];
-  let dropped = 0;
-  for (const entry of raw.slice(0, MAX_RULES_PER_DIRECTIVE)) {
-    if (typeof entry !== 'object' || entry === null) {
-      dropped += 1;
-      continue;
-    }
-    const record = entry as Record<string, unknown>;
-    const rule: TriggerRule = {};
-    if (typeof record.tool === 'string' && record.tool.trim().length > 0) {
-      rule.tool = record.tool.trim();
-    }
-    if (typeof record.path === 'string' && record.path.trim().length > 0) {
-      rule.path = record.path.trim();
-    }
-    if (rule.tool === undefined && rule.path === undefined) {
-      dropped += 1;
-      continue;
-    }
-    rules.push(rule);
-  }
-  if (raw.length > MAX_RULES_PER_DIRECTIVE) {
-    dropped += raw.length - MAX_RULES_PER_DIRECTIVE;
-  }
-  return { rules, dropped };
+/** A trimmed non-empty string field of a raw rule record, or undefined. */
+const trimmedField = (record: Record<string, unknown>, key: string): string | undefined => {
+  const value = record[key];
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
 };
 
 /**
- * Normalize `approve` gate rules (FR-043, design D7): strings are
- * trimmed; a rule needs at least one of tool/path/pattern (an empty
- * rule would match every call) and is dropped otherwise.
+ * Generic rule-list normalizer (FR-032, design D8 of the
+ * advisory-sweep change): absent input is no rules; a non-array
+ * counts as one dropped entry; at most MAX_RULES_PER_DIRECTIVE
+ * entries are considered and the overflow counts as dropped; a
+ * non-object entry, or one `toRule` rejects with null, is dropped.
+ * Each rule kind supplies only its per-entry mapping.
+ *
+ * @param raw The raw rule list from a fence or options entry.
+ * @param toRule Maps one raw record to a rule, or null to drop it.
+ * @returns The kept rules and the dropped count.
  */
-const normalizeApproveRules = (
-  raw: unknown
-): { rules: ApproveRule[]; dropped: number } => {
+const normalizeRules = <T>(
+  raw: unknown,
+  toRule: (record: Record<string, unknown>) => T | null
+): NormalizedRules<T> => {
   if (raw === undefined || raw === null) return { rules: [], dropped: 0 };
   if (!Array.isArray(raw)) return { rules: [], dropped: 1 };
-  const rules: ApproveRule[] = [];
+  const rules: T[] = [];
   let dropped = 0;
   for (const entry of raw.slice(0, MAX_RULES_PER_DIRECTIVE)) {
-    if (typeof entry !== 'object' || entry === null) {
+    const rule = typeof entry === 'object' && entry !== null ? toRule(entry as Record<string, unknown>) : null;
+    if (rule === null) {
       dropped += 1;
-      continue;
+    } else {
+      rules.push(rule);
     }
-    const record = entry as Record<string, unknown>;
-    const rule: ApproveRule = {};
-    if (typeof record.id === 'string' && record.id.trim().length > 0) {
-      rule.id = record.id.trim();
-    }
-    if (typeof record.tool === 'string' && record.tool.trim().length > 0) {
-      rule.tool = record.tool.trim();
-    }
-    if (typeof record.path === 'string' && record.path.trim().length > 0) {
-      rule.path = record.path.trim();
-    }
-    if (typeof record.pattern === 'string' && record.pattern.trim().length > 0) {
-      rule.pattern = record.pattern.trim();
-    }
-    if (rule.tool === undefined && rule.path === undefined && rule.pattern === undefined) {
-      dropped += 1;
-      continue;
-    }
-    rules.push(rule);
   }
   if (raw.length > MAX_RULES_PER_DIRECTIVE) {
     dropped += raw.length - MAX_RULES_PER_DIRECTIVE;
@@ -222,64 +167,114 @@ const normalizeApproveRules = (
   return { rules, dropped };
 };
 
-/**
- * Normalize `review` gate rules (FR-047, design D7): a rule is a
- * path glob and nothing else — a review rule without a path is
- * meaningless and is dropped.
- */
-const normalizeReviewRules = (
-  raw: unknown
-): { rules: ReviewRule[]; dropped: number } => {
-  if (raw === undefined || raw === null) return { rules: [], dropped: 0 };
-  if (!Array.isArray(raw)) return { rules: [], dropped: 1 };
-  const rules: ReviewRule[] = [];
-  let dropped = 0;
-  for (const entry of raw.slice(0, MAX_RULES_PER_DIRECTIVE)) {
-    if (typeof entry !== 'object' || entry === null) {
-      dropped += 1;
-      continue;
-    }
-    const record = entry as Record<string, unknown>;
-    if (typeof record.path !== 'string' || record.path.trim().length === 0) {
-      dropped += 1;
-      continue;
-    }
-    rules.push({ path: record.path.trim() });
-  }
-  if (raw.length > MAX_RULES_PER_DIRECTIVE) {
-    dropped += raw.length - MAX_RULES_PER_DIRECTIVE;
-  }
-  return { rules, dropped };
+/** `enforce` entries need a forbidPath or a forbidPattern (FR-028). */
+const toEnforcementRule = (record: Record<string, unknown>): EnforcementRule | null => {
+  const forbidPath = trimmedField(record, 'forbidPath');
+  const forbidPattern = trimmedField(record, 'forbidPattern');
+  if (forbidPath === undefined && forbidPattern === undefined) return null;
+  return {
+    ...(forbidPath !== undefined ? { forbidPath } : {}),
+    ...(forbidPattern !== undefined ? { forbidPattern } : {}),
+  };
+};
+
+/** `when` entries need a tool or a path (FR-029). */
+const toTriggerRule = (record: Record<string, unknown>): TriggerRule | null => {
+  const tool = trimmedField(record, 'tool');
+  const path = trimmedField(record, 'path');
+  if (tool === undefined && path === undefined) return null;
+  return { ...(tool !== undefined ? { tool } : {}), ...(path !== undefined ? { path } : {}) };
 };
 
 /**
- * Normalize `repair` scope rules: a rule is a tool name or glob and
- * nothing else — a repair rule without a tool is meaningless and is
- * dropped.
+ * `approve` entries (FR-043, design D7): a rule needs at least one
+ * of tool/path/pattern — an empty rule would match every call.
  */
-const normalizeRepairRules = (
-  raw: unknown
-): { rules: RepairRule[]; dropped: number } => {
-  if (raw === undefined || raw === null) return { rules: [], dropped: 0 };
-  if (!Array.isArray(raw)) return { rules: [], dropped: 1 };
-  const rules: RepairRule[] = [];
-  let dropped = 0;
-  for (const entry of raw.slice(0, MAX_RULES_PER_DIRECTIVE)) {
-    if (typeof entry !== 'object' || entry === null) {
-      dropped += 1;
-      continue;
-    }
-    const record = entry as Record<string, unknown>;
-    if (typeof record.tool !== 'string' || record.tool.trim().length === 0) {
-      dropped += 1;
-      continue;
-    }
-    rules.push({ tool: record.tool.trim() });
+const toApproveRule = (record: Record<string, unknown>): ApproveRule | null => {
+  const id = trimmedField(record, 'id');
+  const tool = trimmedField(record, 'tool');
+  const path = trimmedField(record, 'path');
+  const pattern = trimmedField(record, 'pattern');
+  if (tool === undefined && path === undefined && pattern === undefined) return null;
+  return {
+    ...(id !== undefined ? { id } : {}),
+    ...(tool !== undefined ? { tool } : {}),
+    ...(path !== undefined ? { path } : {}),
+    ...(pattern !== undefined ? { pattern } : {}),
+  };
+};
+
+/** `review` entries (FR-047, design D7) are a path glob and nothing else. */
+const toReviewRule = (record: Record<string, unknown>): ReviewRule | null => {
+  const path = trimmedField(record, 'path');
+  return path === undefined ? null : { path };
+};
+
+/** `repair` entries are a tool name or glob and nothing else. */
+const toRepairRule = (record: Record<string, unknown>): RepairRule | null => {
+  const tool = trimmedField(record, 'tool');
+  return tool === undefined ? null : { tool };
+};
+
+/**
+ * Shared build step for file and options directives (design D8):
+ * truncates the advisory text with a warning, normalizes the five
+ * rule kinds, records one warning per kind that dropped entries,
+ * and returns null for a directive with neither text nor rules —
+ * the caller emits its own source-specific skip warning.
+ *
+ * @param id The directive id.
+ * @param rawText The trimmed advisory text, before truncation.
+ * @param rawRules The raw rule lists keyed by kind.
+ * @param warnings The warning list to append to.
+ * @returns The directive, or null when it carries nothing.
+ */
+const buildDirective = (
+  id: string,
+  rawText: string,
+  rawRules: RawRules,
+  warnings: string[]
+): Directive | null => {
+  if (rawText.length > MAX_DIRECTIVE_TEXT) {
+    warnings.push(
+      `directive '${id}' advisory text truncated from ${rawText.length} to ${MAX_DIRECTIVE_TEXT} characters`
+    );
   }
-  if (raw.length > MAX_RULES_PER_DIRECTIVE) {
-    dropped += raw.length - MAX_RULES_PER_DIRECTIVE;
+  const text = rawText.slice(0, MAX_DIRECTIVE_TEXT);
+  const kinds = {
+    enforce: normalizeRules(rawRules.enforce, toEnforcementRule),
+    when: normalizeRules(rawRules.when, toTriggerRule),
+    approve: normalizeRules(rawRules.approve, toApproveRule),
+    review: normalizeRules(rawRules.review, toReviewRule),
+    repair: normalizeRules(rawRules.repair, toRepairRule),
+  };
+  for (const [kind, normalized] of Object.entries(kinds)) {
+    if (normalized.dropped > 0) {
+      warnings.push(
+        `directive '${id}': ${normalized.dropped} ${kind} rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
+      );
+    }
   }
-  return { rules, dropped };
+  const { enforce, when, approve, review, repair } = kinds;
+  if (
+    !text &&
+    enforce.rules.length === 0 &&
+    when.rules.length === 0 &&
+    approve.rules.length === 0 &&
+    review.rules.length === 0 &&
+    repair.rules.length === 0
+  ) {
+    return null;
+  }
+  return {
+    id,
+    text,
+    ...(enforce.rules.length > 0 ? { enforce: enforce.rules } : {}),
+    ...(when.rules.length > 0 ? { when: when.rules } : {}),
+    ...(approve.rules.length > 0 ? { approve: approve.rules } : {}),
+    ...(review.rules.length > 0 ? { review: review.rules } : {}),
+    ...(repair.rules.length > 0 ? { repair: repair.rules } : {}),
+  };
 };
 
 /**
@@ -287,6 +282,9 @@ const normalizeRepairRules = (
  * is the advisory text; the first ```supervisor-fenced block holds a
  * JSON rules object. The file id is the filename without `.md`.
  * Malformed files are skipped with a warning (fail-open).
+ *
+ * @param files The directive files read by the loader.
+ * @returns The parsed directives and the load warnings.
  */
 export const parseDirectives = (files: DirectiveFile[]): ParseDirectivesResult => {
   const directives: Directive[] = [];
@@ -318,65 +316,14 @@ export const parseDirectives = (files: DirectiveFile[]): ParseDirectivesResult =
       rawRules = parsed as RawRules;
       text = file.content.replace(FENCE_PATTERN, '');
     }
-    const trimmedText = text.trim();
-    if (trimmedText.length > MAX_DIRECTIVE_TEXT) {
-      warnings.push(
-        `directive '${id}' advisory text truncated from ${trimmedText.length} to ${MAX_DIRECTIVE_TEXT} characters`
-      );
-    }
-    const trimmed = trimmedText.slice(0, MAX_DIRECTIVE_TEXT);
-    const enforce = normalizeEnforcementRules(rawRules.enforce);
-    const when = normalizeTriggerRules(rawRules.when);
-    const approve = normalizeApproveRules(rawRules.approve);
-    const review = normalizeReviewRules(rawRules.review);
-    const repair = normalizeRepairRules(rawRules.repair);
-    if (enforce.dropped > 0) {
-      warnings.push(
-        `directive '${id}': ${enforce.dropped} enforce rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
-      );
-    }
-    if (when.dropped > 0) {
-      warnings.push(
-        `directive '${id}': ${when.dropped} when rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
-      );
-    }
-    if (approve.dropped > 0) {
-      warnings.push(
-        `directive '${id}': ${approve.dropped} approve rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
-      );
-    }
-    if (review.dropped > 0) {
-      warnings.push(
-        `directive '${id}': ${review.dropped} review rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
-      );
-    }
-    if (repair.dropped > 0) {
-      warnings.push(
-        `directive '${id}': ${repair.dropped} repair rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
-      );
-    }
-    if (
-      !trimmed &&
-      enforce.rules.length === 0 &&
-      when.rules.length === 0 &&
-      approve.rules.length === 0 &&
-      review.rules.length === 0 &&
-      repair.rules.length === 0
-    ) {
+    const directive = buildDirective(id, text.trim(), rawRules, warnings);
+    if (directive === null) {
       warnings.push(
         `directive file '${file.name}' has neither advisory text nor rules; file skipped`
       );
       continue;
     }
-    directives.push({
-      id,
-      text: trimmed,
-      ...(enforce.rules.length > 0 ? { enforce: enforce.rules } : {}),
-      ...(when.rules.length > 0 ? { when: when.rules } : {}),
-      ...(approve.rules.length > 0 ? { approve: approve.rules } : {}),
-      ...(review.rules.length > 0 ? { review: review.rules } : {}),
-      ...(repair.rules.length > 0 ? { repair: repair.rules } : {}),
-    });
+    directives.push(directive);
   }
   return { directives, warnings };
 };
@@ -385,6 +332,9 @@ export const parseDirectives = (files: DirectiveFile[]): ParseDirectivesResult =
  * Parse the `options.directives` array from tuple plugin
  * registration (FR-026). Same validation as files; entries without
  * an id get `d<index>`.
+ *
+ * @param raw The `options.directives` value.
+ * @returns The parsed directives and the load warnings.
  */
 export const parseOptionsDirectives = (raw: unknown): ParseDirectivesResult => {
   if (raw === undefined || raw === null) {
@@ -401,70 +351,32 @@ export const parseOptionsDirectives = (raw: unknown): ParseDirectivesResult => {
       return;
     }
     const record = entry as Record<string, unknown>;
-    const id =
-      typeof record.id === 'string' && record.id.trim().length > 0
-        ? record.id.trim()
-        : `d${index + 1}`;
+    const id = trimmedField(record, 'id') ?? `d${index + 1}`;
     const rawText = typeof record.text === 'string' ? record.text.trim() : '';
-    if (rawText.length > MAX_DIRECTIVE_TEXT) {
-      warnings.push(
-        `directive '${id}' advisory text truncated from ${rawText.length} to ${MAX_DIRECTIVE_TEXT} characters`
-      );
-    }
-    const text = rawText.slice(0, MAX_DIRECTIVE_TEXT);
-    const enforce = normalizeEnforcementRules(record.enforce);
-    const when = normalizeTriggerRules(record.when);
-    const approve = normalizeApproveRules(record.approve);
-    const review = normalizeReviewRules(record.review);
-    const repair = normalizeRepairRules(record.repair);
-    if (enforce.dropped > 0) {
-      warnings.push(
-        `directive '${id}': ${enforce.dropped} enforce rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
-      );
-    }
-    if (when.dropped > 0) {
-      warnings.push(
-        `directive '${id}': ${when.dropped} when rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
-      );
-    }
-    if (approve.dropped > 0) {
-      warnings.push(
-        `directive '${id}': ${approve.dropped} approve rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
-      );
-    }
-    if (review.dropped > 0) {
-      warnings.push(
-        `directive '${id}': ${review.dropped} review rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
-      );
-    }
-    if (repair.dropped > 0) {
-      warnings.push(
-        `directive '${id}': ${repair.dropped} repair rule(s) skipped (invalid or beyond the cap of ${MAX_RULES_PER_DIRECTIVE})`
-      );
-    }
-    if (
-      !text &&
-      enforce.rules.length === 0 &&
-      when.rules.length === 0 &&
-      approve.rules.length === 0 &&
-      review.rules.length === 0 &&
-      repair.rules.length === 0
-    ) {
+    const directive = buildDirective(id, rawText, record as RawRules, warnings);
+    if (directive === null) {
       warnings.push(`options.directives[${index}] ('${id}') has neither text nor rules; skipped`);
       return;
     }
-    directives.push({
-      id,
-      text,
-      ...(enforce.rules.length > 0 ? { enforce: enforce.rules } : {}),
-      ...(when.rules.length > 0 ? { when: when.rules } : {}),
-      ...(approve.rules.length > 0 ? { approve: approve.rules } : {}),
-      ...(review.rules.length > 0 ? { review: review.rules } : {}),
-      ...(repair.rules.length > 0 ? { repair: repair.rules } : {}),
-    });
+    directives.push(directive);
   });
   return { directives, warnings };
 };
+
+/**
+ * Renders the loaded directives with their sources for the identity
+ * log line (FR-079): `<id> (<id>.md)` for a file directive — the
+ * loader reads only `.md` files and the id is the name without the
+ * extension — and `<id> (options)` for a tuple-registered one.
+ *
+ * @param loaded The directives in effect, after the count cap.
+ * @param fromFiles The directives parsed from files (identity compared).
+ * @returns The comma-separated provenance list, or '' when none loaded.
+ */
+export const describeDirectiveSources = (loaded: Directive[], fromFiles: Directive[]): string =>
+  loaded
+    .map((directive) => `${directive.id} (${fromFiles.includes(directive) ? `${directive.id}.md` : 'options'})`)
+    .join(', ');
 
 /**
  * Compile a glob to an anchored RegExp (design D4): a `**` segment
@@ -532,6 +444,64 @@ export function extractPolicyPaths(args: Record<string, unknown> | undefined): s
     .filter((v): v is string => typeof v === 'string')
     .flatMap((v) => v.match(POLICY_PATH_PATTERN) || []);
 }
+
+/** Nesting depth below the top-level arguments that directive matching reads (FR-079). */
+export const MAX_NESTED_ARG_DEPTH = 4;
+
+/** Cap on string values collected from one call's arguments for directive matching (FR-079). */
+export const MAX_NESTED_ARG_STRINGS = 256;
+
+/**
+ * Extracts directive path candidates from tool arguments (FR-079):
+ * the `extractPolicyPaths` pattern applied to every string value
+ * reachable through arrays and plain objects — so `edits[0].filePath`
+ * is seen — bounded at MAX_NESTED_ARG_DEPTH levels below the top and
+ * MAX_NESTED_ARG_STRINGS values. Feeds `forbidPath` enforcement and
+ * `when` triggers only; the protected-state lens and the FR-071 scan
+ * keep the top-level `extractPolicyPaths`.
+ *
+ * @param args The tool-call arguments.
+ * @returns The path candidates, in argument order.
+ */
+export function extractDirectivePaths(args: Record<string, unknown> | undefined): string[] {
+  const strings: string[] = [];
+  const visit = (value: unknown, depth: number): void => {
+    if (strings.length >= MAX_NESTED_ARG_STRINGS) return;
+    if (typeof value === 'string') {
+      strings.push(value);
+      return;
+    }
+    if (depth > MAX_NESTED_ARG_DEPTH || typeof value !== 'object' || value === null) return;
+    for (const child of Array.isArray(value) ? value : Object.values(value)) {
+      visit(child, depth + 1);
+    }
+  };
+  visit(args ?? {}, 0);
+  return strings.flatMap((value) => value.match(POLICY_PATH_PATTERN) || []);
+}
+
+/**
+ * Matches a compiled directive glob against path candidates (FR-079):
+ * a candidate matches when the glob matches the whole candidate or
+ * any suffix starting after a `/` — so `./secrets/token`,
+ * `~/secrets/token`, and `/abs/proj/secrets/token` all match
+ * `secrets/**`, and the basename (the shortest suffix) keeps
+ * `.env*` matching anywhere. Suffixes never start with `/`, so a
+ * glob written with a leading `/` matches whole candidates only.
+ *
+ * @param regex A glob compiled by `globToRegExp`.
+ * @param paths The path candidates of one tool call.
+ * @returns The first matching candidate, or undefined.
+ */
+export const matchesPaths = (regex: RegExp, paths: string[]): string | undefined =>
+  paths.find((candidate) => {
+    if (regex.test(candidate)) return true;
+    for (let slash = candidate.indexOf('/'); slash !== -1; slash = candidate.indexOf('/', slash + 1)) {
+      const suffix = candidate.slice(slash + 1);
+      if (suffix !== '' && regex.test(suffix)) return true;
+    }
+    return false;
+  });
 
 /**
  * Compile enforcement rules for the tool guard (FR-028). Invalid
@@ -613,9 +583,9 @@ export interface EnforcementVerdict {
 
 /**
  * Evaluate compiled enforcement against a tool call (FR-028).
- * Paths match case-insensitively on the full path or the basename;
- * patterns match the raw serialized arguments, case-insensitively.
- * An empty rule set
+ * Paths match case-insensitively on the whole path or any
+ * slash-boundary suffix (`matchesPaths`, FR-079); patterns match the
+ * raw serialized arguments, case-insensitively. An empty rule set
  * never blocks. Block reasons name the directive, the match, and
  * the advisory text so the model can correct course (FR-012).
  */
@@ -626,16 +596,14 @@ export const evaluateEnforcement = (
   argPaths: string[]
 ): EnforcementVerdict => {
   for (const rule of enforcement.forbidPaths) {
-    for (const path of argPaths) {
-      const basename = path.split('/').pop() ?? path;
-      if (rule.regex.test(path) || rule.regex.test(basename)) {
-        return {
-          allowed: false,
-          reason:
-            `Tool '${toolName}' blocked by engineer directive '${rule.directiveId}': ` +
-            `arguments touch forbidden path '${path}' (glob '${rule.glob}'). ${rule.text}`,
-        };
-      }
+    const path = matchesPaths(rule.regex, argPaths);
+    if (path !== undefined) {
+      return {
+        allowed: false,
+        reason:
+          `Tool '${toolName}' blocked by engineer directive '${rule.directiveId}': ` +
+          `arguments touch forbidden path '${path}' (glob '${rule.glob}'). ${rule.text}`,
+      };
     }
   }
   for (const rule of enforcement.forbidPatterns) {
@@ -651,37 +619,64 @@ export const evaluateEnforcement = (
   return { allowed: true, reason: '' };
 };
 
+/** One compiled `when` rule: a lowercased tool name and/or a compiled path glob. */
+export interface CompiledTriggerRule {
+  tool?: string;
+  pathRegex?: RegExp;
+}
+
+/** The compiled `when` rules of one conditioned directive (FR-029). */
+export interface CompiledTrigger {
+  directiveId: string;
+  rules: CompiledTriggerRule[];
+}
+
+/**
+ * Compile `when` rules once at server start (FR-029): tool names are
+ * lowercased and path globs compiled, so `matchTriggers` does no glob
+ * compilation on the guarded-call hot path. Directives without `when`
+ * rules are omitted — they are always active.
+ *
+ * @param directives The loaded directive set.
+ * @returns The compiled triggers, in directive order.
+ */
+export const compileTriggers = (directives: Directive[]): CompiledTrigger[] =>
+  directives
+    .filter((directive) => (directive.when ?? []).length > 0)
+    .map((directive) => ({
+      directiveId: directive.id,
+      rules: (directive.when ?? []).map((rule) => ({
+        ...(rule.tool !== undefined ? { tool: rule.tool.toLowerCase() } : {}),
+        ...(rule.path !== undefined ? { pathRegex: globToRegExp(rule.path) } : {}),
+      })),
+    }));
+
 /**
  * Return the ids of directives whose `when` rules match the tool
- * call (FR-029): tool names compare case-insensitively; path globs
- * match any extracted argument path on the full path or basename,
- * case-insensitively. Directives without `when` rules never trigger
- * here — they are always active.
+ * call (FR-029): a rule matches when its tool name equals the call's
+ * case-insensitively, or its path glob matches an argument path on
+ * the whole path or a slash-boundary suffix (`matchesPaths`, FR-079).
+ *
+ * @param triggers Output of {@link compileTriggers}.
+ * @param toolName The tool being invoked.
+ * @param argPaths Path candidates from `extractDirectivePaths`.
+ * @returns The triggered directive ids, in directive order.
  */
 export const matchTriggers = (
-  directives: Directive[],
+  triggers: CompiledTrigger[],
   toolName: string,
   argPaths: string[]
 ): string[] => {
   const lowerTool = toolName.toLowerCase();
-  return directives
-    .filter((directive) => {
-      const rules = directive.when ?? [];
-      return rules.some((rule) => {
-        if (rule.tool !== undefined && rule.tool.toLowerCase() === lowerTool) {
-          return true;
-        }
-        if (rule.path !== undefined) {
-          const regex = globToRegExp(rule.path);
-          return argPaths.some((path) => {
-            const basename = path.split('/').pop() ?? path;
-            return regex.test(path) || regex.test(basename);
-          });
-        }
-        return false;
-      });
-    })
-    .map((directive) => directive.id);
+  return triggers
+    .filter((trigger) =>
+      trigger.rules.some(
+        (rule) =>
+          rule.tool === lowerTool ||
+          (rule.pathRegex !== undefined && matchesPaths(rule.pathRegex, argPaths) !== undefined)
+      )
+    )
+    .map((trigger) => trigger.directiveId);
 };
 
 /**
