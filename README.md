@@ -63,49 +63,95 @@ plan steps that contradict earlier constraints.
 
 ## 3. Quickstart
 
+Requires OpenCode **1.19.0** or later.
+
+### 3.1 Install for yourself
+
 ```bash
-git clone https://github.com/jflowers/opencode-supervisor.git
-cd opencode-supervisor
-bun install        # the plugin entry imports @opencode-ai/plugin
+opencode plugin @jflowers/opencode-supervisor@2.9.0 --global
 ```
 
-Register the plugin through one of OpenCode's three real mechanisms:
+OpenCode downloads the package and adds it to the `plugin` array of
+your global config (`~/.config/opencode/opencode.jsonc`). Without
+`--global`, it goes into the current project's `.opencode/opencode.json`.
+Start `opencode`; the server log shows the supervisor's identity line
+(Section 7).
 
-**Option A — project config `plugin` array** (this repository's own
-pattern). Add the entry to the `opencode.json` of the project OpenCode
-runs in:
+### 3.2 Install for a team
+
+Commit the entry to the project's `opencode.json` so everyone who opens
+the repository runs the same supervisor version:
 
 ```json
 {
-  "plugin": [
-    "./index.ts"
-  ]
+  "plugin": ["@jflowers/opencode-supervisor@2.9.0"]
 }
 ```
 
-Relative specs resolve against the config file's directory. From a
-different project, use an absolute path to this repository's
-`index.ts`.
+Upgrading is then a reviewed change to that line. Shared settings can
+live in `.opencode/supervisor/config.json` and directives in
+`.opencode/supervisor/directives/` (Section 6). To keep a project from
+turning the guards off, each engineer sets `lockGuards: true` in their
+global config file (Section 7.2).
 
-**Option B — the `opencode plugin` command**:
+### 3.3 Pin a version, and how to upgrade
+
+Always name a version. OpenCode caches each npm plugin under
+`~/.cache/opencode/packages/<spec>/` and never refreshes a cached
+entry, so a bare name or `@latest` stays on whichever version was
+current at first install. To upgrade, change the version in the
+`plugin` entry (or run `opencode plugin @jflowers/opencode-supervisor@<new> --global --force`)
+and restart OpenCode. Releases are listed in [CHANGELOG.md](CHANGELOG.md).
+
+### 3.4 Run from a clone (development)
 
 ```bash
-opencode plugin /absolute/path/to/opencode-supervisor
+git clone https://github.com/jflowers/opencode-supervisor.git
+cd opencode-supervisor
+bun install
 ```
 
-Registers in the current project's `.opencode/opencode.json`
-(`--global` for the global config). Pass an absolute path: a relative
-spec is written verbatim, then resolves against `.opencode/`, where it
-points nowhere and is silently dropped.
+Then point OpenCode at the checkout:
 
-**Option C — auto-discovery**. OpenCode loads every `*.ts` / `*.js`
-file directly under a `plugin/` or `plugins/` directory in a config
-directory. Use a symlink, not a copy: the entry imports `./src/*`, and
-a copy would lose those relative imports.
+- **`plugin` array** — add the absolute path to this repository's
+  `index.ts` to any `opencode.json` (inside this repository,
+  `"./index.ts"` works: relative entries resolve against the config
+  file's directory).
+- **`opencode plugin` command** — `opencode plugin /absolute/path/to/opencode-supervisor`
+  (`--global` for the global config). Pass an absolute path: a relative
+  one is written verbatim, then resolves against `.opencode/`, where it
+  points nowhere and is silently dropped.
+- **Auto-discovery** — OpenCode loads every `*.ts` / `*.js` file
+  directly under a `plugin/` or `plugins/` directory in a config
+  directory. Use a symlink, not a copy: the entry imports `./src/*`,
+  and a copy would lose those relative imports.
 
-Start `opencode` in the project; verify an install with `bun test`
-(Node 22+: `npm run test:node`). Prefer no middleware? See
-[Section 8](#8-middleware-or-skill).
+Local paths skip OpenCode's version check and pick up changes on
+restart. Run the tests with `bun test` (Node 22.18+:
+`npm run test:node`) and the typecheck with `bun run typecheck`.
+Prefer no middleware? See [Section 8](#8-middleware-or-skill).
+
+### 3.5 Releasing
+
+A release is a version bump merged to `main`: the Publish workflow
+publishes any `package.json` version not yet on npm, with provenance,
+then pushes a `v<version>` tag. It authenticates through npm trusted
+publishing, so the repository stores no npm token. Bump `version` in
+`package.json`, move the CHANGELOG's Unreleased entries under the new
+version, and update the version in the install commands above.
+
+The first release is manual, because npm can only register a trusted
+publisher for a package that exists:
+
+```bash
+npm login
+npm run typecheck && npm run verify:package
+npm publish --access public
+```
+
+Then, on npmjs.com, open the package's settings and add a trusted
+publisher: GitHub Actions, repository `jflowers/opencode-supervisor`,
+workflow `publish.yml`.
 
 ---
 

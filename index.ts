@@ -187,7 +187,7 @@ export const pluginConfig: HookConfig = {
  * build. `package.json` cannot be imported from here without a build
  * step, so the constant is the source of truth for the log prefix.
  */
-export const PLUGIN_VERSION = '2.8.0';
+export const PLUGIN_VERSION = '2.9.0';
 
 /**
  * Log-identity state (FR-055): the module-identity line is emitted
@@ -1917,11 +1917,11 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
       return '';
     }
     return message.parts
-      .filter(
-        (part) =>
-          (part?.type === 'reasoning' || part?.type === 'text') && typeof part.text === 'string' && part.text !== ''
+      .flatMap((part) =>
+        (part?.type === 'reasoning' || part?.type === 'text') && typeof part.text === 'string' && part.text !== ''
+          ? [part.text]
+          : []
       )
-      .map((part) => part.text)
       .join('\n\n');
   };
 

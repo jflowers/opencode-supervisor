@@ -1,0 +1,66 @@
+name: Publish
+
+# Publishes to npm when package.json carries a version that is not on npm
+# yet, so a release is a version bump merged to main. Uses npm trusted
+# publishing (OIDC): no npm token is stored in the repository. The package
+# must exist on npm and have this workflow registered as its trusted
+# publisher first; see "Releasing" in README.md.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write # push the release tag
+  id-token: write # npm trusted publishing and provenance
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  npm:
+    runs-on: ubuntu-latest
+    env:
+      XDG_CONFIG_HOME: ${{ github.workspace }}/.ci-xdg
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.x"
+          registry-url: https://registry.npmjs.org
+
+      - name: Check whether this version is published
+        id: package
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          if npm view "${NAME}@${VERSION}" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "${NAME}@${VERSION} is already on npm."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.package.outputs.published == 'false'
+        run: bun install --frozen-lockfile
+      - if: steps.package.outputs.published == 'false'
+        run: bun run typecheck
+      - if: steps.package.outputs.published == 'false'
+        run: bun test
+      - if: steps.package.outputs.published == 'false'
+        run: npm run test:node
+
+      - name: Publish
+        if: steps.package.outputs.published == 'false'
+        run: npx --yes npm@11 publish --provenance --access public
+
+      - name: Tag the release
+        if: steps.package.outputs.published == 'false'
+        run: |
+          TAG="v${{ steps.package.outputs.version }}"
+          git tag "$TAG"
+          git push origin "$TAG"

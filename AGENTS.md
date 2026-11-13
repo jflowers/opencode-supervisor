@@ -21,14 +21,25 @@ bun test
 # Test (Node 22+)
 node --test test/audit.test.ts test/memo.test.ts test/reminders.test.ts test/directives.test.ts test/console.test.ts test/gates.test.ts test/plugin-log.test.ts test/config-file.test.ts test/arg-repair.test.ts test/guard-profiles.test.ts
 
+# Typecheck (plugin source; tests are not yet type-clean)
+bun run typecheck
+
+# Check the npm tarball contents
+npm run verify:package
+
 # Register the plugin with OpenCode (local development)
 # Either add "./index.ts" to the "plugin" array in opencode.json, or:
 opencode plugin "$(pwd)"
 ```
 
-- No build step: OpenCode executes the TypeScript directly.
+- No build step: OpenCode executes the TypeScript directly, and the npm
+  package ships the `.ts` sources (`exports["./server"]` is `./index.ts`).
+- Published to npm as `@jflowers/opencode-supervisor`. A release is a
+  `package.json` version bump merged to `main`; `.github/workflows/publish.yml`
+  publishes unpublished versions through npm trusted publishing and tags them.
+- CI (`.github/workflows/ci.yml`) runs the typecheck, both test runners,
+  and the package check on pull requests and pushes to `main`.
 - No lint step is configured; match existing code style.
-- No CI workflows are defined in this repository.
 
 ## Project Structure
 
