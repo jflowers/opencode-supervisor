@@ -1,0 +1,19 @@
+schema: spec-driven
+created: 2026-11-13
+originating_issue: 55
+goal: Close the open review-council advisories from #9, #13, #17, and #22 — honest console results at cap 0, a request_audit focus cap, anchoring-proof directive path matching with load provenance, and the listed code-hygiene refactors
+affected_areas:
+  - index.ts
+  - src/memo.ts
+  - src/console.ts
+  - src/reminders.ts
+  - src/records.ts
+  - src/plugin-id.ts
+  - src/directives.ts
+  - src/tool-guard.ts
+  - src/auditor.ts
+  - src/plugin-log.ts
+  - test/
+  - README.md
+  - CHANGELOG.md
+  - AGENTS.md
