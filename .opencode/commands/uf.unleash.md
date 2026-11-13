@@ -684,7 +684,11 @@ sections instead of embedding their text.
    counts summary — `dispatch_review_runs: <status>
    (correlation_id <id>) — <completed> completed, <failed>
    failed, <skipped> skipped, <findings> findings, <proposals>
-   proposals`. Capture the `correlation_id` reported in that
+   proposals`. A non-ok summary also ends with ` — error:
+   <message> (retryable: <bool>)`, the failure message collapsed
+   to one line and cut to at most 512 characters including the
+   ellipsis, the retryable marker omitted when unknown. Capture
+   the `correlation_id` reported in that
    one-line summary and pass it as `correlation_id` on every
    subsequent consolidation call for this dispatch. Step 4
    and Step 6 are separate dispatches with separate
@@ -707,12 +711,39 @@ sections instead of embedding their text.
 
 **Processing results**:
 
-- If the verdict is APPROVE or APPROVE WITH ADVISORIES:
-  record any advisories for the final report and
-  proceed to Step 5 (Implement) — approving verdicts
-  never trigger the decision gate below.
+- Read the authoritative full data once from the persisted
+  artifact through `read_dispatch_artifact` (never the
+  file-read tool, whose line limit cuts long artifact lines):
+  call it with the finalization result's `correlation_id` and
+  `section` `findings`, `advisories`, then `proposals`,
+  repeating each with `offset: <next_offset>` until
+  `next_offset` is null, and fail closed if any call returns
+  `status: "error"`. The compact result carries the outcome,
+  the scalar `review_verdict`, and run counts, never the
+  projection.
+- Store the dispatch's lessons from the `proposals` section:
+  for each entry (full text, already merged across personas by
+  `consolidate_dispatch`), call `dewey_store_learning` once
+  with its `information`, `tag`, and `category`. An empty
+  section means no lesson was submitted, unless the compact
+  result's `proposals` preview is non-empty: then the loaded
+  plugin predates durable proposals, so store nothing and
+  report the previewed lessons as stranded. Never store from
+  the preview. Skip storage when the finalization failed or
+  Dewey is unavailable: store no lesson and report the
+  proposals as stranded in the dispatch store.
+- Parse the entire finalization response as one JSON
+  object first. If it parses, it is complete — ignore any
+  truncation-shaped text inside it. If it does not parse,
+  the host truncated it (typically a truncation notice
+  such as `[... truncated ... saved to: /path ...]`): fail
+  closed and do not read the saved file.
+- If `operation_verdict` is APPROVE or APPROVE WITH
+  ADVISORIES: record the artifact's advisories for the final
+  report and proceed to Step 5 (Implement) — approving
+  verdicts never trigger the decision gate below.
 
-- If the verdict is REQUEST CHANGES: present the
+- If `operation_verdict` is REQUEST CHANGES: present the
   per-finding spec review decision gate. The council's
   "Spec Review Mode" MANDATORY GATE in
   `.opencode/commands/uf.review-council.md` governs the
@@ -864,7 +895,7 @@ from the pre-flight gate below):
       (docs authorship is judgment work)]
     skill: [repo skill or script reference that performs the
       change end-to-end -- only when deterministic]
-    skill_absent_reason: [what was searched and what was
+    skill_absent_reason: [<=512 chars: what was searched and what was
       found -- only when deterministic and no repo skill or
       script applies; never together with skill]
     checkpoint_step: "implement"
@@ -986,9 +1017,20 @@ its Local Tool Detection phase to discover additional
    - `skill`: a repo skill name or repo-relative script path
      that performs the work end-to-end. Valid only with a
      deterministic classification; mutually exclusive with
+     `skill_absent_reason`. A value without `/` resolves as a
+     repo skill name first, then as a repo-root file
+     (`Makefile`, `build-all.sh`); a value with `/` is a
+     repo-relative path (`./Makefile` names a root file
+     explicitly). Make targets and commands such as
+     `make plugin-test` are not valid `skill` values:
+     reference the file that defines them (`Makefile`) and
+     name the target in `prompt`, or record the command in
      `skill_absent_reason`.
    - `skill_absent_reason`: a substantive reason stating
-     what was searched and what was found. Valid only with a
+     what was searched and what was found, in one or two
+     sentences of at most 512 characters (longer values
+     fail with `INVALID_INPUT`; name the searched
+     locations, not their contents). Valid only with a
      deterministic classification; mutually exclusive with
      `skill`.
 
@@ -1002,11 +1044,42 @@ its Local Tool Detection phase to discover additional
    procedure -- the delegation names the reference and does
    not restate the procedure. The classification, resolved
    reference, and any recorded reason are written to the
-   checkpoint data and success envelope, so every delegation
-   is auditable without reconstructing prompts. Swarm-path
+   checkpoint data and success envelope, so every delegation is
+   auditable without reconstructing prompts. Swarm-path
    `[P]` delegations carry the same classification through
    the spawn tool's `task_classification` parameter (see
    parallel execution below).
+
+**Model-selection parameters for delegated calls**
+(model-matrix-delegation UF-FR-001): pass `pack` on an
+`uf_delegate_command` implement delegation whenever the task
+clearly names a convention pack -- a Go task passes `pack:
+"go"`, a TypeScript task `pack: "typescript"`,
+spec-authoring work `pack: "meta-prompt"`. A task with no
+clearly named pack omits the parameter: the classifier
+cascade (MM-FR-005) derives the selection. The selection
+parameters are independent of the classification contract
+above -- they govern which model the child session runs on,
+not skill enforcement. Parameter contract and precedence
+order (MM-FR-003):
+   - `model`: explicit provider/model identity (with optional
+     `variant`); wins the chain outright, skipping matrix
+     resolution and host introspection.
+   - `profile`: matrix capability name; resolves the
+     profile's model and pack through `.uf/model-matrix.yaml`
+     when configured.
+   - `pack`: UF convention pack name; double duty -- resolves
+     the mapped profile's model AND renders the tool-authored
+     directive instructing the child to load
+     `.opencode/uf/packs/<pack>.md` before writing.
+   - Precedence: explicit `model` > `profile` > `pack` >
+     agent pin > task-kind default > classifier cascade >
+     host model.
+
+   Never reconstruct, inline, or paraphrase pack content in a
+   delegation prompt -- the pack directive is tool-rendered
+   by `uf_delegate_command` from a fixed template; the
+   orchestrator only ever names the pack.
 
 **Build/test fix loop**: a failing check at a blocking
 gate is implement work the agent owns, not a human
@@ -1053,7 +1126,7 @@ For each iteration (up to 3 total):
        the usual case for diagnosing a broken test]
      skill: [repo skill or script reference that performs
        the fix end-to-end -- only when deterministic]
-     skill_absent_reason: [what was searched and what was
+     skill_absent_reason: [<=512 chars: what was searched and what was
        found -- only when deterministic and no repo skill
        or script applies; never together with skill]
      feature_dir: FEATURE_DIR
@@ -1132,7 +1205,7 @@ its spent budget the same way, from its budget-only
        deterministic or judgment, per the step above]
      skill: [repo skill or script reference that performs
        the task end-to-end -- only when deterministic]
-     skill_absent_reason: [what was searched and what was
+     skill_absent_reason: [<=512 chars: what was searched and what was
        found -- only when deterministic and no repo skill or
        script applies; never together with skill]
      feature_dir: FEATURE_DIR
@@ -1188,8 +1261,8 @@ its spent budget the same way, from its budget-only
             deterministic or judgment, per the step above]
           skill: [repo skill or script reference that performs
             the task end-to-end -- only when deterministic]
-          skill_absent_reason: [what was searched and what was
-            found -- only when deterministic and no repo skill or
+          skill_absent_reason: [<=512 chars: what was searched and what
+            was found -- only when deterministic and no repo skill or
             script applies; never together with skill]
           files: [files from the task]
           project_path: [the worktree path]
@@ -1562,7 +1635,11 @@ text.
       `dispatch_review_runs: <status> (correlation_id <id>)
       — <completed> completed, <failed> failed, <skipped>
       skipped, <findings> findings, <proposals> proposals`.
-      Capture the `correlation_id` reported in that
+      A non-ok summary also ends with ` — error: <message>
+      (retryable: <bool>)`, the failure message collapsed to one
+      line and cut to at most 512 characters including the ellipsis,
+      the retryable marker omitted when unknown. Capture the
+      `correlation_id` reported in that
       one-line summary and pass it as `correlation_id` on
       every subsequent consolidation call for this
       dispatch. Step 4 and Step 6 are separate dispatches
@@ -1585,15 +1662,39 @@ text.
    `**Files Reviewed**:` attestation) strictly above —
    below-threshold prompt assembly is unchanged.
 
+Read the authoritative full data once from the persisted artifact
+through `read_dispatch_artifact` (never the file-read tool, whose line
+limit cuts long artifact lines): call it with the finalization result's
+`correlation_id` and `section` `findings`, `advisories`, then
+`proposals`, repeating each with `offset: <next_offset>` until
+`next_offset` is null, and fail closed if any call returns
+`status: "error"`. The compact result carries the outcome, the scalar
+`review_verdict`, and run counts, never the projection. Store the
+dispatch's lessons from the `proposals` section: for each entry (full
+text, already merged across personas by `consolidate_dispatch`), call
+`dewey_store_learning` once with its `information`, `tag`, and
+`category`. An empty section means no lesson was submitted, unless the
+compact result's `proposals` preview is non-empty: then the loaded
+plugin predates durable proposals, so store nothing and report the
+previewed lessons as stranded. Never store from the preview. Skip
+storage when the finalization failed or Dewey is unavailable: store no
+lesson and report the proposals as stranded in the dispatch store.
+
+Parse the entire finalization response as one JSON object first. If it
+parses, it is complete — ignore any truncation-shaped text inside it. If
+it does not parse, the host truncated it (typically a truncation notice
+such as `[... truncated ... saved to: /path ...]`): fail closed and do
+not read the saved file.
+
 **Processing results**:
 
-- If the verdict is APPROVE or APPROVE WITH ADVISORIES
+- If `operation_verdict` is APPROVE or APPROVE WITH ADVISORIES
   (at least one successful reviewer assessment is
   required for a valid verdict): record any advisories
   for the final report and proceed to Step 7
   (Retrospective).
 
-- If the verdict is REQUEST CHANGES: enter the fix loop.
+- If `operation_verdict` is REQUEST CHANGES: enter the fix loop.
   For each iteration (up to 3 total):
   a. Address the findings by making code fixes --
      delegate the code-fix application to the
@@ -1612,7 +1713,7 @@ text.
          applying prose findings, which is authorship work]
        skill: [repo skill or script reference that performs
          the fix end-to-end -- only when deterministic]
-       skill_absent_reason: [what was searched and what was
+       skill_absent_reason: [<=512 chars: what was searched and what was
          found -- only when deterministic and no repo skill
          or script applies; never together with skill]
        feature_dir: FEATURE_DIR
@@ -1750,10 +1851,11 @@ memory.
    lost.
 
 > POLICY NOTE: Learnings stored via `dewey_store_learning`
-> produce files (`.uf/dewey/learnings/*.md`,
-> `.uf/dewey/compiled/*.md`) that are part of the feature
-> PR scope and MUST be committed on the feature branch.
-> See the Commit scope rule in `AGENTS.md`.
+> produce files under `.uf/dewey/learnings/` that MUST NOT
+> be committed on the feature branch. They stay untracked
+> and reach `main` through a separate
+> `chore/dewey-learnings-*` PR. See the Commit scope rule in
+> `AGENTS.md`.
 
 Proceed immediately to Step 8 (Demo). Do NOT ask for
 confirmation.
