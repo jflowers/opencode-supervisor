@@ -13,7 +13,7 @@
  * imports, no I/O.
  */
 
-import { evaluateEnforcement, extractPolicyPaths, type CompiledEnforcement } from './directives.ts';
+import { evaluateEnforcement, extractDirectivePaths, extractPolicyPaths, type CompiledEnforcement } from './directives.ts';
 import type { AuditConfig } from './auditor.ts';
 import { extractPathTokens, isPatternToken } from './path-tokens.ts';
 
@@ -704,13 +704,14 @@ export function verifyToolIntent(
   // Engineer-directive enforcement (FR-028): applies whenever compiled
   // rules exist — the directive set itself is the gate, not a config
   // flag — and an empty rule set never blocks. Reasons name the
-  // directive, the match, and the advisory text (FR-012).
+  // directive, the match, and the advisory text (FR-012). Path
+  // candidates include nested argument values (FR-079).
   if (enforcement && (enforcement.forbidPaths.length > 0 || enforcement.forbidPatterns.length > 0)) {
     const directiveVerdict = evaluateEnforcement(
       enforcement,
       toolCall.name,
       rawArgs,
-      extractPolicyPaths(toolCall.arguments)
+      extractDirectivePaths(toolCall.arguments)
     );
     if (!directiveVerdict.allowed) {
       return {

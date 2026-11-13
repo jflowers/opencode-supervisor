@@ -4,16 +4,23 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Hooks, PluginInput } from '@opencode-ai/plugin';
-import plugin, { sessionState } from '../index.ts';
+import plugin, { logIdentityState, sessionState } from '../index.ts';
 import { recordingPluginInput, silentPluginInput } from './mocks.ts';
 import {
   activeDirectives,
   compileEnforcement,
+  compileTriggers,
+  describeDirectiveSources,
   evaluateEnforcement,
+  extractDirectivePaths,
   extractPolicyPaths,
   globToRegExp,
+  matchesPaths,
   matchTriggers,
+  MAX_DIRECTIVE_FILES,
   MAX_DIRECTIVES,
+  MAX_NESTED_ARG_DEPTH,
+  MAX_NESTED_ARG_STRINGS,
   MAX_DIRECTIVE_TEXT,
   MAX_DIRECTIVES_RENDER_BUDGET,
   parseDirectives,
@@ -522,15 +529,66 @@ test('matchTriggers matches tool names case-insensitively', () => {
     { id: 'unrelated', text: 'note', when: [{ tool: 'edit' }] },
     { id: 'always', text: 'note' },
   ];
-  assert.deepEqual(matchTriggers(directives, 'BASH', []), ['bash-only']);
+  assert.deepEqual(matchTriggers(compileTriggers(directives), 'BASH', []), ['bash-only']);
 });
 
 test('matchTriggers matches argument paths against when-globs', () => {
-  const directives: Directive[] = [
-    { id: 'crypto', text: 'note', when: [{ path: 'src/crypto/**' }] },
-  ];
-  assert.deepEqual(matchTriggers(directives, 'edit', ['src/crypto/aes.ts']), ['crypto']);
-  assert.deepEqual(matchTriggers(directives, 'edit', ['src/other/aes.ts']), []);
+  const triggers = compileTriggers([{ id: 'crypto', text: 'note', when: [{ path: 'src/crypto/**' }] }]);
+  assert.deepEqual(matchTriggers(triggers, 'edit', ['src/crypto/aes.ts']), ['crypto']);
+  assert.deepEqual(matchTriggers(triggers, 'edit', ['./src/crypto/aes.ts']), ['crypto']);
+  assert.deepEqual(matchTriggers(triggers, 'edit', ['src/other/aes.ts']), []);
+});
+
+test('compileTriggers skips unconditioned directives and precompiles globs', () => {
+  const triggers = compileTriggers([
+    { id: 'always', text: 'note' },
+    { id: 'mixed', text: 'note', when: [{ tool: 'Bash' }, { path: 'src/**' }] },
+  ]);
+  assert.equal(triggers.length, 1);
+  assert.equal(triggers[0].directiveId, 'mixed');
+  assert.equal(triggers[0].rules[0].tool, 'bash');
+  assert.ok(triggers[0].rules[1].pathRegex instanceof RegExp);
+});
+
+// ── Pure module: FR-079 matching helpers ──
+
+test('matchesPaths matches the whole path or a slash-boundary suffix', () => {
+  const regex = globToRegExp('secrets/**');
+  assert.equal(matchesPaths(regex, ['src/a.ts', './secrets/token']), './secrets/token');
+  assert.equal(matchesPaths(regex, ['~/secrets/token']), '~/secrets/token');
+  assert.equal(matchesPaths(regex, ['/home/dev/proj/secrets/token']), '/home/dev/proj/secrets/token');
+  assert.equal(matchesPaths(regex, ['src/secrets.ts', 'docs/secrets-faq']), undefined);
+  assert.equal(matchesPaths(regex, []), undefined);
+});
+
+test('matchesPaths keeps leading-slash globs root-anchored and basename globs global', () => {
+  assert.equal(matchesPaths(globToRegExp('/etc/**'), ['vendor/etc/conf']), undefined);
+  assert.equal(matchesPaths(globToRegExp('/etc/**'), ['/etc/passwd']), '/etc/passwd');
+  assert.equal(matchesPaths(globToRegExp('.env*'), ['deploy/.env.local']), 'deploy/.env.local');
+});
+
+test('extractDirectivePaths reads nested string values within its bounds', () => {
+  assert.deepEqual(
+    extractDirectivePaths({ edits: [{ filePath: 'secrets/token' }], meta: { target: { file: 'a/b.txt' } } }),
+    ['secrets/token', 'a/b.txt']
+  );
+  assert.deepEqual(extractDirectivePaths({ command: 'cat ./x/y' }), ['./x/y']);
+  assert.deepEqual(extractDirectivePaths(undefined), []);
+  let deep: unknown = 'too/deep';
+  for (let i = 0; i < MAX_NESTED_ARG_DEPTH + 2; i += 1) deep = [deep];
+  assert.deepEqual(extractDirectivePaths({ deep }), []);
+  const many = Array.from({ length: MAX_NESTED_ARG_STRINGS + 10 }, (_, i) => `p/${i}`);
+  assert.equal(extractDirectivePaths({ many }).length, MAX_NESTED_ARG_STRINGS);
+});
+
+test('describeDirectiveSources names each directive with its file or options source', () => {
+  const fileDirective: Directive = { id: 'no-secrets', text: 'x' };
+  const optionDirective: Directive = { id: 'prefer-bun', text: 'y' };
+  assert.equal(
+    describeDirectiveSources([fileDirective, optionDirective], [fileDirective]),
+    'no-secrets (no-secrets.md), prefer-bun (options)'
+  );
+  assert.equal(describeDirectiveSources([], []), '');
 });
 
 test('activeDirectives keeps unconditioned directives always active', () => {
@@ -959,6 +1017,150 @@ test('the first-recorded trigger for a directive is logged once', async () => {
       assert.equal(hits.length, 1);
     });
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── FR-079: directive path anchoring regressions (#17 round 2, #55) ──
+
+/** Runs one guarded call against a single-directive project; resolves to the block message or null. */
+async function guardOutcome(rules: object, tool: string, args: unknown): Promise<string | null> {
+  const dir = makeDirectiveDir({ 'policy.md': directiveFile('Policy text.', rules) });
+  try {
+    let outcome: string | null = null;
+    await withCleanDirectivesEnv(async () => {
+      const hooks = await plugin.server(silentPluginInput(dir));
+      try {
+        await dispatchToolBefore(hooks, 'anchor-session', tool, args);
+      } catch (error) {
+        outcome = error instanceof Error ? error.message : String(error);
+      }
+      await hooks.dispose!();
+    });
+    return outcome;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** Runs one call against a single when-path directive; resolves to whether it triggered. */
+async function triggerOutcome(glob: string, tool: string, args: unknown): Promise<boolean> {
+  const dir = makeDirectiveDir({ 'note.md': directiveFile('Trigger note.', { when: [{ path: glob }] }) });
+  try {
+    let triggered = false;
+    await withCleanDirectivesEnv(async () => {
+      const hooks = await plugin.server(silentPluginInput(dir));
+      await dispatchToolBefore(hooks, 'anchor-trigger-session', tool, args);
+      triggered = sessionState.get('anchor-trigger-session').triggeredDirectives.includes('note');
+      sessionState.cleanup('anchor-trigger-session');
+      await hooks.dispose!();
+    });
+    return triggered;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('forbidPath blocks a ./-prefixed spelling (FR-079)', async () => {
+  const outcome = await guardOutcome(NO_SECRETS_RULES, 'read', { filePath: './secrets/token' });
+  assert.ok(outcome?.includes("engineer directive 'policy'"), String(outcome));
+});
+
+test('forbidPath blocks a ~-prefixed spelling (FR-079)', async () => {
+  const outcome = await guardOutcome(NO_SECRETS_RULES, 'bash', { command: 'cat ~/secrets/token' });
+  assert.ok(outcome?.includes("engineer directive 'policy'"), String(outcome));
+});
+
+test('forbidPath blocks an absolute spelling (FR-079)', async () => {
+  const outcome = await guardOutcome(NO_SECRETS_RULES, 'read', { filePath: '/home/dev/proj/secrets/token' });
+  assert.ok(outcome?.includes("engineer directive 'policy'"), String(outcome));
+});
+
+test('forbidPath blocks a path nested inside array arguments (FR-079)', async () => {
+  const outcome = await guardOutcome(NO_SECRETS_RULES, 'multiedit', {
+    edits: [{ filePath: 'secrets/token', oldString: 'a', newString: 'b' }],
+  });
+  assert.ok(outcome?.includes("engineer directive 'policy'"), String(outcome));
+});
+
+test('forbidPath still passes unrelated look-alike paths (FR-079)', async () => {
+  assert.equal(await guardOutcome(NO_SECRETS_RULES, 'read', { filePath: 'src/secrets.ts' }), null);
+  assert.equal(await guardOutcome(NO_SECRETS_RULES, 'read', { filePath: 'docs/secrets-faq' }), null);
+});
+
+test('a leading-slash forbidPath stays anchored at the root (FR-079)', async () => {
+  const rules = { enforce: [{ forbidPath: '/etc/**' }] };
+  assert.equal(await guardOutcome(rules, 'read', { filePath: 'vendor/etc/conf' }), null);
+  const outcome = await guardOutcome(rules, 'read', { filePath: '/etc/passwd' });
+  assert.ok(outcome?.includes("engineer directive 'policy'"), String(outcome));
+});
+
+test('when-path globs trigger on a ./-prefixed spelling (FR-079)', async () => {
+  assert.equal(await triggerOutcome('src/crypto/**', 'edit', { filePath: './src/crypto/aes.ts' }), true);
+});
+
+test('when-path globs trigger on a ~-prefixed spelling (FR-079)', async () => {
+  assert.equal(await triggerOutcome('src/crypto/**', 'bash', { command: 'cat ~/src/crypto/aes.ts' }), true);
+});
+
+test('when-path globs trigger on an absolute spelling (FR-079)', async () => {
+  assert.equal(await triggerOutcome('src/crypto/**', 'edit', { filePath: '/home/dev/proj/src/crypto/aes.ts' }), true);
+});
+
+test('when-path globs trigger on a nested argument path (FR-079)', async () => {
+  assert.equal(
+    await triggerOutcome('src/crypto/**', 'multiedit', { edits: [{ filePath: 'src/crypto/aes.ts' }] }),
+    true
+  );
+});
+
+test('when-path globs ignore unrelated spellings (FR-079)', async () => {
+  assert.equal(await triggerOutcome('src/crypto/**', 'edit', { filePath: './src/other/aes.ts' }), false);
+});
+
+test('directive files past the read cap are never parsed (FR-079)', async () => {
+  const files: Record<string, string> = {};
+  for (let i = 1; i <= MAX_DIRECTIVE_FILES; i += 1) {
+    files[`d${String(i).padStart(2, '0')}.md`] = `policy ${i}`;
+  }
+  const broken = `x\n\n\`\`\`supervisor\n{"enforce": [}\n\`\`\`\n`;
+  files['z1.md'] = broken;
+  files['z2.md'] = broken;
+  const dir = makeDirectiveDir(files);
+  try {
+    await withCleanDirectivesEnv(async () => {
+      const { input, logEntries } = recordingPluginInput(dir);
+      const hooks = await plugin.server(input);
+      await dispatchToolBefore(hooks, 'file-cap-session', 'bash', { command: 'bun test' });
+      await hooks.dispose!();
+      const warnings = logEntries.filter((entry) => entry.level === 'warn').map((entry) => entry.message);
+      assert.ok(!warnings.some((message) => message.includes('z1.md') || message.includes('z2.md')));
+      assert.ok(warnings.some((message) => message.includes(`2 directive file(s) beyond the read cap of ${MAX_DIRECTIVE_FILES}`)));
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the identity line names loaded directives and their sources (FR-079)', async () => {
+  const dir = makeDirectiveDir({ 'no-secrets.md': directiveFile(NO_SECRETS_TEXT, NO_SECRETS_RULES) });
+  const saved = { ...logIdentityState };
+  try {
+    await withCleanDirectivesEnv(async () => {
+      logIdentityState.identityLogged = false;
+      logIdentityState.identitySaidNoModel = false;
+      const { input, logEntries } = recordingPluginInput(dir);
+      const hooks = await plugin.server(input, {
+        directives: [{ id: 'prefer-bun', text: 'Prefer bun over node.' }],
+      });
+      await dispatchToolBefore(hooks, 'identity-session', 'bash', { command: 'bun test' });
+      await hooks.dispose!();
+      const identity = logEntries.find((entry) => entry.level === 'info' && entry.message.includes(' loaded ('));
+      assert.ok(identity, 'identity line logged');
+      assert.ok(identity.message.includes('directives: 2 [no-secrets (no-secrets.md), prefer-bun (options)]'), identity.message);
+    });
+  } finally {
+    Object.assign(logIdentityState, saved);
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

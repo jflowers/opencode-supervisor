@@ -28,16 +28,16 @@
 
 ## 3. Directive anchoring and provenance (FR-079)
 
-- [ ] 3.1 regression tests first: `./`, `~`, absolute, and
+- [x] 3.1 regression tests first: `./`, `~`, absolute, and
   nested spellings against `forbidPath` and `when` globs;
   record which fail on the unfixed code
-- [ ] 3.2 `src/directives.ts`: `matchesPaths` (whole path or
+- [x] 3.2 `src/directives.ts`: `matchesPaths` (whole path or
   slash-boundary suffix) for enforcement and triggers
-- [ ] 3.3 `src/directives.ts`: `extractDirectivePaths` (nested,
+- [x] 3.3 `src/directives.ts`: `extractDirectivePaths` (nested,
   bounded); guard enforcement and the trigger call site use it
-- [ ] 3.4 `src/directives.ts`: `MAX_DIRECTIVE_FILES`;
+- [x] 3.4 `src/directives.ts`: `MAX_DIRECTIVE_FILES`;
   `index.ts` loader applies it at read time with one warning
-- [ ] 3.5 `src/directives.ts`: `describeDirectiveSources`;
+- [x] 3.5 `src/directives.ts`: `describeDirectiveSources`;
   identity line names ids and sources
 
 ## 4. Hygiene refactors (no behavior change)
@@ -47,11 +47,12 @@
 - [ ] 4.2 `src/records.ts`: `SolvedItem`, `CritiqueRecord`,
   `takeMostRecent`; break the memo ↔ console cycle; reminders
   and reports reuse the helper
-- [ ] 4.3 `src/directives.ts`: generic `normalizeRules`, shared
+- [x] 4.3 `src/directives.ts`: generic `normalizeRules`, shared
   `buildDirective`, `compileTriggers` precompiled at server
   start
-- [ ] 4.4 `extractArgPaths`: confirm a direct test exists (keep
-  the export) or unexport
+- [x] 4.4 `extractArgPaths`: confirm a direct test exists (keep
+  the export) or unexport — already done: direct FR-066 tests
+  in `test/audit.test.ts` import it; export kept
 - [ ] 4.5 `test/mocks.ts`: `toolContext`,
   `completedReasoningPart`, `SUPERVISOR_ENV_NAMES`,
   `withCleanSupervisorEnv`; remove the copies; drop the unused

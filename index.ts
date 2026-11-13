@@ -86,9 +86,13 @@ import {
   activeDirectives,
   compileEnforcement,
   compileRepairTools,
+  compileTriggers,
+  describeDirectiveSources,
+  extractDirectivePaths,
   extractPolicyPaths,
   matchRepairTools,
   matchTriggers,
+  MAX_DIRECTIVE_FILES,
   MAX_DIRECTIVES,
   parseDirectives,
   parseOptionsDirectives,
@@ -1299,8 +1303,15 @@ const loadDirectiveFiles = (
   const sorted = entries
     .filter((entry) => entry.isFile() && entry.name.endsWith('.md'))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  // FR-079: the file cap applies at read time — files past it are
+  // never read or parsed, so they cannot warn individually.
+  if (sorted.length > MAX_DIRECTIVE_FILES) {
+    warnings.push(
+      `${sorted.length - MAX_DIRECTIVE_FILES} directive file(s) beyond the read cap of ${MAX_DIRECTIVE_FILES} not read`
+    );
+  }
   const files: { name: string; content: string }[] = [];
-  for (const entry of sorted) {
+  for (const entry of sorted.slice(0, MAX_DIRECTIVE_FILES)) {
     // Review round 3: the read is bounded and non-blocking — a
     // planted oversized or non-regular directive file (a FIFO stalls
     // a plain open) skips as unreadable instead of stalling load.
@@ -1522,6 +1533,8 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
   // directive set (FR-043..FR-048); their warnings join the
   // load-time stream.
   const { gates: compiledGates, warnings: gateWarnings } = compileGates(directives);
+  // FR-029: trigger globs compile once here, not per guarded call.
+  const compiledTriggers = compileTriggers(directives);
   const directivesAdvisory = renderDirectivesAdvisory(directives);
   // Deferred bootstrap warnings (review round 1, MEDIUM): warnings
   // collected during server() fire into the listener-down window,
@@ -1801,7 +1814,9 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         `v${PLUGIN_VERSION} loaded (mode: ${config.mode}, auditor: ${
           config.auditorModel ?? (derivedLookupFailed ? 'pending host lookup' : 'none — LLM audit disabled')
         }, variant: ${config.auditorVariant ?? 'unset'}${
-          directives.length > 0 ? `, directives: ${directives.length}` : ''
+          directives.length > 0
+            ? `, directives: ${directives.length} [${describeDirectiveSources(directives, parsedFiles.directives)}]`
+            : ''
         }, guards: blockRewardHacking=${config.blockRewardHacking}, stepReference=${
           config.requireStepReferenceInTools
         }, lockGuards=${guardsLocked}${
@@ -2339,7 +2354,8 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           return;
         }
         const argPaths = extractPolicyPaths(output.args);
-        for (const id of matchTriggers(directives, hookInput.tool, argPaths)) {
+        // FR-079: triggers also see nested argument paths.
+        for (const id of matchTriggers(compiledTriggers, hookInput.tool, extractDirectivePaths(output.args))) {
           if (!state.triggeredDirectives.includes(id)) {
             state.triggeredDirectives.push(id);
             // Design III observability (review round 1): triggers are
