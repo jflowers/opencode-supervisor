@@ -12,7 +12,8 @@
  * reports are capped at configurable maximums, keeping the most recent
  * entries, so the memo cannot grow without limit across a long session
  * (FR-017, FR-023, FR-035); directives carry their own fixed render
- * budget (FR-032). Pure module: no OpenCode
+ * budget (FR-032), and the external-access section (FR-087) arrives
+ * pre-rendered and bounded by its own renderer. Pure module: no OpenCode
  * imports, no I/O, no session state — the hook layer (design D4) owns the
  * Maps and passes plain data in.
  */
@@ -37,6 +38,8 @@ export interface MemoInput {
   agentReports?: AgentReport[];
   solvedItems: SolvedItem[];
   critiques: CritiqueRecord[];
+  /** Pre-rendered external-access section (FR-087), bounded by its renderer; optional. */
+  externalAccess?: string | null;
 }
 
 export interface MemoLimits {
@@ -110,6 +113,7 @@ export function buildMemo(input: MemoInput, limits: Partial<MemoLimits> = DEFAUL
   const remindersSection = renderReminders(input.reminders ?? [], caps.maxReminders);
   const reportsSection = renderReports(input.agentReports ?? [], caps.maxReports);
   const directivesSection = directives.length > 0 ? renderDirectives(directives) : null;
+  const externalAccess = input.externalAccess ?? null;
 
   if (
     !goal &&
@@ -117,7 +121,8 @@ export function buildMemo(input: MemoInput, limits: Partial<MemoLimits> = DEFAUL
     remindersSection === null &&
     solvedItems.length === 0 &&
     reportsSection === null &&
-    critiques.length === 0
+    critiques.length === 0 &&
+    externalAccess === null
   ) {
     return null;
   }
@@ -143,6 +148,10 @@ export function buildMemo(input: MemoInput, limits: Partial<MemoLimits> = DEFAUL
 
   if (reportsSection !== null) {
     sections.push(reportsSection);
+  }
+
+  if (externalAccess !== null) {
+    sections.push(externalAccess);
   }
 
   if (critiques.length > 0) {
