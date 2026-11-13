@@ -94,9 +94,45 @@ export const compileToolGlob = (glob: string): RegExp => {
   return new RegExp(`^${source}$`);
 };
 
+/**
+ * Compiled exempt-tool globs, keyed by glob text. Globs come only from
+ * the validated global file (at most MAX_PROFILES profiles), so the
+ * cache is bounded by the config, and each glob compiles once instead
+ * of on every guarded tool call.
+ */
+const compiledToolGlobs = new Map<string, RegExp>();
+
+const cachedToolGlob = (glob: string): RegExp => {
+  let compiled = compiledToolGlobs.get(glob);
+  if (compiled === undefined) {
+    compiled = compileToolGlob(glob);
+    compiledToolGlobs.set(glob, compiled);
+  }
+  return compiled;
+};
+
 /** True when `tool` matches any glob in `globs`. */
 export const matchesToolGlob = (tool: string, globs: readonly string[]): boolean =>
-  globs.some((glob) => compileToolGlob(glob).test(tool));
+  globs.some((glob) => cachedToolGlob(glob).test(tool));
+
+/**
+ * True when some profile's exempt-tool globs match `tool`, whatever the
+ * session (design D4). The hook checks this before resolving a
+ * session's lineage, so calls no profile can exempt never pay for
+ * parent lookups.
+ */
+export const toolMayBeExempt = (tool: string, profiles: readonly GuardProfile[] | undefined): boolean =>
+  profiles !== undefined && profiles.some((profile) => matchesToolGlob(tool, profile.traceCheck.exemptTools));
+
+/**
+ * A wildcard exempt-tool glob must start with a literal MCP-server
+ * prefix — letters, digits, `-` or `.` followed by `_`, as in
+ * `dewey_*` — so it names one server's tools. Broad globs like `*_*`
+ * or `*write*` would also match file-writing tools of other MCP
+ * servers, which the built-in list cannot know about (FR-074,
+ * design D3). Exact tool names are always allowed.
+ */
+const SERVER_PREFIXED_GLOB = /^[A-Za-z0-9.-]+_/;
 
 /** Normalizes a slash command name: trimmed, without a leading `/`. */
 export const normalizeCommand = (command: string): string => command.trim().replace(/^\/+/, '');
@@ -147,6 +183,11 @@ const validateTraceCheck = (raw: unknown): { exemptTools?: string[]; error?: str
     if (hit !== undefined) {
       return {
         error: `"traceCheck.exemptTools" entry "${glob}" matches the file-mutating builtin "${hit}"; exemptions may not disable the trace check where code is written`,
+      };
+    }
+    if (countToolGlobWildcards(glob) > 0 && !SERVER_PREFIXED_GLOB.test(glob)) {
+      return {
+        error: `"traceCheck.exemptTools" entry "${glob}" is too broad: a wildcard glob must start with an MCP server prefix such as "dewey_*", so it cannot match another server's file-writing tools`,
       };
     }
   }

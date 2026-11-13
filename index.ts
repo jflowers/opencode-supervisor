@@ -28,7 +28,7 @@
  */
 
 import fs from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, userInfo } from 'node:os';
 import path from 'node:path';
 import { tool, type Hooks, type PluginInput, type PluginModule, type PluginOptions } from '@opencode-ai/plugin';
 import {
@@ -116,6 +116,7 @@ import {
   MAX_PROFILE_ANCESTRY,
   normalizeCommand,
   sanitizeNonGlobalTier,
+  toolMayBeExempt,
   traceExemption,
   type SessionContext,
 } from './src/guard-profiles.ts';
@@ -318,6 +319,14 @@ export function resolveHookConfig(
   sources: SupervisorConfigSources = {}
 ): HookConfig {
   const overrides = sessionOverrides(session);
+  // FR-075 (design D6): under the global lock, no tier above the
+  // global file may turn a guard off — session overrides and the
+  // environment included, since per-directory env tools (mise.toml
+  // `[env]`, .envrc) let a repository set environment variables.
+  const locked = sources.global?.lockGuards === true;
+  const guardOn = (value: boolean | undefined): boolean | undefined => (locked && value === false ? undefined : value);
+  const fullMode = (value: SupervisorMode | undefined): SupervisorMode | undefined =>
+    locked && value === 'repair-only' ? undefined : value;
   const memoOverrides = memoLimitOverrides(overrides.memoLimits);
   const repairOverrides = argRepairOverrides(overrides.argRepair);
   const base = resolveAuditorConfig(pluginConfig, session);
@@ -348,13 +357,13 @@ export function resolveHookConfig(
       tiered(sources.project?.stripMode, sources.options?.stripMode, sources.global?.stripMode) ??
       base.stripMode,
     blockRewardHacking:
-      pickBoolean(overrides.blockRewardHacking) ??
-      envBoolean(ENV_BLOCK_REWARD_HACKING) ??
+      guardOn(pickBoolean(overrides.blockRewardHacking)) ??
+      guardOn(envBoolean(ENV_BLOCK_REWARD_HACKING)) ??
       tiered(sources.project?.blockRewardHacking, sources.options?.blockRewardHacking, sources.global?.blockRewardHacking) ??
       base.blockRewardHacking,
     requireStepReferenceInTools:
-      pickBoolean(overrides.requireStepReferenceInTools) ??
-      envBoolean(ENV_REQUIRE_STEP_REFERENCE) ??
+      guardOn(pickBoolean(overrides.requireStepReferenceInTools)) ??
+      guardOn(envBoolean(ENV_REQUIRE_STEP_REFERENCE)) ??
       tiered(
         sources.project?.requireStepReferenceInTools,
         sources.options?.requireStepReferenceInTools,
@@ -399,8 +408,8 @@ export function resolveHookConfig(
       tiered(sources.project?.maxCoveredTimeoutFailOpens, sources.options?.maxCoveredTimeoutFailOpens, sources.global?.maxCoveredTimeoutFailOpens) ??
       pluginConfig.maxCoveredTimeoutFailOpens,
     mode:
-      pickSupervisorMode(overrides.mode) ??
-      pickSupervisorMode(envText(ENV_MODE)) ??
+      fullMode(pickSupervisorMode(overrides.mode)) ??
+      fullMode(pickSupervisorMode(envText(ENV_MODE))) ??
       tiered(sources.project?.mode, sources.options?.mode, sources.global?.mode) ??
       pluginConfig.mode,
     argRepair: {
@@ -509,15 +518,25 @@ export interface SessionState {
   agent: string | undefined;
   /**
    * The session's task command (FR-072): the latest slash command seen
-   * by `command.execute.before`, without a leading `/`, kept until
-   * another command runs. Matched by global profiles.
+   * by `command.execute.before`, without a leading `/`, kept for that
+   * command's task (see `commandEnded`). Matched by global profiles.
    */
   command: string | undefined;
   /**
+   * True once the session went idle after `command` was recorded
+   * (FR-072): the command's task has ended, so the next human-typed
+   * (non-synthetic) user message clears `command` unless it is
+   * itself a slash command.
+   */
+  commandEnded: boolean;
+  /**
    * The parent session (FR-072, design D4): a session ID, `null` for a
-   * root session (or a failed lookup), `undefined` while unknown.
+   * root session, `undefined` while unknown. A failed lookup is not
+   * cached: it is retried after `parentLookupRetryAt`.
    */
   parentID: string | null | undefined;
+  /** Epoch ms before which a failed parent lookup is not retried (design D4). */
+  parentLookupRetryAt: number;
 }
 
 /** Module-level state (design D4), keyed by session ID. */
@@ -546,7 +565,9 @@ function emptySessionState(): SessionState {
     repairNotices: new Set(),
     agent: undefined,
     command: undefined,
+    commandEnded: false,
     parentID: undefined,
+    parentLookupRetryAt: 0,
   };
 }
 
@@ -1408,6 +1429,29 @@ const readSupervisorConfigFile = (configPath: string): ParsedSupervisorConfig =>
  *
  * @returns Absolute path to the global config file.
  */
+/**
+ * The global config path under the home directory, ignoring
+ * XDG_CONFIG_HOME (FR-075, design D6): consulted for the guard lock
+ * when XDG_CONFIG_HOME points elsewhere.
+ */
+const homeSupervisorConfigPath = (): string =>
+  path.join(configPathState.accountHome(), '.config', 'opencode', 'supervisor', 'config.json');
+
+/**
+ * The account's home directory from the OS user database, not `HOME`
+ * (FR-075): per-directory env tooling can set `HOME` as easily as
+ * XDG_CONFIG_HOME. Exported so tests can point it at a fixture.
+ */
+export const configPathState = {
+  accountHome: (): string => {
+    try {
+      return userInfo().homedir;
+    } catch {
+      return homedir();
+    }
+  },
+};
+
 const globalSupervisorConfigPath = (): string => {
   // Review round 4 (LOW): a relative XDG_CONFIG_HOME is ignored the
   // same as an unset one — path.join would otherwise rebase the
@@ -1500,8 +1544,27 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
   if (projectFile.error !== null) {
     bootstrapWarnings.push(`project supervisor config file ignored: ${projectFile.error}`);
   }
-  const globalFile = readSupervisorConfigFile(globalSupervisorConfigPath());
-  if (globalFile.error !== null) {
+  // FR-075 (design D6): XDG_CONFIG_HOME can be set by a repository's
+  // per-directory env tooling, so it must not escape the lock. When it
+  // points away from the home-directory file and that file locks, the
+  // home-directory file is the global tier.
+  const globalPath = globalSupervisorConfigPath();
+  const homePath = homeSupervisorConfigPath();
+  let globalFile = readSupervisorConfigFile(globalPath);
+  if (globalPath !== homePath && globalFile.config.lockGuards !== true) {
+    const homeFile = readSupervisorConfigFile(homePath);
+    if (homeFile.config.lockGuards === true) {
+      bootstrapWarnings.push(
+        `XDG_CONFIG_HOME points the global supervisor config at ${globalPath}, but ${homePath} sets lockGuards: true; using ${homePath}`
+      );
+      globalFile = homeFile;
+    }
+  }
+  if (globalFile.error !== null && globalFile.config.lockGuards === true) {
+    bootstrapWarnings.push(
+      `global supervisor config file ignored except lockGuards: true (the lock fails closed): ${globalFile.error}`
+    );
+  } else if (globalFile.error !== null) {
     bootstrapWarnings.push(`global supervisor config file ignored: ${globalFile.error}`);
   }
   // FR-056 options tier: `options.config` from tuple registration,
@@ -1525,17 +1588,32 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
   const optionsTier = sanitizeNonGlobalTier(optionsParsed.config, 'plugin options supervisor config', guardsLocked);
   bootstrapWarnings.push(...projectTier.warnings, ...optionsTier.warnings);
   const optionsConfig = optionsTier.config;
+  if (guardsLocked) {
+    for (const name of [ENV_BLOCK_REWARD_HACKING, ENV_REQUIRE_STEP_REFERENCE]) {
+      if (envBoolean(name) === false) {
+        bootstrapWarnings.push(`environment sets ${name}=false; ignored because the global config sets lockGuards: true`);
+      }
+    }
+    if (pickSupervisorMode(envText(ENV_MODE)) === 'repair-only') {
+      bootstrapWarnings.push(`environment sets ${ENV_MODE}=repair-only; ignored because the global config sets lockGuards: true`);
+    }
+  }
   const profiles = globalFile.config.profiles;
   // FR-072 (design D1/D4): a session's lineage — its own context, then
   // each ancestor's — for profile matching. A parent unknown from
   // session events is looked up once (bounded) and cached; a failed
-  // lookup is treated as a root session (fail closed: no inherited
-  // grant).
+  // lookup is treated as a root session for that call (fail closed:
+  // no inherited grant) but is not cached — it is retried after a
+  // backoff, and a session event can still supply the parent.
   const PARENT_LOOKUP_TIMEOUT_MS = 2000;
+  const PARENT_LOOKUP_RETRY_MS = 30_000;
   const resolveParent = async (sessionID: string): Promise<string | null> => {
     const state = sessionState.get(sessionID);
     if (state.parentID !== undefined) {
       return state.parentID;
+    }
+    if (Date.now() < state.parentLookupRetryAt) {
+      return null;
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -1546,16 +1624,23 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           timer.unref?.();
         }),
       ]);
-      const parent = (response as { data?: { parentID?: unknown } } | undefined)?.data?.parentID;
-      state.parentID = typeof parent === 'string' && parent !== '' ? parent : null;
+      const data = (response as { data?: { id?: unknown; parentID?: unknown } } | undefined)?.data;
+      if (data === undefined || data === null) {
+        throw new Error('session.get returned no session');
+      }
+      // A session event may have recorded the parent while the lookup ran.
+      if (state.parentID === undefined) {
+        state.parentID = typeof data.parentID === 'string' && data.parentID !== '' ? data.parentID : null;
+      }
     } catch {
-      state.parentID = null;
+      state.parentLookupRetryAt = Date.now() + PARENT_LOOKUP_RETRY_MS;
+      return state.parentID ?? null;
     } finally {
       if (timer !== undefined) {
         clearTimeout(timer);
       }
     }
-    return state.parentID;
+    return state.parentID ?? null;
   };
   const sessionLineage = async (sessionID: string): Promise<SessionContext[]> => {
     const lineage: SessionContext[] = [];
@@ -1575,7 +1660,9 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
   // order as resolveHookConfig (environment → project file → plugin options
   // → global file → default); no derived tier — mode is never derived.
   const mode: SupervisorMode =
-    pickSupervisorMode(envText(ENV_MODE)) ??
+    (guardsLocked && pickSupervisorMode(envText(ENV_MODE)) === 'repair-only'
+      ? undefined
+      : pickSupervisorMode(envText(ENV_MODE))) ??
     tiered(projectFile.config.mode, optionsConfig.mode, globalFile.config.mode) ??
     'full';
   const repairOnly = mode === 'repair-only';
@@ -2016,6 +2103,23 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           }
           return;
         }
+        // FR-072: an idle session has finished the command's task; the
+        // next human-typed message starts a new one (see chat.message).
+        const idleSessionID =
+          event.type === 'session.idle'
+            ? event.properties.sessionID
+            : event.type === 'session.status' && event.properties.status?.type === 'idle'
+              ? event.properties.sessionID
+              : undefined;
+        if (idleSessionID !== undefined) {
+          if (typeof idleSessionID === 'string' && !isAuditorSessionId(idleSessionID)) {
+            const idle = sessionState.get(idleSessionID);
+            if (idle.command !== undefined) {
+              idle.commandEnded = true;
+            }
+          }
+          return;
+        }
         // Switch on event.type: undeclared types (message.part.delta
         // and friends) arrive at runtime and are not errors (spike 1.1).
         if (event.type !== 'message.part.updated') {
@@ -2146,6 +2250,15 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         if (typeof hookInput.agent === 'string' && hookInput.agent !== '') {
           state.agent = hookInput.agent;
         }
+        // FR-072: a command scopes one task. After the session went idle,
+        // a human-typed message (non-synthetic text) that is not itself a
+        // slash command — `command.execute.before` resets `commandEnded`
+        // first — starts a new task, so the command no longer applies.
+        // Messages during the task (plugin summaries, steers) keep it.
+        if (state.commandEnded && userMessageText(output?.parts) !== '') {
+          state.command = undefined;
+          state.commandEnded = false;
+        }
         // Tool-arg repair: capture the session's model identity in every
         // mode — it drives the per-model tool-schema lookup.
         const model = hookInput.model;
@@ -2232,9 +2345,10 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         const consoleTools = new Set(hooks.tool !== undefined ? Object.keys(hooks.tool) : []);
         // FR-074 (design D3/D4): a global profile matching this session
         // or an ancestor may exempt this tool from the trace check only.
-        // Lineage resolves only when profiles exist (no lookups otherwise).
+        // Lineage resolves only when some profile could exempt this tool,
+        // so other calls never pay for parent lookups.
         const exemption =
-          profiles !== undefined && profiles.length > 0
+          toolMayBeExempt(hookInput.tool, profiles)
             ? traceExemption(await sessionLineage(hookInput.sessionID), hookInput.tool, profiles)
             : null;
         const exemptReason = exemption?.reason ?? null;
@@ -2272,7 +2386,7 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         // logged once per profile+tool pair per session (the FR-046
         // first-grant precedent), so an engineer reviewing logs can
         // distinguish a skipped trace check from one that passed on merits.
-        if (exemption !== null) {
+        if (exemption !== null && verification.allowed && verification.reason === exemption.reason) {
           const noticeKey = `${exemption.profile}:${hookInput.tool}`;
           if (!state.traceExemptionNotices.has(noticeKey)) {
             state.traceExemptionNotices.add(noticeKey);
@@ -2778,14 +2892,13 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
     },
 
     /**
-     * Dispose (design D4): supervision state is in-process only; clear
-     * it when the plugin unloads so a re-register starts clean.
-     */
-    /**
      * Task context (FR-072, design D1): records the slash command a
      * session runs so global guard profiles can match it. The command
-     * stays until another command runs in the session. Fail-open: an
-     * odd payload is ignored.
+     * scopes one task: it stays while the session works, including
+     * through plugin-injected messages, and ends at the first
+     * human-typed message after the session goes idle, or when another
+     * command runs (see chat.message). Fail-open: an odd payload is
+     * ignored.
      */
     'command.execute.before': async (hookInput) => {
       try {
@@ -2794,13 +2907,19 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         }
         const command = normalizeCommand(hookInput.command);
         if (command !== '') {
-          sessionState.get(hookInput.sessionID).command = command;
+          const state = sessionState.get(hookInput.sessionID);
+          state.command = command;
+          state.commandEnded = false;
         }
       } catch (error) {
         logger.error(`command.execute.before hook failed open: ${errorText(error)}`);
       }
     },
 
+    /**
+     * Dispose (design D4): supervision state is in-process only; clear
+     * it when the plugin unloads so a re-register starts clean.
+     */
     dispose: async () => {
       sessionState.clearAll();
     },

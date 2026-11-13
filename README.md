@@ -518,7 +518,7 @@ when unset, the side-session prompt omits it.
 | `argRepair.tools` | *(config file/options only)* | builtin tool ids | Tools in the repair scope; `"*"` covers everything including MCP and plugin tools. |
 | `argRepair.maxPerSession` | *(config file/options only)* | `8` | Per-session bound on repair-model attempts; deterministic repairs are unbounded. |
 | `argRepair.timeoutMs` | *(config file/options only)* | `15000` | Timeout on the repair side session. |
-| `lockGuards` | *(global config file only)* | `false` | When `true`, `blockRewardHacking: false`, `requireStepReferenceInTools: false`, and `mode: "repair-only"` from the project config file or plugin options are ignored with a warning, so a committed project config cannot turn the guards off or unregister them. The environment and the global file stay authoritative (Section 7.2). |
+| `lockGuards` | *(global config file only)* | `false` | When `true`, `blockRewardHacking: false`, `requireStepReferenceInTools: false`, and `mode: "repair-only"` from the project config file, plugin options, or the environment are ignored with a warning, so a committed project config or per-directory env file cannot turn the guards off or unregister them. Fails closed (Section 7.2). |
 | `profiles` | *(global config file only)* | *(none)* | Task-scoped grants, matched on slash command and/or agent, that narrow where a guard applies (Section 7.2). |
 
 Gate approvals are not a knob: `approve` rules read the approvals file
@@ -561,7 +561,9 @@ not restarted per task, so the supervisor picks guard grants per
 session from what the session is doing. Each session records:
 
 - its **command** — the latest slash command it ran (without `/`),
-  kept until another command runs;
+  kept for that command's task: until the first message you type
+  after the session goes idle, unless that message is itself a slash
+  command (messages plugins inject during the task keep it);
 - its **agent** — the `agent` of its latest user message;
 - its **parent** — subagent sessions (task-tool children,
   review-council reviewers) inherit their ancestors' grants.
@@ -602,8 +604,11 @@ the task. The global config file holds the grants:
   included — is rejected, and so is any key other than `name`,
   `match`, and `traceCheck`, so a profile carrying
   `"blockRewardHacking": false` warns instead of silently doing
-  nothing. A rejected profile is dropped with a warning; other
-  profiles and the rest of the file stay in force.
+  nothing. A wildcard entry must start with an MCP server prefix
+  (`dewey_*`, not `*_file` or `fs*`), so it cannot reach another
+  server's file-writing tools; exact tool names are always allowed. A
+  rejected profile is dropped with a warning; other profiles and the
+  rest of the file stay in force.
 - `profiles` and `lockGuards` are honored only from the global config
   file. Agent and command names are weak keys — any repository can
   ship `.opencode/agents/curator.md` or a `dewey-distill` command — so
@@ -612,11 +617,20 @@ the task. The global config file holds the grants:
 - Read-only builtins (`read`, `grep`, `glob`) are not exempt unless a
   profile lists them; path-scoped glob reasoning (FR-069) covers most
   bulk reads, and corpus-scale tasks may list them.
-- A command grant lasts for the rest of the session (until another
-  command runs), including unrelated follow-up messages.
+- `lockGuards: true` fails closed. Under it, guard-disabling values
+  are ignored, with a warning, from the project file, plugin options,
+  and the environment (`OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING=false`,
+  `..._REQUIRE_STEP_REFERENCE_IN_TOOLS=false`, `OPENCODE_SUPERVISOR_MODE=repair-only`),
+  because per-directory env tools (mise.toml `[env]`, `.envrc`) let a
+  repository set environment variables. A global file rejected for
+  another key still keeps the lock. If `XDG_CONFIG_HOME` points away
+  from `~/.config/opencode/supervisor/config.json` and that file sets
+  the lock, the home-directory file is used. To unlock, edit the global
+  file.
 
 The identity log line reports `lockGuards=<bool>` and the profile
-names. An applied exemption logs once per profile and tool.
+names. An applied exemption logs once per profile and tool, only when
+it decided the call.
 
 ---
 

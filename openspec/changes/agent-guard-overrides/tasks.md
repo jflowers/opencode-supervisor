@@ -50,3 +50,22 @@
 - [ ] 5.3 `/uf.review-council` (runs inside OpenCode; draft PR until
   then; docs issue #50, website capabilities issue
   unbound-force/website#412, blog issue #52)
+
+## 5. Review round 2
+
+- [x] 5.1 lock fails closed: a rejected global file keeps
+  `lockGuards: true`
+- [x] 5.2 lock covers guard-disabling environment variables;
+  `XDG_CONFIG_HOME` cannot escape a home-directory lock (home
+  from the OS account)
+- [x] 5.3 a command scopes one task: cleared by the first
+  human-typed message after idle
+- [x] 5.4 failed parent lookups are not cached; retried after a
+  backoff
+- [x] 5.5 lineage resolves only when a profile could exempt the
+  tool; exempt-tool globs compile once
+- [x] 5.6 exemption notice logs only when the exemption decided
+  the call
+- [x] 5.7 wildcard exempt globs must start with an MCP server
+  prefix
+- [x] 5.8 tests and mutation checks for each fix on both runners

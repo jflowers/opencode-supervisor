@@ -290,10 +290,31 @@ export const validateSupervisorConfig = (value: unknown): ParsedSupervisorConfig
  */
 export const parseSupervisorConfigFile = (raw: string): ParsedSupervisorConfig => {
   let parsed: unknown;
+  let result: ParsedSupervisorConfig;
   try {
     parsed = JSON.parse(raw);
+    result = validateSupervisorConfig(parsed);
   } catch (error) {
-    return { config: {}, error: `invalid JSON: ${String(error)}` };
+    result = { config: {}, error: `invalid JSON: ${String(error)}` };
   }
-  return validateSupervisorConfig(parsed);
+  // FR-075 (design D6): the guard lock fails closed. A file rejected
+  // for any other reason (a wrong-typed key, malformed JSON) still
+  // keeps `lockGuards: true` when it asks for it, so one typo cannot
+  // silently unlock the guards for every lower tier.
+  if (result.error !== null && lockRequested(parsed, raw)) {
+    return { config: { lockGuards: true }, error: result.error };
+  }
+  return result;
+};
+
+/**
+ * True when a config file asks for the guard lock: parsed JSON with
+ * `lockGuards: true`, or — when the JSON does not parse — the literal
+ * text `"lockGuards": true`. Used only on rejected files.
+ */
+export const lockRequested = (parsed: unknown, raw: string): boolean => {
+  if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+    return (parsed as Record<string, unknown>).lockGuards === true;
+  }
+  return /"lockGuards"\s*:\s*true\b/.test(raw);
 };
