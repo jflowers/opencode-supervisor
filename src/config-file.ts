@@ -318,3 +318,46 @@ export const lockRequested = (parsed: unknown, raw: string): boolean => {
   }
   return /"lockGuards"\s*:\s*true\b/.test(raw);
 };
+
+/** The 1.x environment-variable prefix (renamed in 2.0.0, FR-019). */
+export const LEGACY_ENV_PREFIX = 'OPENCODE_AUDITOR_';
+
+/** The 2.x environment-variable prefix that replaced it. */
+export const SUPERVISOR_ENV_PREFIX = 'OPENCODE_SUPERVISOR_';
+
+/** Most legacy names one warning lists before counting the rest (FR-076, design D3). */
+export const MAX_LEGACY_ENV_NAMES = 10;
+
+/**
+ * Names of set legacy 1.x variables (FR-076, design D1): sorted names
+ * with the `OPENCODE_AUDITOR_` prefix and a non-empty value. Only
+ * presence is tested — values are never returned, so they can never
+ * be logged or applied (FR-019 stays a clean break).
+ */
+export const detectLegacyEnvNames = (env: Record<string, string | undefined>): string[] =>
+  Object.keys(env)
+    .filter((name) => name.startsWith(LEGACY_ENV_PREFIX) && typeof env[name] === 'string' && env[name] !== '')
+    .sort();
+
+/**
+ * One bounded migration warning for the detected legacy names
+ * (FR-076, design D2/D3), or null when there are none. Each name is
+ * paired with its `OPENCODE_SUPERVISOR_` replacement; the endpoint
+ * variable, removed in 1.0, is named as removed.
+ */
+export const legacyEnvWarning = (names: readonly string[]): string | null => {
+  if (names.length === 0) {
+    return null;
+  }
+  const listed = names.slice(0, MAX_LEGACY_ENV_NAMES).map((name) =>
+    name === `${LEGACY_ENV_PREFIX}ENDPOINT`
+      ? `${name} (removed in 1.0, no replacement)`
+      : `${name} → ${SUPERVISOR_ENV_PREFIX}${name.slice(LEGACY_ENV_PREFIX.length)}`
+  );
+  const remainder = names.length - listed.length;
+  const more = remainder > 0 ? `, and ${remainder} more` : '';
+  return (
+    `legacy 1.x environment variables are set and ignored: ${listed.join(', ')}${more}. ` +
+    'Rename them (values are not read); see README "Migrating from 1.x".'
+  );
+};

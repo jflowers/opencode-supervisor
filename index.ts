@@ -106,6 +106,8 @@ import {
 } from './src/gates.ts';
 import {
   MAX_CONFIG_FILE_BYTES,
+  detectLegacyEnvNames,
+  legacyEnvWarning,
   parseSupervisorConfigFile,
   validateSupervisorConfig,
   type ParsedSupervisorConfig,
@@ -1534,6 +1536,14 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
     ...gateWarnings,
   ];
   let bootstrapFlushed = false;
+  // FR-076: legacy 1.x OPENCODE_AUDITOR_* names are detected (never
+  // read) so a silent fallback to defaults after the 2.0.0 rename is
+  // observable — e.g. a stale BLOCK_REWARD_HACKING=false re-arming the
+  // guard without explanation.
+  const legacyWarning = legacyEnvWarning(detectLegacyEnvNames(process.env));
+  if (legacyWarning !== null) {
+    bootstrapWarnings.push(legacyWarning);
+  }
   // FR-057: file config tiers, read once per plugin start. An absent
   // file is the unconfigured state (silent); a present-but-invalid
   // file is skipped with one warning — the tier dissolves, lower tiers

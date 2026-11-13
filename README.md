@@ -827,7 +827,10 @@ improving accuracy
 
 Formerly `opencode-reasoning-audit` (1.x). Version 2.0.0 renames the
 plugin and its configuration surface; the break is clean — 1.x names
-are not read as aliases.
+are not read as aliases. If any `OPENCODE_AUDITOR_*` variable is
+still set, the plugin logs one warning at load (server log, service
+`opencode-supervisor`) naming each variable and its replacement; the
+values themselves are never read.
 
 | 1.x variable | 2.0.0 variable |
 | :--- | :--- |

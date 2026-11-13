@@ -5,6 +5,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Legacy environment-variable warning (FR-076, #8): when any 1.x
+  `OPENCODE_AUDITOR_*` variable is set, the plugin logs one warning
+  at load naming each one with its `OPENCODE_SUPERVISOR_*`
+  replacement (`OPENCODE_AUDITOR_ENDPOINT` is named as removed).
+  Values are never read or logged; the 2.0.0 no-alias contract
+  (FR-019) is unchanged, and a regression test now pins it. A stale
+  `OPENCODE_AUDITOR_BLOCK_REWARD_HACKING=false` no longer re-arms
+  the tool guard silently.
+
 ## [2.9.1] - 2026-11-13
 
 ### Changed
