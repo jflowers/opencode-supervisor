@@ -7,6 +7,9 @@ import type { Hooks, PluginInput } from '@opencode-ai/plugin';
 import plugin, { resolveHookConfig } from '../index.ts';
 import { logIdentityState, sessionState } from '../index.ts';
 import {
+  MAX_LEGACY_ENV_NAMES,
+  detectLegacyEnvNames,
+  legacyEnvWarning,
   parseSupervisorConfigFile,
   validateSupervisorConfig,
   type SupervisorFileConfig,
@@ -558,4 +561,130 @@ test('the global config file applies when XDG_CONFIG_HOME is set', async () => {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(xdgRoot, { recursive: true, force: true });
   }
+});
+
+// ── Legacy 1.x environment variables (FR-076, FR-019) ─────────────
+
+test('detectLegacyEnvNames returns sorted set legacy names and skips empty values', () => {
+  const names = detectLegacyEnvNames({
+    OPENCODE_AUDITOR_STRIP_MODE: 'strict',
+    OPENCODE_AUDITOR_BLOCK_REWARD_HACKING: 'false',
+    OPENCODE_AUDITOR_MODEL: '',
+    OPENCODE_SUPERVISOR_MODEL: 'a/b',
+    OPENCODE_AUDITOR_VARIANT: undefined,
+    PATH: '/usr/bin',
+  });
+  assert.deepEqual(names, ['OPENCODE_AUDITOR_BLOCK_REWARD_HACKING', 'OPENCODE_AUDITOR_STRIP_MODE']);
+});
+
+test('legacyEnvWarning is null when no legacy names are set', () => {
+  assert.equal(legacyEnvWarning([]), null);
+});
+
+test('legacyEnvWarning pairs each name with its replacement and names the removed endpoint', () => {
+  const message = legacyEnvWarning(['OPENCODE_AUDITOR_ENDPOINT', 'OPENCODE_AUDITOR_MAX_REGENERATIONS']);
+  assert.ok(message !== null);
+  assert.ok(message.includes('OPENCODE_AUDITOR_ENDPOINT (removed in 1.0, no replacement)'), message);
+  assert.ok(
+    message.includes('OPENCODE_AUDITOR_MAX_REGENERATIONS → OPENCODE_SUPERVISOR_MAX_REGENERATIONS'),
+    message
+  );
+  assert.ok(message.includes('Migrating from 1.x'), message);
+});
+
+test('legacyEnvWarning lists at most the bound and counts the rest', () => {
+  const names = Array.from({ length: MAX_LEGACY_ENV_NAMES + 3 }, (_, i) => `OPENCODE_AUDITOR_KNOB_${String(i).padStart(2, '0')}`);
+  const message = legacyEnvWarning(names);
+  assert.ok(message !== null);
+  assert.ok(message.includes(`OPENCODE_AUDITOR_KNOB_${String(MAX_LEGACY_ENV_NAMES - 1).padStart(2, '0')}`), message);
+  assert.ok(!message.includes(`OPENCODE_AUDITOR_KNOB_${String(MAX_LEGACY_ENV_NAMES).padStart(2, '0')}`), message);
+  assert.ok(message.includes(', and 3 more'), message);
+});
+
+/** Sets legacy variables for one test and always removes them. */
+async function withLegacyEnv(vars: Record<string, string>, run: () => Promise<void>): Promise<void> {
+  const saved: Record<string, string | undefined> = {};
+  for (const [name, value] of Object.entries(vars)) {
+    saved[name] = process.env[name];
+    process.env[name] = value;
+  }
+  try {
+    await run();
+  } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
+  }
+}
+
+test('a set legacy variable warns once at load, naming its replacement but not its value', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-legacy-'));
+  try {
+    await withCleanConfigEnv(async () => {
+      await withLegacyEnv({ OPENCODE_AUDITOR_BLOCK_REWARD_HACKING: 'legacy-sentinel-value' }, async () => {
+        const harness = serverHarness(dir, { small_model: 'derived/legacy-model' });
+        const hooks = await plugin.server(harness.input);
+        await dispatchPart(hooks, completedReasoningPart({ sessionID: 'legacy-env-session' }));
+        await dispatchPart(hooks, completedReasoningPart({ sessionID: 'legacy-env-session' }));
+        const warnings = harness.logEntries.filter(
+          (entry) => entry.level === 'warn' && entry.message.includes('legacy 1.x environment variables')
+        );
+        assert.equal(warnings.length, 1);
+        assert.ok(
+          warnings[0].message.includes(
+            'OPENCODE_AUDITOR_BLOCK_REWARD_HACKING → OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING'
+          ),
+          warnings[0].message
+        );
+        assert.ok(
+          harness.logEntries.every((entry) => !entry.message.includes('legacy-sentinel-value')),
+          'legacy values never reach the log'
+        );
+        await hooks.dispose!();
+      });
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('no legacy variables means no legacy warning', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-legacy-'));
+  const hostLegacy = detectLegacyEnvNames(process.env);
+  const saved = hostLegacy.map((name) => [name, process.env[name]] as const);
+  for (const name of hostLegacy) {
+    delete process.env[name];
+  }
+  try {
+    await withCleanConfigEnv(async () => {
+      const harness = serverHarness(dir, { small_model: 'derived/legacy-model' });
+      const hooks = await plugin.server(harness.input);
+      await dispatchPart(hooks, completedReasoningPart({ sessionID: 'no-legacy-env-session' }));
+      assert.ok(harness.logEntries.every((entry) => !entry.message.includes('legacy 1.x environment variables')));
+      await hooks.dispose!();
+    });
+  } finally {
+    for (const [name, value] of saved) {
+      process.env[name] = value;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a legacy variable is ignored: the default applies as if unset (FR-019)', async () => {
+  await withCleanConfigEnv(async () => {
+    const defaults = resolveHookConfig(undefined, {});
+    await withLegacyEnv(
+      { OPENCODE_AUDITOR_MAX_REGENERATIONS: String(defaults.maxRegenerations + 7), OPENCODE_AUDITOR_STRIP_MODE: 'strict' },
+      async () => {
+        const config = resolveHookConfig(undefined, {});
+        assert.equal(config.maxRegenerations, defaults.maxRegenerations);
+        assert.equal(config.stripMode, defaults.stripMode);
+      }
+    );
+  });
 });

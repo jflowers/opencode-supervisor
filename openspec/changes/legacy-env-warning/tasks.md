@@ -9,16 +9,16 @@
 
 ## 2. Detection (FR-076)
 
-- [ ] 2.1 `src/config-file.ts`: pure `detectLegacyEnvNames(env)`
+- [x] 2.1 `src/config-file.ts`: pure `detectLegacyEnvNames(env)`
   and `legacyEnvWarning(names)` (replacement mapping, removed
   endpoint, 10-name bound)
-- [ ] 2.2 `index.ts`: push the warning onto `bootstrapWarnings`
-- [ ] 2.3 tests: detector and message units; hook-layer warning
+- [x] 2.2 `index.ts`: push the warning onto `bootstrapWarnings`
+- [x] 2.3 tests: detector and message units; hook-layer warning
   with no value leak; no-warning case; FR-019 legacy-ignored
   regression
 
 ## 3. Integration and release
 
-- [ ] 3.1 both runners green: `bun test` and `npm run test:node`
-- [ ] 3.2 docs: README §10.2 note, CHANGELOG Unreleased entry
+- [x] 3.1 both runners green: `bun test` and `npm run test:node`
+- [x] 3.2 docs: README §10.2 note, CHANGELOG Unreleased entry
 - [ ] 3.3 `/uf.review-council`
