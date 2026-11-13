@@ -27,3 +27,4 @@ replicator.log
 cells.json
 node_modules
 opencode.json
+.ci-xdg/

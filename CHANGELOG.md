@@ -5,8 +5,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.9.0] - 2026-11-13
+
 ### Added
 
+- npm distribution as `@jflowers/opencode-supervisor` (the unscoped
+  name belongs to an unrelated package): install with
+  `opencode plugin @jflowers/opencode-supervisor@2.9.0 --global`, or
+  commit the pinned entry to a project's `opencode.json` for a team.
+  The package ships the TypeScript sources (`exports["./server"]`),
+  declares `engines.opencode: ">=1.19.0"`, and takes
+  `@opencode-ai/plugin` as a peer dependency. The README's Quickstart
+  covers team installs, pinning (OpenCode never refreshes a cached
+  `@latest`), running from a clone, and releasing.
+- CI (typecheck, Bun and Node tests, tarball check) and a Publish
+  workflow that releases any unpublished `package.json` version from
+  `main` through npm trusted publishing with provenance, then tags it.
+- MIT `LICENSE` file (the license was declared but the file was missing).
 - Task-scoped guard profiles (FR-072..FR-074, #48, #47): the supervisor
   records each session's slash command (`command.execute.before`, kept
   for that command's task — until the first human-typed message after
@@ -40,6 +55,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `lockGuards` and the profile names.
 
 ### Changed
+
+- Dropped the unused `zod` dependency; pinned `bun-types`, added
+  `typescript` and a `typecheck` script. Fixed the one type error in
+  the plugin source (tool-arg repair evidence collection; no behavior
+  change).
 
 - Reward-hacking check scope (FR-071, #46): the markers (`--no-verify`,
   `.skip(`, `expect(true).toBe(true)`, `rm -rf tests`) are now looked
