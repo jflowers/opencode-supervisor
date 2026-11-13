@@ -1,0 +1,10 @@
+schema: spec-driven
+created: 2026-11-13
+originating_issue: 8
+goal: Warn once at plugin load when legacy 1.x OPENCODE_AUDITOR_* environment variables are set, without reading their values
+affected_areas:
+  - src/config-file.ts
+  - index.ts
+  - test/config-file.test.ts
+  - README.md
+  - CHANGELOG.md
