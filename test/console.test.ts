@@ -10,19 +10,21 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Hooks, PluginInput, ToolContext } from '@opencode-ai/plugin';
-import plugin, { sessionState } from '../index.ts';
+import plugin, { resolveHookConfig, sessionState } from '../index.ts';
 import {
   addReport,
   CRITIQUE_RETENTION_CAP,
+  MAX_AUDIT_FOCUS,
   MAX_REPORT_TEXT,
+  prepareAuditFocus,
   prepareReportText,
   renderRecall,
   renderReports,
-  REPORT_KINDS,
   SOLVED_RETENTION_CAP,
   type AgentReport,
 } from '../src/console.ts';
 import { buildMemo } from '../src/memo.ts';
+import { PLUGIN_ID } from '../src/plugin-id.ts';
 import { silentClientSurface, silentPluginInput } from './mocks.ts';
 
 /** A stored report with a fixed timestamp — the module never touches the clock. */
@@ -366,7 +368,7 @@ test('report truncates over-length text and notes it in the result', async () =>
       { kind: 'note', text: 'a'.repeat(2500) },
       toolContext('console-report-truncate')
     );
-    assert.ok(result.includes('(truncated to 2000 characters)'));
+    assert.ok(result.includes(`(truncated to ${MAX_REPORT_TEXT} characters)`));
     const state = sessionState.get('console-report-truncate');
     assert.equal(state.agentReports[0].text.length, MAX_REPORT_TEXT);
   });
@@ -392,6 +394,23 @@ test('report bounds stored reports to the configured maxReports', async () => {
     assert.ok(memo.includes('- [note] second'));
     assert.ok(memo.includes('- [note] third'));
     assert.ok(!memo.includes('- [note] first'));
+  });
+});
+
+test('report says reports are disabled and stores nothing when maxReports is 0 (FR-077)', async () => {
+  await withCleanConsoleEnv(async () => {
+    process.env.OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS = '0';
+    const hooks = await plugin.server(silentPluginInput());
+    const result = await hooks.tool!.report.execute(
+      { kind: 'note', text: 'worth keeping' },
+      toolContext('console-report-disabled')
+    );
+    assert.equal(result, 'Reports are disabled (maxReports is 0) — nothing was stored.');
+    assert.ok(!result.includes('memo'));
+    assert.equal(sessionState.peek('console-report-disabled'), undefined);
+    // Validation still runs first: an unknown kind keeps its actionable result.
+    const unknown = await hooks.tool!.report.execute({ kind: 'todo', text: 'x' }, toolContext('console-report-disabled'));
+    assert.ok(unknown.startsWith('Unknown report kind'));
   });
 });
 
@@ -431,6 +450,15 @@ test('recall returns the full retained solved items beyond the memo render cap',
     const result = await hooks.tool!.recall.execute({ what: 'solved' }, toolContext(sessionID));
     assert.ok(result.includes('step one done'));
     assert.ok(result.includes('step eight done'));
+  });
+});
+
+test('recall reads without creating session state', async () => {
+  await withCleanConsoleEnv(async () => {
+    const hooks = await plugin.server(silentPluginInput());
+    const result = await hooks.tool!.recall.execute({ what: 'goal' }, toolContext('console-recall-peek'));
+    assert.equal(result, 'No goal is stored for this session.');
+    assert.equal(sessionState.peek('console-recall-peek'), undefined);
   });
 });
 
@@ -594,6 +622,44 @@ test('request_audit is bounded per session', async () => {
     );
     // Only the first request reached the model.
     assert.equal(calls.create.length, 1);
+  });
+});
+
+test('a session-config maxOnDemandAudits override beats the environment', async () => {
+  await withCleanConsoleEnv(async () => {
+    process.env.OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS = '1';
+    const session = { config: { plugins: { [PLUGIN_ID]: { maxOnDemandAudits: 4 } } } };
+    assert.equal(resolveHookConfig(session).maxOnDemandAudits, 4);
+    assert.equal(resolveHookConfig(undefined).maxOnDemandAudits, 1);
+  });
+});
+
+test('prepareAuditFocus trims, rejects empty focus, and truncates at MAX_AUDIT_FOCUS (FR-078)', () => {
+  assert.equal(MAX_AUDIT_FOCUS, MAX_REPORT_TEXT);
+  assert.deepEqual(prepareAuditFocus('  x = 1 + 1 = 2  '), { ok: true, text: 'x = 1 + 1 = 2', truncated: false });
+  const empty = prepareAuditFocus(' \n ');
+  assert.equal(empty.ok, false);
+  const long = prepareAuditFocus('a'.repeat(MAX_AUDIT_FOCUS + 50));
+  assert.ok(long.ok);
+  assert.equal(long.text.length, MAX_AUDIT_FOCUS);
+  assert.equal(long.truncated, true);
+});
+
+test('request_audit caps an over-length focus before the audit, trace, and result (FR-078)', async () => {
+  await withCleanConsoleEnv(async () => {
+    const { input, calls } = auditInput(PASSED_AUDIT);
+    const hooks = await plugin.server(input);
+    const focus = `x = 1 + 1 = 2 ${'y'.repeat(MAX_AUDIT_FOCUS)} TAIL_BEYOND_CAP`;
+    const result = await hooks.tool!.request_audit.execute({ focus }, toolContext('console-audit-cap'));
+    assert.ok(result.startsWith('Audit passed'));
+    assert.ok(result.includes(`(Focus truncated to ${MAX_AUDIT_FOCUS} characters before the audit.)`));
+    assert.ok(!result.includes('TAIL_BEYOND_CAP'));
+    assert.ok(!JSON.stringify(calls.prompt).includes('TAIL_BEYOND_CAP'));
+    const [entry] = sessionState.get('console-audit-cap').verifiedSteps;
+    assert.ok(entry.text.length <= MAX_AUDIT_FOCUS);
+    // A focus within the cap carries no note.
+    const short = await hooks.tool!.request_audit.execute({ focus: 'b = 2 + 2 = 4' }, toolContext('console-audit-cap'));
+    assert.ok(!short.includes('truncated'));
   });
 });
 

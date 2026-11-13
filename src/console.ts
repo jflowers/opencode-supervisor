@@ -79,6 +79,40 @@ export function prepareReportText(raw: string): PreparedReportText {
 }
 
 /**
+ * Fixed ceiling on the `request_audit` focus (FR-078): the same bound
+ * as report text, so every agent-authored console input is capped.
+ * Deliberately not configurable.
+ */
+export const MAX_AUDIT_FOCUS = MAX_REPORT_TEXT;
+
+/** Outcome of preparing a raw `request_audit` focus (FR-078). */
+export type PreparedAuditFocus =
+  | { ok: true; text: string; truncated: boolean }
+  | { ok: false; error: string };
+
+/**
+ * Prepares a `request_audit` focus before narrative stripping
+ * (FR-037, FR-078): whitespace-only input is rejected with the
+ * actionable message the tool returns; anything longer than
+ * MAX_AUDIT_FOCUS is truncated and flagged, so the stripper, the
+ * auditor prompt, the verified trace, and the result all see bounded
+ * text.
+ *
+ * @param raw The `request_audit` focus argument.
+ * @returns The prepared focus, or the rejection the tool returns verbatim.
+ */
+export function prepareAuditFocus(raw: string): PreparedAuditFocus {
+  const text = raw.trim();
+  if (text.length === 0) {
+    return { ok: false, error: 'Audit focus is empty after trimming — state the claim or step to check.' };
+  }
+  if (text.length > MAX_AUDIT_FOCUS) {
+    return { ok: true, text: text.slice(0, MAX_AUDIT_FOCUS), truncated: true };
+  }
+  return { ok: true, text, truncated: false };
+}
+
+/**
  * Appends a report, keeping at most the `cap` most recent entries
  * (FR-035). Pure: returns the next array rather than mutating, so the
  * hook layer assigns the result back to session state. A cap of zero or

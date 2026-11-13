@@ -69,6 +69,9 @@ import {
 import {
   addReport,
   CRITIQUE_RETENTION_CAP,
+  MAX_AUDIT_FOCUS,
+  MAX_REPORT_TEXT,
+  prepareAuditFocus,
   prepareReportText,
   renderRecall,
   REPORT_KINDS,
@@ -79,6 +82,7 @@ import {
 import {
   addReminder,
   clearReminder,
+  MAX_REMINDER_TEXT_LENGTH,
   prepareReminderText,
   type Reminder,
 } from './src/reminders.ts';
@@ -2727,6 +2731,13 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           if (!prepared.ok) {
             return prepared.error;
           }
+          // FR-077: a cap of zero or less stores nothing — say so, and
+          // consume no id, instead of confirming a memo entry that will
+          // never appear.
+          const maxReminders = (await buildConfig()).memoLimits.maxReminders;
+          if (maxReminders <= 0) {
+            return `Reminders are disabled (maxReminders is ${maxReminders}) — nothing was stored.`;
+          }
           const state = sessionState.get(context.sessionID);
           // D3: monotonic per-session sequence — ids are unique and never
           // recycled, so a stale forget_reminder can never hit a new
@@ -2738,11 +2749,11 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           state.reminders = addReminder(
             state.reminders,
             { id, text: prepared.text, addedAt: new Date().toISOString() },
-            (await buildConfig()).memoLimits.maxReminders
+            maxReminders
           );
           // FR-020: the result echoes the stored text and id — the
           // in-conversation delivery that survives gateway memo drops (D7).
-          const truncationNote = prepared.truncated ? ' (truncated to 2000 characters)' : '';
+          const truncationNote = prepared.truncated ? ` (truncated to ${MAX_REMINDER_TEXT_LENGTH} characters)` : '';
           return (
             `Reminder ${id} stored: ${prepared.text}${truncationNote}. ` +
             `It reappears in the supervisor memo each turn; clear it with forget_reminder ${id} when it no longer applies.`
@@ -2793,12 +2804,13 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           const what = typeof args?.what === 'string' ? args.what : 'all';
           // FR-033: read-only recall over the retained state (D3 retention
           // keeps more than the memo renders, so recall reaches further).
-          const state = sessionState.get(context.sessionID);
+          // Read-only: `peek` never creates state as a lookup side effect.
+          const state = sessionState.peek(context.sessionID);
           return renderRecall(what, {
-            goal: state.goal,
-            reminders: state.reminders,
-            solvedItems: state.solvedItems,
-            critiques: state.critiqueLog,
+            goal: state?.goal,
+            reminders: state?.reminders ?? [],
+            solvedItems: state?.solvedItems ?? [],
+            critiques: state?.critiqueLog ?? [],
           });
         },
       }),
@@ -2823,11 +2835,17 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
             return `Unknown report kind "${kind}" — supported kinds: ${REPORT_KINDS.join(', ')}.`;
           }
           // FR-025 hygiene mirrored: whitespace-only rejected, over-length
-          // truncated at the fixed ceiling (2000 characters).
+          // truncated at the fixed ceiling (MAX_REPORT_TEXT).
           const rawText = typeof args?.text === 'string' ? args.text : '';
           const prepared = prepareReportText(rawText);
           if (!prepared.ok) {
             return prepared.error;
+          }
+          // FR-077: a cap of zero or less stores nothing — the result
+          // must not claim memo delivery.
+          const maxReports = (await buildConfig()).memoLimits.maxReports;
+          if (maxReports <= 0) {
+            return `Reports are disabled (maxReports is ${maxReports}) — nothing was stored.`;
           }
           const state = sessionState.get(context.sessionID);
           // FR-035: storage bounded to the most recent reports at append
@@ -2835,11 +2853,11 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           state.agentReports = addReport(
             state.agentReports,
             { kind: kind as ReportKind, text: prepared.text, addedAt: new Date().toISOString() },
-            (await buildConfig()).memoLimits.maxReports
+            maxReports
           );
           // FR-034: the result echoes the stored text — in-conversation
           // delivery that survives gateway memo drops (D7).
-          const truncationNote = prepared.truncated ? ' (truncated to 2000 characters)' : '';
+          const truncationNote = prepared.truncated ? ` (truncated to ${MAX_REPORT_TEXT} characters)` : '';
           return `${kind} report recorded: ${prepared.text}${truncationNote}. It appears in the supervisor memo for the engineer.`;
         },
       }),
@@ -2859,18 +2877,22 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           }
           // FR-037/FR-041: whitespace-only focus is rejected without an
           // audit; odd payloads fall through to the same actionable result.
-          const focus = typeof args?.focus === 'string' ? args.focus : '';
-          if (focus.trim() === '') {
-            return 'Audit focus is empty after trimming — state the claim or step to check.';
+          // FR-078: the focus is capped at MAX_AUDIT_FOCUS before it
+          // reaches the stripper, the auditor prompt, the verified
+          // trace, or the result.
+          const prepared = prepareAuditFocus(typeof args?.focus === 'string' ? args.focus : '');
+          if (!prepared.ok) {
+            return prepared.error;
           }
+          const focusNote = prepared.truncated ? `\n(Focus truncated to ${MAX_AUDIT_FOCUS} characters before the audit.)` : '';
           const state = sessionState.get(context.sessionID);
           const config = await buildConfig();
           // FR-037: the same pipeline as reasoning steps — strip narrative
           // per config.stripMode before invariants and the audit itself.
-          const [stripped] = stripNarrative([focus], config.stripMode);
+          const [stripped] = stripNarrative([prepared.text], config.stripMode);
           if (stripped === undefined || stripped === '') {
             // No formal content survives: no model call, no bound use.
-            return 'Audit focus contained no formal content after narrative stripping — restate the claim with the code, math, or commands it depends on.';
+            return `Audit focus contained no formal content after narrative stripping — restate the claim with the code, math, or commands it depends on.${focusNote}`;
           }
           // FR-039: per-session bound; rejections above never consume it.
           if (state.onDemandAuditCount >= config.maxOnDemandAudits) {
@@ -2893,12 +2915,12 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
               // on-demand audit never overclaims LLM review.
               if (outcome.error !== undefined) {
                 logger.warn(`on-demand audit failed open; focus recorded as passed: ${outcome.error}`);
-                return `Audit infrastructure failed open — the focus is recorded as passed without LLM review:\n${stripped}`;
+                return `Audit infrastructure failed open — the focus is recorded as passed without LLM review:\n${stripped}${focusNote}`;
               }
               if (config.auditorModel === undefined) {
-                return `Audit passed on deterministic invariants only (no auditor model configured) — the focus is recorded in the verified trace:\n${stripped}`;
+                return `Audit passed on deterministic invariants only (no auditor model configured) — the focus is recorded in the verified trace:\n${stripped}${focusNote}`;
               }
-              return `Audit passed — the focus is recorded in the verified trace:\n${stripped}`;
+              return `Audit passed — the focus is recorded in the verified trace:\n${stripped}${focusNote}`;
             }
             // FR-038: solicited critique — delivered in this tool result
             // only. No steer, no interrupt, no regeneration-budget use;
@@ -2909,10 +2931,10 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
               { text: outcome.critique, severity, delivered: true },
               CRITIQUE_RETENTION_CAP
             );
-            return `Audit failed (${severity}):\n${outcome.critique}`;
+            return `Audit failed (${severity}):\n${outcome.critique}${focusNote}`;
           } catch (error) {
             // FR-041: never throw — the tool result is the channel.
-            return `Audit infrastructure failed open: ${errorText(error)} — the automatic audit loop remains in effect.`;
+            return `Audit infrastructure failed open: ${errorText(error)} — the automatic audit loop remains in effect.${focusNote}`;
           }
         },
       }),
