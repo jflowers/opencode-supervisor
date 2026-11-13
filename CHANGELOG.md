@@ -16,6 +16,42 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `OPENCODE_AUDITOR_BLOCK_REWARD_HACKING=false` no longer re-arms
   the tool guard silently.
 
+### Fixed
+
+- Directive path globs match the spellings agents use (FR-079, #55,
+  from #17): `forbidPath` and `when` path globs now match the whole
+  path or any part after a `/`, so `./secrets/token`,
+  `~/secrets/token`, and `/home/dev/proj/secrets/token` all match
+  `secrets/**`, and paths nested in array or object arguments
+  (`edits[0].filePath`) are checked too. Before, those spellings
+  walked past a directory-scoped forbid. A glob that starts with `/`
+  still matches whole absolute paths only.
+- `remind_me` and `report` no longer claim success when their cap is
+  0 (FR-077, #55, from #13 and #22): they say reminders or reports
+  are disabled and store nothing, and `remind_me` no longer uses up
+  a reminder id. `buildMemo` fills a missing or non-numeric cap with
+  its default, so JavaScript callers passing an older `MemoLimits`
+  object without `maxReminders` / `maxReports` stay bounded.
+- `request_audit` caps its focus at 2000 characters, like report text
+  (FR-078, #55, from #22), before the auditor prompt, the verified
+  trace, or the result see it; the result notes a truncation.
+
+### Changed
+
+- At most 25 directive files are read (FR-079); files past that are
+  never parsed and produce one warning instead of one per file.
+- The startup identity log line names each loaded directive and its
+  source, for example `directives: 2 [no-secrets (no-secrets.md),
+  prefer-bun (options)]`, instead of only a count (FR-079, from #17).
+- Code hygiene from the #9, #13, #17, and #22 review councils, with
+  no behavior change: one `PLUGIN_ID` constant (`src/plugin-id.ts`);
+  `SolvedItem`, `CritiqueRecord`, and one `takeMostRecent` helper in
+  `src/records.ts`, which breaks the `memo.ts` / `console.ts` import
+  cycle; one generic directive rule normalizer and a shared parse
+  step; trigger globs compiled once at startup; truncation notes
+  built from the length constants; `recall` reads state without
+  creating it; shared test helpers moved to `test/mocks.ts`.
+
 ## [2.9.1] - 2026-11-13
 
 ### Changed
