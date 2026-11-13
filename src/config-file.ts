@@ -17,6 +17,7 @@
 import { validateProfiles, type GuardProfile } from './guard-profiles.ts';
 import { SUPERVISOR_MODES, type ArgRepairConfig, type SupervisorMode } from './arg-repair.ts';
 import type { AuditorVariant } from './auditor.ts';
+import { READ_POLICIES, type ExternalAccessConfig, type ReadPolicy } from './external-access.ts';
 import type { MemoLimits } from './memo.ts';
 import type { StripMode } from './stripper.ts';
 
@@ -57,6 +58,8 @@ export interface SupervisorFileConfig {
   profiles?: GuardProfile[];
   /** Global-file only: lower tiers cannot turn guards off (FR-075). */
   lockGuards?: boolean;
+  /** External-access supervision (FR-088); unset keys fall through to the next tier. */
+  externalAccess?: Partial<ExternalAccessConfig>;
 }
 
 /** Parse outcome: the accepted subset, or an error when rejected. */
@@ -268,6 +271,27 @@ export const validateSupervisorConfig = (value: unknown): ParsedSupervisorConfig
     if (timeoutMs.error !== null) return reject('"argRepair.timeoutMs" must be a non-negative integer');
     if (timeoutMs.value !== undefined) argRepair.timeoutMs = timeoutMs.value;
     config.argRepair = argRepair;
+  }
+
+  // FR-088: external-access supervision. Unknown sub-keys are
+  // ignored like argRepair's; a wrong-typed value rejects the tier.
+  const externalAccessRaw = value.externalAccess;
+  if (externalAccessRaw !== undefined) {
+    if (!isRecord(externalAccessRaw)) {
+      return reject('"externalAccess" must be an object');
+    }
+    const externalAccess: Partial<ExternalAccessConfig> = {};
+    const enabled = optionalBoolean(externalAccessRaw, 'enabled');
+    if (enabled.error !== null) return reject('"externalAccess.enabled" must be a boolean');
+    if (enabled.value !== undefined) externalAccess.enabled = enabled.value;
+    const readPolicy = externalAccessRaw.readPolicy;
+    if (readPolicy !== undefined) {
+      if (typeof readPolicy !== 'string' || !READ_POLICIES.includes(readPolicy as ReadPolicy)) {
+        return reject(`"externalAccess.readPolicy" must be one of ${READ_POLICIES.join(', ')}`);
+      }
+      externalAccess.readPolicy = readPolicy as ReadPolicy;
+    }
+    config.externalAccess = externalAccess;
   }
 
   // FR-073 (design D2): profiles validate one by one — a bad

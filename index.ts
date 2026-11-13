@@ -8,7 +8,9 @@
  * the agent self-serve reminder tools (`tool`, FR-020/FR-021),
  * the agent console's second slice — recall, report, and
  * on-demand audit tools (`tool`, FR-033..FR-041),
- * load and enforce engineer directives (FR-026..FR-032), and inject
+ * load and enforce engineer directives (FR-026..FR-032), gate tool
+ * calls outside the project root on engineer-mediated grants when
+ * external-access supervision is enabled (FR-080..FR-089), and inject
  * the supervision memo (`experimental.chat.messages.transform`; FR-016
  * moved off `experimental.chat.system.transform` — OpenCode 1.19.0
  * discards system-transform payload mutations, so the memo rides a
@@ -131,6 +133,33 @@ import {
   traceExemption,
   type SessionContext,
 } from './src/guard-profiles.ts';
+import {
+  accessNeedsGrant,
+  accessQuestionText,
+  appendRecent,
+  buildAccessQuestion,
+  classifyToolAccess,
+  decideExternalAccess,
+  DEFAULT_EXTERNAL_ACCESS,
+  EXTERNAL_GRANTS_FILE,
+  findExternalPaths,
+  grantCovers,
+  grantFileRecord,
+  isGateNeutralTool,
+  matchQuestionReplies,
+  MAX_EXTERNAL_GRANTS_FILE_BYTES,
+  MAX_PENDING_ACCESS_REQUESTS,
+  MAX_SESSION_GRANTS,
+  parseExternalGrants,
+  prepareAccessRequest,
+  READ_POLICIES,
+  renderExternalAccess,
+  type AccessRequest,
+  type ExternalAccessConfig,
+  type ExternalGrant,
+  type PathContext,
+  type ReadPolicy,
+} from './src/external-access.ts';
 
 // ── Configuration (session plugin config → environment → defaults) ──
 
@@ -148,6 +177,8 @@ const ENV_MAX_TIMEOUT_FAIL_OPENS = 'OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS';
 const ENV_MAX_COVERED_TIMEOUT_FAIL_OPENS = 'OPENCODE_SUPERVISOR_MAX_COVERED_TIMEOUT_FAIL_OPENS';
 const ENV_MODE = 'OPENCODE_SUPERVISOR_MODE';
 const ENV_REPAIR_MODEL = 'OPENCODE_SUPERVISOR_REPAIR_MODEL';
+const ENV_EXTERNAL_ACCESS = 'OPENCODE_SUPERVISOR_EXTERNAL_ACCESS';
+const ENV_EXTERNAL_ACCESS_READ_POLICY = 'OPENCODE_SUPERVISOR_EXTERNAL_ACCESS_READ_POLICY';
 
 /**
  * Hook-layer configuration: the auditor's `AuditConfig` plus the memo
@@ -169,6 +200,8 @@ export interface HookConfig extends AuditConfig {
   mode: SupervisorMode;
   /** Tool-argument repair configuration (deterministic first, model tier second). */
   argRepair: ArgRepairConfig;
+  /** External-access supervision (FR-088): off by default; reads pass unless `readPolicy: 'gate'`. */
+  externalAccess: ExternalAccessConfig;
 }
 
 /**
@@ -190,6 +223,7 @@ export const pluginConfig: HookConfig = {
   maxCoveredTimeoutFailOpens: 6,
   mode: 'full',
   argRepair: { ...DEFAULT_ARG_REPAIR, tools: [...DEFAULT_ARG_REPAIR.tools] },
+  externalAccess: { ...DEFAULT_EXTERNAL_ACCESS },
 };
 
 /**
@@ -282,6 +316,14 @@ function argRepairOverrides(value: unknown): Partial<ArgRepairConfig> {
   return typeof value === 'object' && value !== null ? (value as Partial<ArgRepairConfig>) : {};
 }
 
+function externalAccessOverrides(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {};
+}
+
+function pickReadPolicy(value: unknown): ReadPolicy | undefined {
+  return READ_POLICIES.includes(value as ReadPolicy) ? (value as ReadPolicy) : undefined;
+}
+
 /**
  * File/options config tiers for `resolveHookConfig` (FR-056). Each tier
  * is a validated `SupervisorFileConfig` subset; `derivedModel` carries
@@ -338,8 +380,14 @@ export function resolveHookConfig(
   const guardOn = (value: boolean | undefined): boolean | undefined => (locked && value === false ? undefined : value);
   const fullMode = (value: SupervisorMode | undefined): SupervisorMode | undefined =>
     locked && value === 'repair-only' ? undefined : value;
+  // FR-088 (external-access design D10): the external-access gate is
+  // a guard — under the lock, tiers above the global file can neither
+  // disable it nor relax `readPolicy` to 'allow'.
+  const strictPolicy = (value: ReadPolicy | undefined): ReadPolicy | undefined =>
+    locked && value === 'allow' ? undefined : value;
   const memoOverrides = memoLimitOverrides(overrides.memoLimits);
   const repairOverrides = argRepairOverrides(overrides.argRepair);
+  const accessOverrides = externalAccessOverrides(overrides.externalAccess);
   const base = resolveAuditorConfig(pluginConfig, session);
   const auditorModel = tiered(
     base.auditorModel,
@@ -445,6 +493,26 @@ export function resolveHookConfig(
         tiered(sources.project?.argRepair?.timeoutMs, sources.options?.argRepair?.timeoutMs, sources.global?.argRepair?.timeoutMs) ??
         pluginConfig.argRepair.timeoutMs,
     },
+    externalAccess: {
+      enabled:
+        guardOn(pickBoolean(accessOverrides.enabled)) ??
+        guardOn(envBoolean(ENV_EXTERNAL_ACCESS)) ??
+        tiered(
+          sources.project?.externalAccess?.enabled,
+          sources.options?.externalAccess?.enabled,
+          sources.global?.externalAccess?.enabled
+        ) ??
+        pluginConfig.externalAccess.enabled,
+      readPolicy:
+        strictPolicy(pickReadPolicy(accessOverrides.readPolicy)) ??
+        strictPolicy(pickReadPolicy(envText(ENV_EXTERNAL_ACCESS_READ_POLICY))) ??
+        tiered(
+          sources.project?.externalAccess?.readPolicy,
+          sources.options?.externalAccess?.readPolicy,
+          sources.global?.externalAccess?.readPolicy
+        ) ??
+        pluginConfig.externalAccess.readPolicy,
+    },
   };
 }
 
@@ -548,6 +616,17 @@ export interface SessionState {
   parentID: string | null | undefined;
   /** Epoch ms before which a failed parent lookup is not retried (design D4). */
   parentLookupRetryAt: number;
+  /**
+   * Question-flow external-access grants (FR-085, external-access
+   * design D6): `once` and `session` lifetimes, bounded to the most
+   * recent MAX_SESSION_GRANTS. Session grants also apply to
+   * descendant sessions; once grants are removed when spent (FR-086).
+   */
+  externalGrants: ExternalGrant[];
+  /** Pending `request_access` requests (FR-084), bounded to MAX_PENDING_ACCESS_REQUESTS. */
+  pendingAccessRequests: AccessRequest[];
+  /** Monotonic request-id sequence: ids are `ax<n>` and never recycled. */
+  accessRequestSeq: number;
 }
 
 /** Module-level state (design D4), keyed by session ID. */
@@ -579,6 +658,9 @@ function emptySessionState(): SessionState {
     commandEnded: false,
     parentID: undefined,
     parentLookupRetryAt: 0,
+    externalGrants: [],
+    pendingAccessRequests: [],
+    accessRequestSeq: 0,
   };
 }
 
@@ -1420,6 +1502,27 @@ const readApprovals = (directory: string): { records: ApprovalRecord[]; error: s
 };
 
 /**
+ * Reads the engineer's external-access grants (FR-083, external-access
+ * design D4) from `<directory>/.opencode/supervisor/external-access.json`,
+ * fresh, for a gated call no session grant covers — grants and
+ * revocations apply on the next call. Mirrors `readApprovals`: an
+ * absent file is no grants; a read or parse error returns as an error
+ * string so the gate fails closed. Parsing lives in
+ * src/external-access.ts.
+ */
+const readExternalGrants = (directory: string, home: string): { grants: ExternalGrant[]; error: string | null } => {
+  const { text, error } = readBoundedFile(
+    path.join(directory, EXTERNAL_GRANTS_FILE),
+    MAX_EXTERNAL_GRANTS_FILE_BYTES,
+    'external-access grants file'
+  );
+  if (error !== null || text === null) {
+    return { grants: [], error };
+  }
+  return parseExternalGrants(text, home);
+};
+
+/**
  * Reads one supervisor config file (FR-057), mirroring `readApprovals`:
  * a size-bounded read (a planted oversized file is skipped with an
  * error rather than stalling the event loop), an absent file is simply
@@ -1625,6 +1728,14 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
     if (pickSupervisorMode(envText(ENV_MODE)) === 'repair-only') {
       bootstrapWarnings.push(`environment sets ${ENV_MODE}=repair-only; ignored because the global config sets lockGuards: true`);
     }
+    if (envBoolean(ENV_EXTERNAL_ACCESS) === false) {
+      bootstrapWarnings.push(`environment sets ${ENV_EXTERNAL_ACCESS}=false; ignored because the global config sets lockGuards: true`);
+    }
+    if (pickReadPolicy(envText(ENV_EXTERNAL_ACCESS_READ_POLICY)) === 'allow') {
+      bootstrapWarnings.push(
+        `environment sets ${ENV_EXTERNAL_ACCESS_READ_POLICY}=allow; ignored because the global config sets lockGuards: true`
+      );
+    }
   }
   const profiles = globalFile.config.profiles;
   // FR-072 (design D1/D4): a session's lineage — its own context, then
@@ -1694,6 +1805,36 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
     tiered(projectFile.config.mode, optionsConfig.mode, globalFile.config.mode) ??
     'full';
   const repairOnly = mode === 'repair-only';
+  // FR-084/FR-089 (external-access design D10-D12): `request_access`
+  // registers only when external access resolves enabled from the static
+  // tiers at load, so a default install sees no sixth tool; the gate
+  // itself resolves per call. Repair-only mode registers none of it.
+  const externalAccessAtLoad =
+    !repairOnly &&
+    resolveHookConfig(undefined, { project: projectFile.config, global: globalFile.config, options: optionsConfig })
+      .externalAccess.enabled;
+  // FR-080 (design D1): relative paths resolve against the project
+  // directory; a path under the directory or the worktree is internal.
+  const pathContext = (): PathContext => ({
+    base: input.directory,
+    roots: [input.directory, input.worktree].filter(
+      (root): root is string => typeof root === 'string' && path.isAbsolute(root) && root !== '/'
+    ),
+    home: homedir(),
+  });
+  // External-access design D6: session grants carry into descendant
+  // sessions — the same parent lookup (and bound) as profile lineage.
+  const sessionAncestors = async (sessionID: string): Promise<string[]> => {
+    const ancestors: string[] = [];
+    const seen = new Set<string>([sessionID]);
+    let current = await resolveParent(sessionID);
+    while (current !== null && !seen.has(current) && ancestors.length < MAX_PROFILE_ANCESTRY) {
+      seen.add(current);
+      ancestors.push(current);
+      current = await resolveParent(current);
+    }
+    return ancestors;
+  };
   // FR-058 derived tier: the OpenCode config's model (small_model
   // preferred) when no earlier tier set one. Lazy and memoized on
   // success only — a failed lookup (the server's HTTP listener may
@@ -1825,6 +1966,10 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         }, guards: blockRewardHacking=${config.blockRewardHacking}, stepReference=${
           config.requireStepReferenceInTools
         }, lockGuards=${guardsLocked}${
+          config.externalAccess.enabled
+            ? `, externalAccess: ${config.externalAccess.readPolicy === 'gate' ? 'reads and writes gated' : 'writes gated'}`
+            : ''
+        }${
           profiles !== undefined && profiles.length > 0
             ? `, profiles: ${profiles.map((profile) => profile.name).join(', ')}`
             : ''
@@ -2109,6 +2254,57 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
     }
   };
 
+  /**
+   * Question-flow minting (FR-085, external-access design D7): matches a
+   * completed `question` call against the session's pending requests and
+   * mints a once or session grant from the engineer's answer, using the
+   * stored request's path and mode. An edited question or an
+   * undecidable answer mints nothing; a decision removes the request.
+   * One `[supervisor]` line per outcome is appended to the tool output.
+   */
+  const mintAccessGrants = (args: unknown, output: unknown, state: SessionState): void => {
+    const notes: string[] = [];
+    for (const { request, reply, edited } of matchQuestionReplies(args, output, state.pendingAccessRequests)) {
+      if (edited) {
+        logger.warn(`external-access request ${request.id}: the relayed question was edited; no grant minted`);
+        notes.push(
+          `[supervisor] access request ${request.id}: the question differs from the one request_access returned, so no grant was minted. Relay it unchanged.`
+        );
+        continue;
+      }
+      if (reply === null) {
+        notes.push(`[supervisor] access request ${request.id}: no decision in the answer; the request stays pending.`);
+        continue;
+      }
+      state.pendingAccessRequests = state.pendingAccessRequests.filter((pending) => pending !== request);
+      if (reply === 'deny') {
+        logger.info(`external-access request ${request.id} denied by the engineer: ${request.mode} ${request.path}`);
+        notes.push(`[supervisor] access request ${request.id} denied: no grant for ${request.path}.`);
+        continue;
+      }
+      const lifetime = reply === 'once' ? 'once' : 'session';
+      state.externalGrants = appendRecent(
+        state.externalGrants,
+        { path: request.path, mode: request.mode, lifetime, requestId: request.id },
+        MAX_SESSION_GRANTS
+      );
+      logger.info(
+        `external-access grant minted from request ${request.id}: ${request.mode} ${request.path} (${lifetime})${
+          reply === 'persistent'
+            ? `; for a grant across sessions add ${grantFileRecord(request.path, request.mode)} to ${EXTERNAL_GRANTS_FILE}`
+            : ''
+        }`
+      );
+      notes.push(
+        `[supervisor] access request ${request.id} granted: ${request.mode} ${request.path} (${lifetime === 'once' ? 'one call' : 'this session'}). Retry the blocked call.`
+      );
+    }
+    const record = output as { output?: unknown } | null;
+    if (notes.length > 0 && record !== null && typeof record === 'object' && typeof record.output === 'string') {
+      record.output = `${record.output}\n${notes.join('\n')}`;
+    }
+  };
+
   const hooks: Hooks = {
     /**
      * Reasoning observation (design D1; spike 1.1, tasks 3.2–3.3).
@@ -2331,6 +2527,9 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
      */
     'tool.execute.before': async (hookInput, output) => {
       let verification: ToolVerificationResult;
+      // FR-086 (external-access design D8): once grants this call would
+      // use, spent only if the whole guard lets the call proceed.
+      let spendOnceGrants: (() => void) | undefined;
       try {
         // Self-suppression first (see `auditorSessionIds`): the
         // plugin's own side sessions are not supervised conversations
@@ -2580,6 +2779,68 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
               reason: `Tool '${hookInput.tool}' blocked by the supervisor: ${protectedReason}`,
             };
           }
+          // FR-082 (external-access design D3): after the protected-state
+          // check, before approve gates. Calls naming no external path, and
+          // reads under readPolicy 'allow', pay no I/O. Session grants are
+          // tried first (own, then inherited); the grants file is read
+          // fresh only for what they leave uncovered.
+          if (
+            verification.allowed &&
+            guardConfig.externalAccess.enabled &&
+            !isGateNeutralTool(hookInput.tool)
+          ) {
+            const accessClass = classifyToolAccess(hookInput.tool);
+            const externalPaths = accessNeedsGrant(accessClass, guardConfig.externalAccess.readPolicy)
+              ? findExternalPaths(hookInput.tool, output.args, pathContext())
+              : [];
+            if (externalPaths.length > 0) {
+              // FR-083: once the call is external and gated, the gate must
+              // not dissolve — unexpected failures fail closed (the FR-045
+              // stance), unlike the outer fail-open catch.
+              try {
+                const decideOver = (grants: ExternalGrant[], fileError: string | null) =>
+                  decideExternalAccess({
+                    tool: hookInput.tool,
+                    accessClass,
+                    paths: externalPaths,
+                    grants,
+                    fileError,
+                    requestToolAvailable: externalAccessAtLoad,
+                  });
+                const grants = [...state.externalGrants];
+                let decision = decideOver(grants, null);
+                if (!decision.allowed) {
+                  for (const ancestorID of await sessionAncestors(hookInput.sessionID)) {
+                    const inherited = sessionState.peek(ancestorID)?.externalGrants ?? [];
+                    grants.push(...inherited.filter((grant) => grant.lifetime === 'session'));
+                  }
+                  decision = decideOver(grants, null);
+                }
+                if (!decision.allowed) {
+                  const file = readExternalGrants(input.directory, homedir());
+                  decision = decideOver([...grants, ...file.grants], file.error);
+                }
+                if (!decision.allowed) {
+                  verification = { allowed: false, reason: decision.reason };
+                } else if (decision.onceGrantsUsed.length > 0) {
+                  const used = decision.onceGrantsUsed;
+                  spendOnceGrants = () => {
+                    state.externalGrants = state.externalGrants.filter((grant) => !used.includes(grant));
+                    for (const grant of used) {
+                      logger.info(
+                        `external-access once grant spent by tool '${hookInput.tool}': ${grant.mode} ${grant.path}${grant.requestId !== undefined ? ` (request ${grant.requestId})` : ''}`
+                      );
+                    }
+                  };
+                }
+              } catch (error) {
+                verification = {
+                  allowed: false,
+                  reason: `Tool '${hookInput.tool}' blocked by external-access supervision: the grant check failed closed (${errorText(error)}). Ask the engineer to inspect ${EXTERNAL_GRANTS_FILE}, then retry.`,
+                };
+              }
+            }
+          }
           if (verification.allowed && compiledGates.approve.length > 0) {
             const rawArgs = JSON.stringify(output.args ?? {});
             const approveMatches = matchApproveGates(
@@ -2648,6 +2909,7 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         logger.error(`blocked tool '${hookInput.tool}': ${verification.reason}`);
         throw new Error(`Execution blocked: ${verification.reason}`);
       }
+      spendOnceGrants?.();
     },
 
     /**
@@ -2678,6 +2940,12 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           { tool: hookInput.tool, outcome: solvedOutcome(output) },
           SOLVED_RETENTION_CAP
         );
+        // FR-085 (external-access design D7): the engineer's answer to a
+        // relayed access question mints the grant. Tool output comes from
+        // the host, so the agent cannot forge it.
+        if (externalAccessAtLoad && hookInput.tool === 'question' && state.pendingAccessRequests.length > 0) {
+          mintAccessGrants(hookInput.args, output, state);
+        }
       } catch (error) {
         logger.error(`tool.execute.after hook failed open: ${errorText(error)}`);
       }
@@ -2973,6 +3241,66 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
       sessionState.clearAll();
     },
   };
+  // FR-084 (external-access design D7): the sixth console tool, added
+  // only when external access is enabled at load. It records a pending
+  // request and returns the exact question to relay; it grants nothing.
+  if (externalAccessAtLoad && hooks.tool !== undefined) {
+    hooks.tool.request_access = tool({
+      description:
+        'Ask the engineer for access outside the project root when the supervisor blocks a call on an external path. ' +
+        'Give the path, the mode (read or read-write), and why the task needs it. Nothing is granted by this tool: ' +
+        "it returns a question to relay with the question tool, and the engineer's answer grants once, for this session, or not at all.",
+      args: {
+        path: tool.schema.string().describe('The external file or directory, absolute or ~/-relative.'),
+        mode: tool.schema.string().describe('read or read-write.'),
+        justification: tool.schema.string().describe('Why the task needs this access, in one sentence.'),
+      },
+      execute: async (args, context) => {
+        // FR-040 precedent: side sessions are audit machinery — inert.
+        if (isAuditorSessionId(context.sessionID)) {
+          return 'Console tools are not available in supervisor side sessions.';
+        }
+        const config = await buildConfig();
+        if (!config.externalAccess.enabled) {
+          return 'External-access supervision is not enabled; no grant is needed.';
+        }
+        const prepared = prepareAccessRequest(args, pathContext());
+        if (!prepared.ok) {
+          return prepared.error;
+        }
+        const state = sessionState.get(context.sessionID);
+        const accessClass = prepared.mode === 'read' ? 'read' : 'write';
+        const file = readExternalGrants(input.directory, homedir());
+        if ([...state.externalGrants, ...file.grants].some((grant) => grantCovers(grant, prepared.path, accessClass))) {
+          return `Access to ${prepared.path} (${prepared.mode}) is already granted — retry the call.`;
+        }
+        // A repeated request returns the pending one instead of piling up.
+        let request = state.pendingAccessRequests.find(
+          (pending) => pending.path === prepared.path && pending.mode === prepared.mode
+        );
+        if (request === undefined) {
+          state.accessRequestSeq += 1;
+          const id = `ax${state.accessRequestSeq}`;
+          request = {
+            id,
+            path: prepared.path,
+            mode: prepared.mode,
+            justification: prepared.justification,
+            question: accessQuestionText(id, prepared.path, prepared.mode, prepared.justification),
+          };
+          state.pendingAccessRequests = appendRecent(state.pendingAccessRequests, request, MAX_PENDING_ACCESS_REQUESTS);
+          logger.info(`external-access request ${id}: ${prepared.mode} ${prepared.path}`);
+        }
+        return (
+          `Access request ${request.id} recorded — nothing is granted yet. Relay it to the engineer: call the question tool with exactly these arguments, unchanged:\n` +
+          `${JSON.stringify({ questions: [buildAccessQuestion(request)] })}\n` +
+          "The engineer's answer grants the access (once or for this session) or denies it; then retry the blocked call. " +
+          `For a grant across sessions the engineer adds ${grantFileRecord(request.path, request.mode)} to ${EXTERNAL_GRANTS_FILE}.`
+        );
+      },
+    });
+  }
+
   // Repair-only mode (arg-repair feature): strip the audit-pipeline hooks
   // — no reasoning observation, no agent console — leaving exactly
   // chat.message (model capture), tool.execute.before (repair, then its
@@ -3035,6 +3363,10 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           critiques: state.critiqueLog,
           // FR-036: agent self-reports ride the memo (bounded render).
           agentReports: state.agentReports,
+          // FR-087: grants and pending access requests (bounded render).
+          externalAccess: externalAccessAtLoad
+            ? renderExternalAccess(state.externalGrants, state.pendingAccessRequests)
+            : null,
         },
         (await buildConfig()).memoLimits
       );

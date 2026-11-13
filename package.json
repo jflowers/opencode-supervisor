@@ -23,7 +23,7 @@
   },
   "scripts": {
     "test": "bun test",
-    "test:node": "node --test test/audit.test.ts test/memo.test.ts test/reminders.test.ts test/directives.test.ts test/console.test.ts test/gates.test.ts test/plugin-log.test.ts test/config-file.test.ts test/arg-repair.test.ts test/guard-profiles.test.ts",
+    "test:node": "node --test test/audit.test.ts test/memo.test.ts test/reminders.test.ts test/directives.test.ts test/console.test.ts test/gates.test.ts test/plugin-log.test.ts test/config-file.test.ts test/arg-repair.test.ts test/guard-profiles.test.ts test/external-access.test.ts",
     "typecheck": "tsc --noEmit -p .",
     "verify:package": "node scripts/verify-package.mjs",
     "prepublishOnly": "npm run typecheck && npm run verify:package"

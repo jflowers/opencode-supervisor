@@ -315,7 +315,12 @@ export const applyGuardLock = <T extends GuardToggles>(
   return { config, warnings };
 };
 
-type NonGlobalTier = GuardToggles & { profiles?: unknown; lockGuards?: unknown; mode?: unknown };
+type NonGlobalTier = GuardToggles & {
+  profiles?: unknown;
+  lockGuards?: unknown;
+  mode?: unknown;
+  externalAccess?: { enabled?: boolean; readPolicy?: string };
+};
 
 /**
  * Prepares a lower-trust tier (project file or plugin options) for
@@ -323,7 +328,9 @@ type NonGlobalTier = GuardToggles & { profiles?: unknown; lockGuards?: unknown; 
  * `lockGuards` are honored only from the global file, so both are
  * removed with a warning, and the guard lock then removes
  * guard-disabling `false` values — and a `mode: "repair-only"` that
- * would unregister the guards entirely. Returns a copy; the input is
+ * would unregister the guards entirely, and `externalAccess` values
+ * that would disable or relax the external-access gate (FR-088).
+ * Returns a copy; the input is
  * not mutated.
  */
 export const sanitizeNonGlobalTier = <T extends NonGlobalTier>(
@@ -344,6 +351,21 @@ export const sanitizeNonGlobalTier = <T extends NonGlobalTier>(
   if (locked && config.mode === 'repair-only') {
     delete config.mode;
     warnings.push(`${tierName} sets mode: "repair-only"; ignored because the global config sets lockGuards: true`);
+  }
+  // FR-088 (external-access design D10): the external-access gate is
+  // a guard too — under the lock a lower tier can neither turn it off
+  // nor relax a global `readPolicy: "gate"`. Tightening values pass.
+  if (locked && config.externalAccess !== undefined) {
+    const externalAccess = { ...config.externalAccess };
+    if (externalAccess.enabled === false) {
+      delete externalAccess.enabled;
+      warnings.push(`${tierName} sets externalAccess.enabled: false; ignored because the global config sets lockGuards: true`);
+    }
+    if (externalAccess.readPolicy === 'allow') {
+      delete externalAccess.readPolicy;
+      warnings.push(`${tierName} sets externalAccess.readPolicy: "allow"; ignored because the global config sets lockGuards: true`);
+    }
+    config.externalAccess = externalAccess;
   }
   const lock = applyGuardLock(config, tierName, locked);
   return { config: lock.config, warnings: [...warnings, ...lock.warnings] };
