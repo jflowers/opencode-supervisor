@@ -3,9 +3,12 @@ import assert from 'node:assert/strict';
 import {
   buildMemo,
   DEFAULT_MEMO_LIMITS,
+  normalizeMemoLimits,
   type CritiqueRecord,
+  type MemoLimits,
   type SolvedItem,
 } from '../src/memo.ts';
+import { takeMostRecent } from '../src/records.ts';
 
 function solvedItem(n: number): SolvedItem {
   return { tool: 'write', outcome: `outcome-${n}` };
@@ -152,4 +155,42 @@ test('buildMemo renders delivered and withheld critiques distinguishably', () =>
   assert.ok(memo !== null);
   assert.ok(memo.includes('[minor, delivered] Step 3 off-by-one bound.'));
   assert.ok(memo.includes('[severe, withheld] Reward hacking: disabling tests.'));
+});
+
+test('takeMostRecent keeps the tail, copies, and yields nothing at a cap of zero or less', () => {
+  const items = [1, 2, 3, 4];
+  assert.deepEqual(takeMostRecent(items, 2), [3, 4]);
+  const all = takeMostRecent(items, 10);
+  assert.deepEqual(all, items);
+  assert.notEqual(all, items);
+  assert.deepEqual(takeMostRecent(items, 0), []);
+  assert.deepEqual(takeMostRecent(items, -1), []);
+  assert.deepEqual(takeMostRecent([], 3), []);
+});
+
+test('normalizeMemoLimits fills missing or non-finite caps with defaults (FR-077)', () => {
+  assert.deepEqual(normalizeMemoLimits(undefined), DEFAULT_MEMO_LIMITS);
+  assert.deepEqual(
+    normalizeMemoLimits({ maxSolvedItems: 2, maxCritiques: Number.NaN, maxReminders: 0 }),
+    { maxSolvedItems: 2, maxCritiques: DEFAULT_MEMO_LIMITS.maxCritiques, maxReminders: 0, maxReports: DEFAULT_MEMO_LIMITS.maxReports }
+  );
+});
+
+test('buildMemo keeps default report and reminder caps for older limits objects (FR-077)', () => {
+  const oldLimits = { maxSolvedItems: 5, maxCritiques: 3 } as unknown as MemoLimits;
+  const agentReports = Array.from({ length: DEFAULT_MEMO_LIMITS.maxReports + 3 }, (_, i) => ({
+    kind: 'note' as const,
+    text: `report-${i}`,
+    addedAt: '2026-11-13T00:00:00.000Z',
+  }));
+  const reminders = Array.from({ length: DEFAULT_MEMO_LIMITS.maxReminders + 2 }, (_, i) => ({
+    id: `r${i}`,
+    text: `reminder-${i}`,
+    addedAt: '2026-11-13T00:00:00.000Z',
+  }));
+  const memo = buildMemo({ agentReports, reminders, solvedItems: [], critiques: [] }, oldLimits);
+  assert.ok(memo !== null);
+  assert.equal((memo.match(/\[note\]/g) ?? []).length, DEFAULT_MEMO_LIMITS.maxReports);
+  assert.ok(!memo.includes('report-0'));
+  assert.equal((memo.match(/reminder-/g) ?? []).length, DEFAULT_MEMO_LIMITS.maxReminders);
 });

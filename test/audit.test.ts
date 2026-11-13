@@ -17,7 +17,8 @@ import {
 import { createGlobBudget, extractArgPaths, globPathMatches, isGlobPatternRejected, isTokenCovered, rewardHackingScanArgs, verifyToolIntent } from '../src/tool-guard.ts';
 import { extractPathTokens, hasPathToken, isPatternToken } from '../src/path-tokens.ts';
 import { DEFAULT_MEMO_LIMITS } from '../src/memo.ts';
-import { silentPluginLogger } from '../src/plugin-log.ts';
+import { PLUGIN_LOG_SERVICE, silentPluginLogger } from '../src/plugin-log.ts';
+import { PLUGIN_ID } from '../src/plugin-id.ts';
 
 test('stripNarrative isolates code and math steps', () => {
   const steps = [
@@ -965,6 +966,12 @@ test('verifyToolIntent exempts registered console tools from the trace check (FR
 
 // recordingPluginInput and silentPluginInput now live in ./mocks.ts
 // (review rounds 2 and 4).
+
+test('PLUGIN_ID is the plugin id and the log service tag (review finding #9)', () => {
+  assert.equal(PLUGIN_ID, 'opencode-supervisor');
+  assert.equal(plugin.id, PLUGIN_ID);
+  assert.equal(PLUGIN_LOG_SERVICE, PLUGIN_ID);
+});
 
 test('plugin module imports cleanly and exports the PluginModule entry', async () => {
   // The id matches the plugin-config key (review finding #5): a user

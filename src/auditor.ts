@@ -9,6 +9,8 @@
  * stripped of narrative (FR-002) — `stripNarrative` runs before this module.
  */
 
+import { PLUGIN_ID } from './plugin-id.ts';
+
 export type AuditorVariant = 'minimal' | 'low' | 'medium' | 'high' | 'default';
 
 /** Failure classification (design D3): 'minor' steers the next turn (FR-007); 'severe' interrupts the session (FR-008). */
@@ -94,7 +96,7 @@ export function outcomeRecordsStep(outcome: PeerAuditOutcome): boolean {
  * 3. Default pluginConfig in index.ts
  */
 export function resolveAuditorConfig(base: AuditConfig, session?: any): AuditConfig {
-  const sessionPluginCfg = session?.config?.plugins?.['opencode-supervisor'] || {};
+  const sessionPluginCfg = session?.config?.plugins?.[PLUGIN_ID] || {};
   return {
     ...base,
     auditorModel:
