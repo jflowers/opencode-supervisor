@@ -434,9 +434,12 @@ can call like any other tool:
   (`maxOnDemandAudits`, default 8); the automatic audit loop is
   unaffected.
 
-Console-tool behavior: whitespace-only text is rejected; text over
-2000 characters is truncated (both reported in the result); side
-sessions get inert results; tool bodies fail open — malformed
+Console-tool behavior: whitespace-only text is rejected; reminder
+text, report text, and the `request_audit` focus over 2000
+characters are truncated (both reported in the result; the focus is
+truncated before the audit sees it); with `maxReminders` or
+`maxReports` at 0, `remind_me` or `report` says the surface is
+disabled and stores nothing; side sessions get inert results; tool bodies fail open — malformed
 arguments yield actionable results, never thrown errors; report text
 never enters audit prompts.
 
@@ -459,6 +462,16 @@ directive is advisory text plus optional machine rules:
 - **`when` rules** surface a directive just-in-time: `tool` (name,
   case-insensitive) or `path` (argument-path glob). Blocked calls
   still record the trigger.
+- **Path globs** in `forbidPath` and `when` rules match a path in
+  the arguments — including paths nested in array and object
+  arguments — when they match the whole path or any part of it
+  after a `/`. So `secrets/**` matches `secrets/token`,
+  `./secrets/token`, `~/secrets/token`, and
+  `/home/dev/proj/secrets/token`, and `.env*` matches a `.env` file
+  in any directory. A relative glob can therefore match deeper than
+  the project root (`config/*.json` also matches
+  `vendor/x/config/a.json`); start a glob with `/` to match whole
+  absolute paths only.
 - **`approve` rules** hold matching tool calls for engineer approval:
   `id` (optional explicit gate key, else `<directive>/<rule
   index>`) and any of `tool`, `path` (glob), `pattern` (regex) — all
@@ -503,11 +516,14 @@ Directives can also ride plugin options through tuple registration in
 ```
 
 File directives load first (sorted by filename), then option
-directives append. Bounds are fixed: 20 directives, 1000 characters
-of advisory text per directive, 10 rules of each kind per directive,
-and a 4000-character aggregate render budget. Malformed files and
-invalid rules are skipped with a warning — loading fails open.
-Directives load once at plugin start; there is no hot reload.
+directives append. Bounds are fixed: 25 directive files read (files
+past that are not read, with one warning), 20 directives, 1000
+characters of advisory text per directive, 10 rules of each kind per
+directive, and a 4000-character aggregate render budget. Malformed
+files and invalid rules are skipped with a warning — loading fails
+open. Directives load once at plugin start; there is no hot reload.
+The startup log line names each loaded directive and its source
+(`no-secrets (no-secrets.md)`, `prefer-bun (options)`).
 
 **Approvals.** `approve` gates read
 `.opencode/supervisor/approvals.json` fresh at each gated call — a
@@ -581,8 +597,8 @@ when unset, the side-session prompt omits it.
 | `requireStepReferenceInTools` | `OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS` | `true` | When `true`, the tool guard blocks tool calls whose file-path arguments do not appear in the verified reasoning trace. Never blocks when the trace is empty. |
 | `memoLimits.maxSolvedItems` | `OPENCODE_SUPERVISOR_MEMO_MAX_SOLVED_ITEMS` | `5` | Cap on solved items shown in the memo. Storage retains more (50) for `recall`; this knob bounds the rendered view. |
 | `memoLimits.maxCritiques` | `OPENCODE_SUPERVISOR_MEMO_MAX_CRITIQUES` | `3` | Cap on critiques shown in the memo. Storage retains more (30) for `recall`; this knob bounds the rendered view. |
-| `memoLimits.maxReminders` | `OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS` | `10` | Cap on reminders kept in state and shown in the memo (the most recent are kept). |
-| `memoLimits.maxReports` | `OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS` | `5` | Cap on agent reports kept in state and shown in the memo (the most recent are kept). |
+| `memoLimits.maxReminders` | `OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS` | `10` | Cap on reminders kept in state and shown in the memo (the most recent are kept). `0` disables `remind_me`, which then says so. |
+| `memoLimits.maxReports` | `OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS` | `5` | Cap on agent reports kept in state and shown in the memo (the most recent are kept). `0` disables `report`, which then says so. |
 | `maxOnDemandAudits` | `OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS` | `8` | Per-session cap on audits requested through the `request_audit` tool. The automatic audit loop is unaffected. |
 | `maxTimeoutFailOpens` | `OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS` | `3` | Per-session cap on trace-check waits that time out and fail open (the wait itself is bounded at 10 seconds). Past the cap a timed-out wait blocks naming the still-unsettled audit. |
 | `maxCoveredTimeoutFailOpens` | `OPENCODE_SUPERVISOR_MAX_COVERED_TIMEOUT_FAIL_OPENS` | `6` | Per-session cap on covered timeout fail-opens — waits whose blocked path an in-flight audit's step text names (the corrective reasoning is under audit). Past the cap a covered timed-out wait blocks naming the still-unsettled audit. |

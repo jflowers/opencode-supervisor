@@ -60,8 +60,8 @@
 
 ## 5. Integration
 
-- [ ] 5.1 both runners green: `bun test` and `npm run
+- [x] 5.1 both runners green: `bun test` and `npm run
   test:node`; `bun run typecheck`; `npm run verify:package`
-- [ ] 5.2 docs: CHANGELOG entry, AGENTS.md (structure, new
+- [x] 5.2 docs: CHANGELOG entry, AGENTS.md (structure, new
   modules), README (directive glob anchoring, cap-0 results)
 - [ ] 5.3 `/uf.review-council`
