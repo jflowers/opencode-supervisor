@@ -935,6 +935,15 @@ export const checkProtectedState = (
   ) {
     return 'the supervisor directives are engineer-authored state; the supervised agent may not touch them (enforcement rules and gates depend on them). Ask the engineer to edit the directives directory directly.';
   }
+  // FR-083: the external-access grants file — named explicitly so the
+  // reason says which file, and so a slash-free bash spelling
+  // (`cd .opencode/supervisor && cat external-access.json`) is caught.
+  if (
+    normalizedArgPaths.some((p) => hasProtectedSegmentRun(p, 'opencode/supervisor/external-access.json')) ||
+    /(?:^|[^a-z0-9_.-])external-access\.json/.test(rawCommandLower)
+  ) {
+    return 'the external-access grants file is engineer-authored state; the supervised agent may not touch it (external-access grants depend on it). Ask the engineer to edit .opencode/supervisor/external-access.json.';
+  }
   // Directory backstop (path lens only): an ancestor spelling
   // (`rm -rf .opencode/supervisor`) normalizes onto the run
   // itself. No raw pairing — the bare word 'supervisor' is too
