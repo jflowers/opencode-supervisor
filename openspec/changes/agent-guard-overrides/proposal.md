@@ -27,9 +27,10 @@ and subagent sessions a task starts carry neither.
 
 - FR-072 (new): the supervisor tracks each session's context:
   the latest user message's agent (`chat.message`), the latest
-  slash command (`command.execute.before`, kept until another
-  command runs), and the parent session (`session.created` /
-  `session.updated` events, one cached lookup as fallback).
+  slash command (`command.execute.before`, kept for that
+  command's task: until a human-typed message after the session
+  goes idle), and the parent session (`session.created` /
+  `session.updated` events, a cached lookup as fallback).
 - FR-073 (new): `profiles` — a list of grants, each with a
   `match` on `agent` and/or `command`. Honored only from the
   global config file; present in the project config file or
@@ -49,8 +50,11 @@ and subagent sessions a task starts carry neither.
   `true`, `blockRewardHacking: false`,
   `requireStepReferenceInTools: false`, and
   `mode: "repair-only"` from the project config file or plugin
-  options are dropped with a warning. The environment and the
-  global file stay authoritative.
+  options — and the same values from environment variables —
+  are dropped with a warning. The lock fails closed: a global
+  file rejected for another key still keeps it, and
+  `XDG_CONFIG_HOME` cannot point around a lock in the
+  home-directory file.
 
 The `rewardHackingScope` knob sketched in #48 is not added:
 FR-071 made execution-surface scanning the default for every

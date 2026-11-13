@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Hooks, PluginInput } from '@opencode-ai/plugin';
-import plugin, { logIdentityState, sessionState } from '../index.ts';
+import plugin, { configPathState, logIdentityState, sessionState } from '../index.ts';
 import {
   MAX_PROFILE_ANCESTRY,
   MAX_PROFILES,
@@ -15,6 +15,7 @@ import {
   normalizeCommand,
   profileMatchesContext,
   sanitizeNonGlobalTier,
+  toolMayBeExempt,
   traceExemption,
   validateProfiles,
   type GuardProfile,
@@ -83,6 +84,24 @@ test('validateProfiles drops a bad profile and keeps the others', () => {
   assert.match(w[7]!, /"match.command" must be a non-empty slash command name/);
   assert.match(w[8]!, /"traceCheck" is required/);
   assert.match(w[9]!, /profile "profiles\[10\]" dropped: must be an object/);
+});
+
+test('validateProfiles rejects wildcard globs without an MCP server prefix', () => {
+  const parsed = validateProfiles([
+    { name: 'any-server', match: { agent: 'a' }, traceCheck: { exemptTools: ['*_file'] } },
+    { name: 'writers', match: { agent: 'a' }, traceCheck: { exemptTools: ['fs*'] } },
+    { name: 'one-server', match: { agent: 'a' }, traceCheck: { exemptTools: ['filesystem_*', 'dewey-x.y_*', 'write_file'] } },
+  ]);
+  assert.deepEqual(parsed.profiles.map((p) => p.name), ['one-server']);
+  assert.match(parsed.warnings[0]!, /profile "any-server" dropped: .*"\*_file" is too broad: a wildcard glob must start with an MCP server prefix/);
+  assert.match(parsed.warnings[1]!, /profile "writers" dropped: .*"fs\*" is too broad/);
+});
+
+test('toolMayBeExempt checks globs across all profiles, regardless of session', () => {
+  const { profiles } = validateProfiles([{ match: { agent: 'curator' }, traceCheck: { exemptTools: ['dewey_*'] } }]);
+  assert.equal(toolMayBeExempt('dewey_search', profiles), true);
+  assert.equal(toolMayBeExempt('bash', profiles), false);
+  assert.equal(toolMayBeExempt('dewey_search', undefined), false);
 });
 
 test('validateProfiles rejects a non-array value and caps the count', () => {
@@ -207,7 +226,7 @@ test('verifyToolIntent: an exempt reason skips only the trace check', () => {
 /** Runs `run` with supervisor env knobs cleared and XDG_CONFIG_HOME pointing at a fresh root. */
 async function withIsolatedConfig(
   files: { global?: unknown; project?: unknown },
-  run: (projectDir: string, xdgRoot: string) => Promise<void>
+  run: (projectDir: string, xdgRoot: string, homeDir: string) => Promise<void>
 ): Promise<void> {
   const saved = { ...process.env };
   for (const name of Object.keys(process.env)) {
@@ -217,7 +236,10 @@ async function withIsolatedConfig(
   logIdentityState.identitySaidNoModel = false;
   const xdgRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-xdg-'));
   const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-project-'));
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-home-'));
   process.env.XDG_CONFIG_HOME = xdgRoot;
+  const savedAccountHome = configPathState.accountHome;
+  configPathState.accountHome = () => homeDir;
   if (files.global !== undefined) {
     fs.mkdirSync(path.join(xdgRoot, 'opencode', 'supervisor'), { recursive: true });
     fs.writeFileSync(path.join(xdgRoot, 'opencode', 'supervisor', 'config.json'), JSON.stringify(files.global));
@@ -227,7 +249,7 @@ async function withIsolatedConfig(
     fs.writeFileSync(path.join(projectDir, '.opencode', 'supervisor', 'config.json'), JSON.stringify(files.project));
   }
   try {
-    await run(projectDir, xdgRoot);
+    await run(projectDir, xdgRoot, homeDir);
   } finally {
     for (const name of Object.keys(process.env)) {
       if (!(name in saved)) delete process.env[name];
@@ -235,6 +257,8 @@ async function withIsolatedConfig(
     Object.assign(process.env, saved);
     fs.rmSync(xdgRoot, { recursive: true, force: true });
     fs.rmSync(projectDir, { recursive: true, force: true });
+    configPathState.accountHome = savedAccountHome;
+    fs.rmSync(homeDir, { recursive: true, force: true });
   }
 }
 
@@ -289,7 +313,7 @@ test('FR-072: chat.message records the latest user message agent', async () => {
   });
 });
 
-test('FR-072: the slash command is recorded without "/" and persists until another command runs', async () => {
+test('FR-072: the slash command is recorded without "/" and is replaced by another command', async () => {
   await withIsolatedConfig({}, async (dir) => {
     const hooks = await plugin.server(recordingPluginInput(dir).input);
     const sessionID = await startSession(hooks, { agent: 'autonomy', command: '/dewey-distill' });
@@ -298,6 +322,81 @@ test('FR-072: the slash command is recorded without "/" and persists until anoth
     assert.equal(sessionState.get(sessionID).command, 'dewey-distill');
     await runCommand(hooks, sessionID, 'uf.fix-ci');
     assert.equal(sessionState.get(sessionID).command, 'uf.fix-ci');
+    await hooks.dispose!();
+  });
+});
+
+const sessionIdle = (hooks: Hooks, sessionID: string) =>
+  hooks.event!({ event: { type: 'session.idle', properties: { sessionID } } } as never);
+
+const syntheticMessage = (hooks: Hooks, sessionID: string) =>
+  hooks['chat.message']!(
+    { sessionID, agent: 'autonomy' },
+    { message: { role: 'user' } as never, parts: [{ type: 'text', text: 'Supervisor note.', synthetic: true } as never] }
+  );
+
+test('FR-072: a command scopes one task and ends at the first human message after idle', async () => {
+  await withIsolatedConfig({ global: DISTILL_GRANT }, async (dir) => {
+    const hooks = await plugin.server(recordingPluginInput(dir).input);
+    const sessionID = await startSession(hooks, { agent: 'autonomy', command: 'dewey-distill' });
+    // During the task, injected messages (an auto-question summary) keep it.
+    await userMessage(hooks, sessionID, 'autonomy');
+    assert.equal(sessionState.get(sessionID).command, 'dewey-distill');
+    await sessionIdle(hooks, sessionID);
+    // Synthetic messages after idle keep it.
+    await syntheticMessage(hooks, sessionID);
+    assert.equal(sessionState.get(sessionID).command, 'dewey-distill');
+    // A human-typed message after idle starts a new task without the grant.
+    await userMessage(hooks, sessionID, 'autonomy');
+    assert.equal(sessionState.get(sessionID).command, undefined);
+    await assert.rejects(() => callTool(hooks, sessionID, 'dewey_store_learning', CORPUS_ARGS), /file-path trace check/);
+    // A new command after idle is its own task.
+    await sessionIdle(hooks, sessionID);
+    await runCommand(hooks, sessionID, 'dewey-distill');
+    await userMessage(hooks, sessionID, 'autonomy');
+    assert.equal(sessionState.get(sessionID).command, 'dewey-distill');
+    await hooks.dispose!();
+  });
+});
+
+test('FR-072: a session.status idle event also ends the command task', async () => {
+  await withIsolatedConfig({}, async (dir) => {
+    const hooks = await plugin.server(recordingPluginInput(dir).input);
+    const sessionID = await startSession(hooks, { agent: 'autonomy', command: 'dewey-distill' });
+    await hooks.event!({ event: { type: 'session.status', properties: { sessionID, status: { type: 'idle' } } } } as never);
+    await userMessage(hooks, sessionID, 'autonomy');
+    assert.equal(sessionState.get(sessionID).command, undefined);
+    await hooks.dispose!();
+  });
+});
+
+test('FR-074: tools no profile can exempt never trigger parent lookups', async () => {
+  await withIsolatedConfig({ global: DISTILL_GRANT }, async (dir) => {
+    const harness = recordingPluginInput(dir);
+    const lookups: string[] = [];
+    (harness.input.client.session as unknown as { get: unknown }).get = async ({ path: p }: { path: { id: string } }) => {
+      lookups.push(p.id);
+      return { data: { id: p.id } };
+    };
+    const hooks = await plugin.server(harness.input as PluginInput);
+    await userMessage(hooks, 'precheck-child', 'general');
+    await callTool(hooks, 'precheck-child', 'read', { filePath: 'src/a.ts' }).catch(() => undefined);
+    assert.deepEqual(lookups, []);
+    await hooks.dispose!();
+  });
+});
+
+test('FR-074: a blocked call does not log the exemption as applied', async () => {
+  await withIsolatedConfig({ global: CURATOR_GRANT }, async (dir) => {
+    const harness = recordingPluginInput(dir);
+    const hooks = await plugin.server(harness.input);
+    const sessionID = await startSession(hooks, { agent: 'curator' });
+    await assert.rejects(() => callTool(hooks, sessionID, 'dewey_store_learning', { flags: '--no-verify' }), /reward-hacking/);
+    const notice = (e: { level: string; message: string }) =>
+      e.level === 'info' && e.message.includes("exempt from the file-path trace check by global profile 'curator'");
+    assert.equal(harness.logEntries.filter(notice).length, 0);
+    await callTool(hooks, sessionID, 'dewey_store_learning', CORPUS_ARGS);
+    assert.equal(harness.logEntries.filter(notice).length, 1);
     await hooks.dispose!();
   });
 });
@@ -366,7 +465,7 @@ test('FR-074: subagent sessions inherit the task grant through session events', 
   });
 });
 
-test('FR-074: an unknown parent is looked up once and cached; a failed lookup grants nothing', async () => {
+test('FR-074: an unknown parent is looked up once and cached; a failed lookup grants nothing and is retried', async () => {
   await withIsolatedConfig({ global: DISTILL_GRANT }, async (dir) => {
     const harness = recordingPluginInput(dir);
     const lookups: string[] = [];
@@ -388,7 +487,14 @@ test('FR-074: an unknown parent is looked up once and cached; a failed lookup gr
     await userMessage(hooks, 'orphan-child', 'general');
     sessionState.get('orphan-child').verifiedSteps.push({ text: 'Edit src/a.ts.', passed: true });
     await assert.rejects(() => callTool(hooks, 'orphan-child', 'dewey_store_learning', CORPUS_ARGS), /file-path trace check/);
-    assert.equal(sessionState.get('orphan-child').parentID, null);
+    // Not cached as a root: within the backoff no new lookup is made...
+    assert.equal(sessionState.get('orphan-child').parentID, undefined);
+    await assert.rejects(() => callTool(hooks, 'orphan-child', 'dewey_store_learning', CORPUS_ARGS), /file-path trace check/);
+    assert.equal(lookups.filter((id) => id === 'orphan-child').length, 1);
+    // ...and after it, the lookup runs again.
+    sessionState.get('orphan-child').parentLookupRetryAt = 0;
+    await assert.rejects(() => callTool(hooks, 'orphan-child', 'dewey_store_learning', CORPUS_ARGS), /file-path trace check/);
+    assert.equal(lookups.filter((id) => id === 'orphan-child').length, 2);
     await hooks.dispose!();
   });
 });
@@ -556,12 +662,59 @@ test('FR-075: the lock keeps a committed project mode from disabling the guards'
   });
 });
 
-test('FR-075: the environment stays authoritative under the lock', async () => {
+test('FR-075: environment variables cannot turn guards off under the lock', async () => {
   await withIsolatedConfig({ global: { lockGuards: true } }, async (dir) => {
+    process.env.OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS = 'false';
+    process.env.OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING = 'false';
+    process.env.OPENCODE_SUPERVISOR_MODE = 'repair-only';
+    const harness = recordingPluginInput(dir);
+    const hooks = await plugin.server(harness.input);
+    const sessionID = await startSession(hooks, { agent: 'build' });
+    await assert.rejects(() => callTool(hooks, sessionID, 'dewey_store_learning', CORPUS_ARGS), /file-path trace check/);
+    await assert.rejects(() => callTool(hooks, sessionID, 'bash', { command: 'git commit --no-verify' }), /reward-hacking check/);
+    const warns = harness.logEntries.filter((e) => e.level === 'warn').map((e) => e.message);
+    assert.ok(warns.some((m) => m.includes('OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS=false; ignored')));
+    assert.ok(warns.some((m) => m.includes('OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING=false; ignored')));
+    assert.ok(warns.some((m) => m.includes('OPENCODE_SUPERVISOR_MODE=repair-only; ignored')));
+    await hooks.dispose!();
+  });
+});
+
+test('FR-075: without the lock the environment still turns guards off', async () => {
+  await withIsolatedConfig({ global: {} }, async (dir) => {
     process.env.OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS = 'false';
     const hooks = await plugin.server(recordingPluginInput(dir).input);
     const sessionID = await startSession(hooks, { agent: 'build' });
     await assert.doesNotReject(() => callTool(hooks, sessionID, 'dewey_store_learning', CORPUS_ARGS));
+    await hooks.dispose!();
+  });
+});
+
+test('FR-075: a global file rejected for another key keeps lockGuards (fails closed)', async () => {
+  await withIsolatedConfig(
+    { global: { lockGuards: true, maxRegenerations: '3' }, project: { requireStepReferenceInTools: false } },
+    async (dir) => {
+      const harness = recordingPluginInput(dir);
+      const hooks = await plugin.server(harness.input);
+      const sessionID = await startSession(hooks, { agent: 'build' });
+      await assert.rejects(() => callTool(hooks, sessionID, 'dewey_store_learning', CORPUS_ARGS), /file-path trace check/);
+      const warns = harness.logEntries.filter((e) => e.level === 'warn').map((e) => e.message);
+      assert.ok(warns.some((m) => m.includes('global supervisor config file ignored except lockGuards: true')));
+      await hooks.dispose!();
+    }
+  );
+});
+
+test('FR-075: XDG_CONFIG_HOME cannot escape a lock in the home-directory config', async () => {
+  await withIsolatedConfig({ global: {}, project: { requireStepReferenceInTools: false } }, async (dir, _xdg, home) => {
+    fs.mkdirSync(path.join(home, '.config', 'opencode', 'supervisor'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.config', 'opencode', 'supervisor', 'config.json'), JSON.stringify({ lockGuards: true }));
+    const harness = recordingPluginInput(dir);
+    const hooks = await plugin.server(harness.input);
+    const sessionID = await startSession(hooks, { agent: 'build' });
+    await assert.rejects(() => callTool(hooks, sessionID, 'dewey_store_learning', CORPUS_ARGS), /file-path trace check/);
+    const warns = harness.logEntries.filter((e) => e.level === 'warn').map((e) => e.message);
+    assert.ok(warns.some((m) => m.includes('XDG_CONFIG_HOME points the global supervisor config at')));
     await hooks.dispose!();
   });
 });

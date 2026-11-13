@@ -15,9 +15,13 @@ weakening any check for any other session.
 The supervisor SHALL record, per session: the `agent` of the
 latest user message seen by `chat.message`; the latest slash
 command seen by `command.execute.before`, without a leading
-`/`, kept until another command runs; and the session's
-`parentID` from `session.created` / `session.updated` events,
-falling back to one cached session lookup when unknown.
+`/`, kept for that command's task — until the first
+human-typed (non-synthetic) user message after the session
+goes idle that is not itself a slash command; and the
+session's `parentID` from `session.created` /
+`session.updated` events, falling back to a session lookup
+when unknown, whose result is cached and whose failure is
+retried after a backoff.
 Auditor side sessions SHALL NOT be recorded.
 
 #### Scenario: Latest user message wins
@@ -136,6 +140,23 @@ SHALL still apply. An entry matching `bash`, `edit`, `write`,
 - **THEN** the profile is dropped with a warning naming the
   matched builtin
 
+#### Scenario: Wildcards must name one MCP server
+
+- **GIVEN** a global profile whose `exemptTools` is
+  `["*_file"]`
+- **WHEN** the plugin loads
+- **THEN** the profile is dropped with a warning that the
+  glob must start with an MCP server prefix
+
+#### Scenario: A command's grant ends with its task
+
+- **GIVEN** the command profile above and an `autonomy`
+  session that ran `/dewey-distill`
+- **WHEN** the session goes idle and a human-typed message
+  that is not a slash command arrives
+- **THEN** a later exempt-tool call is subject to the trace
+  check again
+
 ### Requirement: FR-075 Guard lock
 
 When the global config file sets `lockGuards: true`, a
@@ -144,10 +165,17 @@ When the global config file sets `lockGuards: true`, a
 plugin options SHALL be ignored with a warning. A `mode:
 "repair-only"` from the project config file or plugin options
 SHALL likewise be ignored with a warning, so a committed
-project config cannot unregister the guards. Environment
-and global-file values SHALL still apply. `lockGuards` from
-any tier other than the global file SHALL be ignored with a
-warning.
+project config cannot unregister the guards. The same
+guard-disabling values from environment variables SHALL be
+ignored with a warning, since per-directory env tools can set
+them from committed files. When `XDG_CONFIG_HOME` points the
+global file away from the home-directory file and the
+home-directory file sets `lockGuards: true`, the
+home-directory file SHALL be the global tier. A global file
+rejected for any other reason SHALL still apply
+`lockGuards: true` when it sets it. Global-file values SHALL
+still apply. `lockGuards` from any tier other than the global
+file SHALL be ignored with a warning.
 
 #### Scenario: Project cannot disable a locked guard
 
@@ -165,6 +193,24 @@ warning.
   false`
 - **WHEN** the same call is made
 - **THEN** it is not blocked by the trace check
+
+#### Scenario: The environment cannot disable a locked guard
+
+- **GIVEN** a global file with `lockGuards: true`
+- **AND** `OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS=false`
+- **WHEN** a tool call names a path absent from a non-empty
+  verified trace
+- **THEN** it is blocked by the trace check and a warning
+  reports the ignored variable
+
+#### Scenario: The lock survives a rejected global file
+
+- **GIVEN** a global file with `lockGuards: true` and a
+  wrong-typed `maxRegenerations`
+- **AND** a project file with `requireStepReferenceInTools:
+  false`
+- **WHEN** the same call is made
+- **THEN** it is blocked by the trace check
 
 #### Scenario: Project cannot unregister the guards
 

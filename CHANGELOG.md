@@ -9,7 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Task-scoped guard profiles (FR-072..FR-074, #48, #47): the supervisor
   records each session's slash command (`command.execute.before`, kept
-  until another command runs), agent (latest user message), and parent
+  for that command's task — until the first human-typed message after
+  the session goes idle), agent (latest user message), and parent
   session, and the global config file's `profiles` can grant a task —
   matched on `command` and/or `agent` — `traceCheck.exemptTools`:
   tool-name globs (for example `["dewey_*"]`) whose calls skip the
@@ -17,10 +18,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   grants (up to 8 levels), so unattended dispatch that starts every
   session as one agent can still scope grants per command.
   Reward-hacking, directive, protected-state, and gate checks still
-  apply, and an applied exemption logs once per profile and tool.
+  apply, and an applied exemption logs once per profile and tool when
+  it decided the call. Parent lookups run only for tools some profile
+  could exempt; a failed lookup is retried after a backoff, not cached.
   Profiles only narrow: entries matching a file-mutating builtin
   (`bash`, `edit`, `write`, `patch`, `multiedit`, `apply_patch`, so
-  `*` too) and unknown keys drop the profile with a warning, without
+  `*` too), wildcard globs without an MCP server prefix (`*_file`),
+  and unknown keys drop the profile with a warning, without
   rejecting the rest of the global file. `profiles` in the project
   config file or plugin options is ignored with a warning.
 - Guard lock (FR-075, #48): `lockGuards: true` in the global config
@@ -28,8 +32,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `requireStepReferenceInTools: false`, and `mode: "repair-only"`
   from the project config file or plugin options ineffective, with a
   warning — the guards cannot be turned off or unregistered from a
-  committed project config. The environment and
-  the global file stay authoritative. The identity log line reports
+  committed project config. Guard-disabling environment variables
+  are ignored under the lock too (per-directory env tools let a
+  repository set them), a global file rejected for another key keeps
+  the lock, and `XDG_CONFIG_HOME` cannot point around a lock in the
+  home-directory file. The identity log line reports
   `lockGuards` and the profile names.
 
 ### Changed

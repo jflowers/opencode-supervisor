@@ -51,16 +51,25 @@ Each session records three facts, in every mode:
 - `agent`: from `chat.message`, the latest user message's
   `agent` (a later message replaces it).
 - `command`: from `command.execute.before`, the latest slash
-  command run in the session, without a leading `/`. It stays
-  until another command runs: follow-up messages in a command
-  session are part of that task. This also makes the record
-  independent of whether `command.execute.before` fires
-  before or after the command's `chat.message`.
+  command run in the session, without a leading `/`. It scopes
+  one task: it stays while the session works, including
+  through messages plugins inject during the task (an
+  auto-question summary is a non-synthetic user message), and
+  ends at the first human-typed (non-synthetic) user message
+  after the session goes idle (`session.idle`, or
+  `session.status` idle), unless that message is itself a
+  slash command. Review round 2: "until another command runs"
+  let a command's grant outlive its task in interactive
+  sessions.
 - `parentID`: from `session.created` / `session.updated`
   events. When a session's parent is unknown at a tool call,
-  one `client.session.get` lookup runs and its result
-  (including "no parent" and failures, treated as no parent)
-  is cached, so the lookup is attempted once per session.
+  one `client.session.get` lookup runs. A result ("no
+  parent" included) is cached; a failure or timeout is
+  treated as no parent for that call but not cached — it is
+  retried after a 30 s backoff, and a later session event
+  still supplies the parent. A tool call resolves the
+  lineage only when some profile's `exemptTools` matches the
+  tool, so other calls never pay for lookups.
 
 Auditor side sessions are skipped like every other hook.
 
@@ -94,7 +103,10 @@ with a warning that names it; the remaining profiles and the
 rest of the file stay in force. This departs from the
 whole-file rejection convention (FR-057) on purpose —
 rejecting the whole global file for a bad profile would also
-drop `lockGuards`, failing open on the lock. A non-array
+drop `lockGuards`, failing open on the lock. For the same
+reason a global file rejected for any other key (or
+malformed JSON) still keeps `lockGuards: true` when it asks
+for it (review round 2): the lock fails closed. A non-array
 `profiles` drops only that key. At most 64 profiles are kept.
 
 Unknown keys are rejected rather than ignored, so
@@ -108,7 +120,13 @@ one character, anchored, case-sensitive), bounded at 512
 characters and 32 wildcards. An entry that matches any
 file-mutating builtin — `bash`, `edit`, `write`, `patch`,
 `multiedit`, `apply_patch` — is rejected; that also rejects
-`*` and other catch-alls. An exempt call skips only the
+`*` and other catch-alls. A wildcard entry must also start
+with a literal MCP-server prefix (`[A-Za-z0-9.-]+_`, as in
+`dewey_*`), so it names one server's tools: broad globs like
+`*_file` or `fs*` could match another server's file-writing
+tools, which the builtin list cannot know about (review
+round 2). Exact tool names are always allowed. An exempt
+call skips only the
 file-path trace check: reward-hacking (FR-071), directive
 enforcement (FR-028), the protected-state check (FR-061),
 and approve/review gates still run.
@@ -151,9 +169,22 @@ and plugin options tiers before resolution, with one warning
 per removed key. A `mode: "repair-only"` from those tiers is
 removed the same way — mode selects which hooks register, so
 a committed project config cannot unregister the guards
-under the lock. `true` values pass through. The environment
-and the global file are user-controlled and stay
-authoritative. `lockGuards` from any other tier is ignored
+under the lock. `true` values pass through.
+
+Review round 2: the environment is not reliably
+user-controlled — per-directory env tools (mise.toml `[env]`,
+direnv `.envrc`) let a committed repository file set
+variables. Under the lock, guard-disabling values from the
+environment (`OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING=false`,
+`OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS=false`,
+`OPENCODE_SUPERVISOR_MODE=repair-only`) are ignored with a
+warning too. `XDG_CONFIG_HOME` can be set the same way to
+point the "global" file at a repository path, so when it
+points away from `~/.config/opencode/supervisor/config.json`
+(home resolved from the OS account, not `HOME`) and that
+file sets `lockGuards: true`, the home-directory file is the
+global tier, with a warning. To unlock, the user edits the
+global file. `lockGuards` from any other tier is ignored
 with a warning (a project cannot lock or unlock itself).
 
 ### D7 Observability
