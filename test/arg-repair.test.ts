@@ -18,7 +18,7 @@ import path from 'node:path';
 import type { Hooks, PluginInput, PluginOptions } from '@opencode-ai/plugin';
 
 import plugin from '../index.ts';
-import { silentClientSurface } from './mocks.ts';
+import { silentClientSurface, withCleanSupervisorEnv } from './mocks.ts';
 import {
   buildRepairPrompt,
   deterministicRepair,
@@ -218,54 +218,6 @@ function dispatchChatMessage(
 }
 
 // ── Env isolation ─────────────────────────────────────────────────────────
-
-/** Every OPENCODE_SUPERVISOR_* knob, for env-cleaning around hook-layer tests. */
-const REPAIR_ENV_NAMES = [
-  'OPENCODE_SUPERVISOR_MODEL',
-  'OPENCODE_SUPERVISOR_VARIANT',
-  'OPENCODE_SUPERVISOR_MAX_REGENERATIONS',
-  'OPENCODE_SUPERVISOR_STRIP_MODE',
-  'OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING',
-  'OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_SOLVED_ITEMS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_CRITIQUES',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS',
-  'OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS',
-  'OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS',
-  'OPENCODE_SUPERVISOR_MODE',
-  'OPENCODE_SUPERVISOR_REPAIR_MODEL',
-];
-
-/** Saves/deletes the supervisor env knobs and isolates XDG_CONFIG_HOME around `run`. */
-async function withCleanRepairEnv(run: () => Promise<void>): Promise<void> {
-  const saved: Record<string, string | undefined> = {};
-  for (const name of REPAIR_ENV_NAMES) {
-    saved[name] = process.env[name];
-    delete process.env[name];
-  }
-  const savedXdgHome = process.env.XDG_CONFIG_HOME;
-  const isolatedXdgRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-xdg-'));
-  process.env.XDG_CONFIG_HOME = isolatedXdgRoot;
-  try {
-    await run();
-  } finally {
-    for (const name of REPAIR_ENV_NAMES) {
-      const value = saved[name];
-      if (value === undefined) {
-        delete process.env[name];
-      } else {
-        process.env[name] = value;
-      }
-    }
-    if (savedXdgHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME;
-    } else {
-      process.env.XDG_CONFIG_HOME = savedXdgHome;
-    }
-    fs.rmSync(isolatedXdgRoot, { recursive: true, force: true });
-  }
-}
 
 // ── Directive helpers ─────────────────────────────────────────────────────
 
@@ -606,7 +558,7 @@ test('validateSupervisorConfig rejects a malformed argRepair block', () => {
 // ── Hook layer: repair-only mode shape ────────────────────────────────────
 
 test('repair-only mode strips the audit pipeline hooks', async () => {
-  await withCleanRepairEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input } = repairPluginInput();
     const hooks = await plugin.server(input, repairOnlyOptions());
     assert.equal(hooks.event, undefined);
@@ -618,7 +570,7 @@ test('repair-only mode strips the audit pipeline hooks', async () => {
 });
 
 test('full mode keeps the audit pipeline hooks', async () => {
-  await withCleanRepairEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input } = repairPluginInput();
     const hooks = await plugin.server(input);
     assert.equal(typeof hooks.event, 'function');
@@ -630,7 +582,7 @@ test('full mode keeps the audit pipeline hooks', async () => {
 // ── Hook layer: the repair pass ───────────────────────────────────────────
 
 test('repair-only mode repairs malformed question args in place via the model tier', async () => {
-  await withCleanRepairEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, promptTexts, toolListQueries } = repairPluginInput();
     const hooks = await plugin.server(input, repairOnlyOptions());
     await dispatchChatMessage(hooks, 'repair-happy-1', { providerID: 'enmaas', modelID: 'glm-5-3' });
@@ -649,7 +601,7 @@ test('repair-only mode repairs malformed question args in place via the model ti
 });
 
 test('full mode repairs args and the guard does not block the call', async () => {
-  await withCleanRepairEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, promptTexts } = repairPluginInput();
     const hooks = await plugin.server(input);
     await dispatchChatMessage(hooks, 'repair-full-1', { providerID: 'enmaas', modelID: 'glm-5-3' });
@@ -663,7 +615,7 @@ test('full mode repairs args and the guard does not block the call', async () =>
 });
 
 test('the repair pass fixes stringified arrays deterministically without a model call', async () => {
-  await withCleanRepairEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, promptTexts } = repairPluginInput();
     const hooks = await plugin.server(input, repairOnlyOptions());
     const args: Record<string, unknown> = { questions: JSON.stringify(VALID_QUESTIONS) };
@@ -676,7 +628,7 @@ test('the repair pass fixes stringified arrays deterministically without a model
 });
 
 test('valid args pass through the repair pass untouched', async () => {
-  await withCleanRepairEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, promptTexts } = repairPluginInput();
     const hooks = await plugin.server(input, repairOnlyOptions());
     const args: Record<string, unknown> = { questions: VALID_QUESTIONS };
@@ -689,7 +641,7 @@ test('valid args pass through the repair pass untouched', async () => {
 });
 
 test('out-of-scope tools are left alone', async () => {
-  await withCleanRepairEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, promptTexts } = repairPluginInput();
     const hooks = await plugin.server(input, repairOnlyOptions());
     const args: Record<string, unknown> = { query: null };
@@ -702,7 +654,7 @@ test('out-of-scope tools are left alone', async () => {
 });
 
 test('the per-session bound stops model repairs and leaves args to fail normally', async () => {
-  await withCleanRepairEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, promptTexts } = repairPluginInput();
     const hooks = await plugin.server(input, repairOnlyOptions({ maxPerSession: 1 }));
     await dispatchChatMessage(hooks, 'repair-bound-1', { providerID: 'enmaas', modelID: 'glm-5-3' });
@@ -719,7 +671,7 @@ test('the per-session bound stops model repairs and leaves args to fail normally
 });
 
 test('an unrepairable verdict leaves args unchanged without throwing', async () => {
-  await withCleanRepairEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, promptTexts } = repairPluginInput({
       promptResponse: '{"unrepairable": true, "reason": "cannot recover the questions"}',
     });
@@ -735,7 +687,7 @@ test('an unrepairable verdict leaves args unchanged without throwing', async () 
 });
 
 test('a failing repair model fails open and leaves args unchanged', async () => {
-  await withCleanRepairEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, promptTexts } = repairPluginInput({ promptRejects: true });
     const hooks = await plugin.server(input, repairOnlyOptions());
     await dispatchChatMessage(hooks, 'repair-model-err-1', { providerID: 'enmaas', modelID: 'glm-5-3' });
@@ -749,7 +701,7 @@ test('a failing repair model fails open and leaves args unchanged', async () => 
 });
 
 test('a failing tool-schema lookup skips repair without throwing', async () => {
-  await withCleanRepairEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, promptTexts, toolListQueries } = repairPluginInput({ toolListRejects: true });
     const hooks = await plugin.server(input, repairOnlyOptions());
     await dispatchChatMessage(hooks, 'repair-schema-err-1', { providerID: 'enmaas', modelID: 'glm-5-3' });
@@ -764,7 +716,7 @@ test('a failing tool-schema lookup skips repair without throwing', async () => {
 });
 
 test('argRepair.enabled false disables the repair pass', async () => {
-  await withCleanRepairEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, promptTexts } = repairPluginInput();
     const hooks = await plugin.server(input, repairOnlyOptions({ enabled: false }));
     await dispatchChatMessage(hooks, 'repair-off-1', { providerID: 'enmaas', modelID: 'glm-5-3' });
@@ -778,7 +730,7 @@ test('argRepair.enabled false disables the repair pass', async () => {
 });
 
 test('the fallback model identity drives the schema lookup without chat.message', async () => {
-  await withCleanRepairEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, promptTexts, toolListQueries } = repairPluginInput();
     const hooks = await plugin.server(input, repairOnlyOptions());
     const args: Record<string, unknown> = { questions: null };
@@ -794,7 +746,7 @@ test('the fallback model identity drives the schema lookup without chat.message'
 });
 
 test('directive repair rules extend the scope to non-builtin tools', async () => {
-  await withCleanRepairEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({
       'repair-dewey.md': directiveFile('Repair malformed dewey searches.', { repair: [{ tool: 'dewey_search' }] }),
     });

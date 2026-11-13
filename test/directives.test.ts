@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { Hooks, PluginInput } from '@opencode-ai/plugin';
+import type { Hooks } from '@opencode-ai/plugin';
 import plugin, { logIdentityState, sessionState } from '../index.ts';
-import { recordingPluginInput, silentPluginInput } from './mocks.ts';
+import { completedReasoningPart, recordingPluginInput, silentPluginInput, withCleanSupervisorEnv } from './mocks.ts';
 import {
   activeDirectives,
   compileEnforcement,
@@ -57,19 +57,6 @@ function makeDirectiveDir(files: Record<string, string>): string {
 /** Event-hook input shape, for casting deliberately undeclared event payloads. */
 type EventHookInput = Parameters<NonNullable<Hooks['event']>>[0];
 
-/** A synthetic completed reasoning part (the SDK's terminal publication shape). */
-function completedReasoningPart(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
-    id: 'part-1',
-    sessionID: 'event-session-1',
-    messageID: 'msg-1',
-    type: 'reasoning',
-    text: 'the rate = 24 * 15 = 360',
-    time: { start: 1, end: 2 },
-    ...overrides,
-  };
-}
-
 /** Dispatches one message.part.updated event through the hook. */
 function dispatchPart(hooks: Hooks, part: unknown): Promise<void> {
   return hooks.event!({ event: { type: 'message.part.updated', properties: { part } } } as unknown as EventHookInput);
@@ -102,52 +89,6 @@ async function dispatchMemoTransform(hooks: Hooks, sessionID: string): Promise<u
 function messageText(message: unknown): string {
   const parts = (message as { parts?: Array<{ type?: string; text?: unknown }> }).parts ?? [];
   return parts.filter((part) => part.type === 'text').map((part) => String(part.text)).join('\n');
-}
-
-/** Every OPENCODE_SUPERVISOR_* knob, for env-cleaning around hook-layer tests. */
-const DIRECTIVE_ENV_NAMES = [
-  'OPENCODE_SUPERVISOR_MODEL',
-  'OPENCODE_SUPERVISOR_VARIANT',
-  'OPENCODE_SUPERVISOR_MAX_REGENERATIONS',
-  'OPENCODE_SUPERVISOR_STRIP_MODE',
-  'OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING',
-  'OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_SOLVED_ITEMS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_CRITIQUES',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS',
-];
-
-/** Saves/deletes the supervisor env knobs and isolates XDG_CONFIG_HOME around `run`, restoring after. */
-async function withCleanDirectivesEnv(run: () => Promise<void>): Promise<void> {
-  const saved: Record<string, string | undefined> = {};
-  for (const name of DIRECTIVE_ENV_NAMES) {
-    saved[name] = process.env[name];
-    delete process.env[name];
-  }
-  // Isolate the global config tier (review round 5): a real
-  // ~/.config/opencode/supervisor/config.json on the host must not
-  // leak into tier resolution through XDG_CONFIG_HOME.
-  const savedXdgHome = process.env.XDG_CONFIG_HOME;
-  const isolatedXdgRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-xdg-'));
-  process.env.XDG_CONFIG_HOME = isolatedXdgRoot;
-  try {
-    await run();
-  } finally {
-    for (const name of DIRECTIVE_ENV_NAMES) {
-      const value = saved[name];
-      if (value === undefined) {
-        delete process.env[name];
-      } else {
-        process.env[name] = value;
-      }
-    }
-    if (savedXdgHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME;
-    } else {
-      process.env.XDG_CONFIG_HOME = savedXdgHome;
-    }
-    fs.rmSync(isolatedXdgRoot, { recursive: true, force: true });
-  }
 }
 
 /** A fixed no-secrets directive used across guard and memo tests. */
@@ -708,7 +649,7 @@ test('directive files load from the project directory into the memo', async () =
     'no-secrets.md': directiveFile(NO_SECRETS_TEXT, NO_SECRETS_RULES),
   });
   try {
-    await withCleanDirectivesEnv(async () => {
+    await withCleanSupervisorEnv(async () => {
       const hooks = await plugin.server(silentPluginInput(dir));
       sessionState.get('directives-load');
       const messages = await dispatchMemoTransform(hooks, 'directives-load');
@@ -728,7 +669,7 @@ test('a forbidden path blocks the tool call with the directive named', async () 
     'no-secrets.md': directiveFile(NO_SECRETS_TEXT, NO_SECRETS_RULES),
   });
   try {
-    await withCleanDirectivesEnv(async () => {
+    await withCleanSupervisorEnv(async () => {
       const hooks = await plugin.server(silentPluginInput(dir));
       await assert.rejects(
         dispatchToolBefore(hooks, 'guard-session', 'bash', { command: 'cat secrets/token.ts' }),
@@ -753,7 +694,7 @@ test('a forbidden pattern blocks the tool call case-insensitively', async () => 
     }),
   });
   try {
-    await withCleanDirectivesEnv(async () => {
+    await withCleanSupervisorEnv(async () => {
       const hooks = await plugin.server(silentPluginInput(dir));
       await assert.rejects(
         dispatchToolBefore(hooks, 'pattern-session', 'bash', { command: 'git push --force origin main' }),
@@ -771,7 +712,7 @@ test('clean tool calls proceed while directives are configured', async () => {
     'no-secrets.md': directiveFile(NO_SECRETS_TEXT, NO_SECRETS_RULES),
   });
   try {
-    await withCleanDirectivesEnv(async () => {
+    await withCleanSupervisorEnv(async () => {
       const hooks = await plugin.server(silentPluginInput(dir));
       await dispatchToolBefore(hooks, 'clean-session', 'bash', { command: 'bun test' });
       await hooks.dispose!();
@@ -788,7 +729,7 @@ test('a trigger rule surfaces its directive in the memo after a matching call', 
     }),
   });
   try {
-    await withCleanDirectivesEnv(async () => {
+    await withCleanSupervisorEnv(async () => {
       const hooks = await plugin.server(silentPluginInput(dir));
       sessionState.get('trigger-session');
 
@@ -815,7 +756,7 @@ test('a blocked call still records its trigger', async () => {
     }),
   });
   try {
-    await withCleanDirectivesEnv(async () => {
+    await withCleanSupervisorEnv(async () => {
       const hooks = await plugin.server(silentPluginInput(dir));
       sessionState.get('blocked-trigger-session');
       await assert.rejects(
@@ -833,7 +774,7 @@ test('a blocked call still records its trigger', async () => {
 });
 
 test('a project without directives keeps the 2.1.0 behavior', async () => {
-  await withCleanDirectivesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput('/tmp/supervisor-test'));
     sessionState.get('baseline-session');
     sessionState.get('baseline-session').goal = 'a goal';
@@ -846,7 +787,7 @@ test('a project without directives keeps the 2.1.0 behavior', async () => {
 });
 
 test('options.directives registers directives through the tuple channel', async () => {
-  await withCleanDirectivesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput('/tmp/supervisor-test'), {
       directives: [{ id: 'opt-directive', text: 'Prefer bun over node.', when: [{ tool: 'bash' }] }],
     });
@@ -866,7 +807,7 @@ test('the directive count bound drops the overflow with a warning', async () => 
   }
   const dir = makeDirectiveDir(files);
   try {
-    await withCleanDirectivesEnv(async () => {
+    await withCleanSupervisorEnv(async () => {
       const { input, logEntries } = recordingPluginInput(dir);
       const hooks = await plugin.server(input);
       sessionState.get('cap-session');
@@ -889,7 +830,7 @@ test('the event-hook audit prompt carries the directives advisory', async () => 
     'no-secrets.md': directiveFile(NO_SECRETS_TEXT, NO_SECRETS_RULES),
   });
   try {
-    await withCleanDirectivesEnv(async () => {
+    await withCleanSupervisorEnv(async () => {
       const prompts: string[] = [];
       const input = silentPluginInput(dir);
       (input.client as { session: Record<string, unknown> }).session.prompt = async (
@@ -929,7 +870,7 @@ test('a dotfile forbidPath blocks paths the extension allowlist cannot see', asy
     }),
   });
   try {
-    await withCleanDirectivesEnv(async () => {
+    await withCleanSupervisorEnv(async () => {
       const hooks = await plugin.server(silentPluginInput(dir));
       await assert.rejects(
         dispatchToolBefore(hooks, 'dotenv-session', 'bash', { command: 'cat .env.local' }),
@@ -952,7 +893,7 @@ test('a case-different path still matches a forbidden glob', async () => {
     'no-secrets.md': directiveFile(NO_SECRETS_TEXT, NO_SECRETS_RULES),
   });
   try {
-    await withCleanDirectivesEnv(async () => {
+    await withCleanSupervisorEnv(async () => {
       const hooks = await plugin.server(silentPluginInput(dir));
       await assert.rejects(
         dispatchToolBefore(hooks, 'case-session', 'bash', { command: 'cat Secrets/token.ts' }),
@@ -978,7 +919,7 @@ test('an unreadable directive file is skipped while the rest still load', async 
   const locked = path.join(dir, '.opencode', 'supervisor', 'directives', 'locked.md');
   fs.chmodSync(locked, 0o000);
   try {
-    await withCleanDirectivesEnv(async () => {
+    await withCleanSupervisorEnv(async () => {
       const { input, logEntries } = recordingPluginInput(dir);
       const hooks = await plugin.server(input);
       sessionState.get('unreadable-session');
@@ -1003,7 +944,7 @@ test('the first-recorded trigger for a directive is logged once', async () => {
     }),
   });
   try {
-    await withCleanDirectivesEnv(async () => {
+    await withCleanSupervisorEnv(async () => {
       const { input, logEntries } = recordingPluginInput(dir);
       const hooks = await plugin.server(input);
       sessionState.get('trigger-log-session');
@@ -1028,7 +969,7 @@ async function guardOutcome(rules: object, tool: string, args: unknown): Promise
   const dir = makeDirectiveDir({ 'policy.md': directiveFile('Policy text.', rules) });
   try {
     let outcome: string | null = null;
-    await withCleanDirectivesEnv(async () => {
+    await withCleanSupervisorEnv(async () => {
       const hooks = await plugin.server(silentPluginInput(dir));
       try {
         await dispatchToolBefore(hooks, 'anchor-session', tool, args);
@@ -1048,7 +989,7 @@ async function triggerOutcome(glob: string, tool: string, args: unknown): Promis
   const dir = makeDirectiveDir({ 'note.md': directiveFile('Trigger note.', { when: [{ path: glob }] }) });
   try {
     let triggered = false;
-    await withCleanDirectivesEnv(async () => {
+    await withCleanSupervisorEnv(async () => {
       const hooks = await plugin.server(silentPluginInput(dir));
       await dispatchToolBefore(hooks, 'anchor-trigger-session', tool, args);
       triggered = sessionState.get('anchor-trigger-session').triggeredDirectives.includes('note');
@@ -1128,7 +1069,7 @@ test('directive files past the read cap are never parsed (FR-079)', async () => 
   files['z2.md'] = broken;
   const dir = makeDirectiveDir(files);
   try {
-    await withCleanDirectivesEnv(async () => {
+    await withCleanSupervisorEnv(async () => {
       const { input, logEntries } = recordingPluginInput(dir);
       const hooks = await plugin.server(input);
       await dispatchToolBefore(hooks, 'file-cap-session', 'bash', { command: 'bun test' });
@@ -1146,7 +1087,7 @@ test('the identity line names loaded directives and their sources (FR-079)', asy
   const dir = makeDirectiveDir({ 'no-secrets.md': directiveFile(NO_SECRETS_TEXT, NO_SECRETS_RULES) });
   const saved = { ...logIdentityState };
   try {
-    await withCleanDirectivesEnv(async () => {
+    await withCleanSupervisorEnv(async () => {
       logIdentityState.identityLogged = false;
       logIdentityState.identitySaidNoModel = false;
       const { input, logEntries } = recordingPluginInput(dir);

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { Hooks, PluginInput, ToolContext } from '@opencode-ai/plugin';
+import type { Hooks, PluginInput } from '@opencode-ai/plugin';
 import plugin, { sessionState } from '../index.ts';
 import {
   addReminder,
@@ -14,33 +14,15 @@ import {
   type Reminder,
 } from '../src/reminders.ts';
 import { buildMemo } from '../src/memo.ts';
-import { silentClientSurface, silentPluginInput } from './mocks.ts';
+import { completedReasoningPart, silentClientSurface, silentPluginInput, toolContext, withCleanSupervisorEnv } from './mocks.ts';
 
 /** A stored reminder with a fixed timestamp — the module never touches the clock. */
 function reminder(id: string, text: string): Reminder {
   return { id, text, addedAt: '2026-10-25T00:00:00.000Z' };
 }
 
-/** Minimal ToolContext: the tools only read `sessionID`. */
-function toolContext(sessionID: string): ToolContext {
-  return { sessionID } as unknown as ToolContext;
-}
-
 /** Event-hook input shape, for casting deliberately undeclared event payloads. */
 type EventHookInput = Parameters<NonNullable<Hooks['event']>>[0];
-
-/** A synthetic completed reasoning part (the SDK's terminal publication shape). */
-function completedReasoningPart(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
-    id: 'part-1',
-    sessionID: 'event-session-1',
-    messageID: 'msg-1',
-    type: 'reasoning',
-    text: 'the rate = 24 * 15 = 360',
-    time: { start: 1, end: 2 },
-    ...overrides,
-  };
-}
 
 /** Dispatches one message.part.updated event through the hook. */
 function dispatchPart(hooks: Hooks, part: unknown): Promise<void> {
@@ -69,52 +51,6 @@ async function dispatchMemoTransform(hooks: Hooks, sessionID: string): Promise<u
 function messageText(message: unknown): string {
   const parts = (message as { parts?: Array<{ type?: string; text?: unknown }> }).parts ?? [];
   return parts.filter((part) => part.type === 'text').map((part) => String(part.text)).join('\n');
-}
-
-/** Every OPENCODE_SUPERVISOR_* knob, for env-cleaning around hook-layer tests. */
-const REMINDER_ENV_NAMES = [
-  'OPENCODE_SUPERVISOR_MODEL',
-  'OPENCODE_SUPERVISOR_VARIANT',
-  'OPENCODE_SUPERVISOR_MAX_REGENERATIONS',
-  'OPENCODE_SUPERVISOR_STRIP_MODE',
-  'OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING',
-  'OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_SOLVED_ITEMS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_CRITIQUES',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS',
-];
-
-/** Saves/deletes the supervisor env knobs and isolates XDG_CONFIG_HOME around `run`, restoring after. */
-async function withCleanReminderEnv(run: () => Promise<void>): Promise<void> {
-  const saved: Record<string, string | undefined> = {};
-  for (const name of REMINDER_ENV_NAMES) {
-    saved[name] = process.env[name];
-    delete process.env[name];
-  }
-  // Isolate the global config tier (review round 5): a real
-  // ~/.config/opencode/supervisor/config.json on the host must not
-  // leak into tier resolution through XDG_CONFIG_HOME.
-  const savedXdgHome = process.env.XDG_CONFIG_HOME;
-  const isolatedXdgRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-xdg-'));
-  process.env.XDG_CONFIG_HOME = isolatedXdgRoot;
-  try {
-    await run();
-  } finally {
-    for (const name of REMINDER_ENV_NAMES) {
-      const value = saved[name];
-      if (value === undefined) {
-        delete process.env[name];
-      } else {
-        process.env[name] = value;
-      }
-    }
-    if (savedXdgHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME;
-    } else {
-      process.env.XDG_CONFIG_HOME = savedXdgHome;
-    }
-    fs.rmSync(isolatedXdgRoot, { recursive: true, force: true });
-  }
 }
 
 // ── Pure module: prepareReminderText (FR-025) ──
@@ -226,7 +162,7 @@ test('buildMemo bounds the Reminders section by maxReminders', () => {
 // ── Tool layer: remind_me / forget_reminder (FR-020, FR-021, FR-025) ──
 
 test('remind_me stores a reminder and echoes it with its id', async () => {
-  await withCleanReminderEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const result = await hooks.tool!.remind_me.execute(
       { text: '  use bash 4.5 for the test suite  ' },
@@ -248,7 +184,7 @@ test('remind_me stores a reminder and echoes it with its id', async () => {
 });
 
 test('remind_me assigns sequential ids that are never recycled', async () => {
-  await withCleanReminderEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const context = toolContext('reminders-tool-sequence');
     await hooks.tool!.remind_me.execute({ text: 'first' }, context);
@@ -261,7 +197,7 @@ test('remind_me assigns sequential ids that are never recycled', async () => {
 });
 
 test('remind_me rejects whitespace-only text without creating session state', async () => {
-  await withCleanReminderEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const result = await hooks.tool!.remind_me.execute({ text: '   ' }, toolContext('reminders-tool-empty'));
     assert.ok(result.includes('state the fact to remember'));
@@ -270,7 +206,7 @@ test('remind_me rejects whitespace-only text without creating session state', as
 });
 
 test('remind_me truncates over-length text and notes it in the result', async () => {
-  await withCleanReminderEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const result = await hooks.tool!.remind_me.execute(
       { text: 'a'.repeat(2500) },
@@ -283,7 +219,7 @@ test('remind_me truncates over-length text and notes it in the result', async ()
 });
 
 test('remind_me says reminders are disabled and consumes no id when maxReminders is 0 (FR-077)', async () => {
-  await withCleanReminderEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     process.env.OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS = '0';
     const hooks = await plugin.server(silentPluginInput());
     const result = await hooks.tool!.remind_me.execute({ text: 'use bun' }, toolContext('reminders-tool-disabled'));
@@ -298,7 +234,7 @@ test('remind_me says reminders are disabled and consumes no id when maxReminders
 });
 
 test('remind_me bounds stored reminders to the configured maxReminders', async () => {
-  await withCleanReminderEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     process.env.OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS = '2';
     const hooks = await plugin.server(silentPluginInput());
     const context = toolContext('reminders-tool-bound');
@@ -315,7 +251,7 @@ test('remind_me bounds stored reminders to the configured maxReminders', async (
 });
 
 test('forget_reminder clears a stored reminder', async () => {
-  await withCleanReminderEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const context = toolContext('reminders-tool-forget');
     await hooks.tool!.remind_me.execute({ text: 'use bun, not node' }, context);
@@ -326,7 +262,7 @@ test('forget_reminder clears a stored reminder', async () => {
 });
 
 test('forget_reminder lists current ids for an unknown id', async () => {
-  await withCleanReminderEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const context = toolContext('reminders-tool-unknown');
     await hooks.tool!.remind_me.execute({ text: 'first' }, context);
@@ -338,7 +274,7 @@ test('forget_reminder lists current ids for an unknown id', async () => {
 });
 
 test('forget_reminder reports when the session has no reminders', async () => {
-  await withCleanReminderEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const result = await hooks.tool!.forget_reminder.execute({ id: 'r1' }, toolContext('reminders-tool-none'));
     assert.equal(result, 'No reminder matches "r1" — the session has no reminders.');
@@ -346,7 +282,7 @@ test('forget_reminder reports when the session has no reminders', async () => {
 });
 
 test('the memo transform injects stored reminders as a memo message', async () => {
-  await withCleanReminderEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'reminders-memo-session';
     await hooks.tool!.remind_me.execute({ text: 'use bash 4.5 for the test suite' }, toolContext(sessionID));
@@ -362,7 +298,7 @@ test('the memo transform injects stored reminders as a memo message', async () =
 // ── FR-024: side sessions get an inert result, never state ──
 
 test('reminder tools return an inert result in auditor side sessions', async () => {
-  await withCleanReminderEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     // A parked audit keeps side session 'auditor-side-live' registered for
     // self-suppression while the reminder tools are exercised against it —
     // exactly the window in which a side session could see the tools.

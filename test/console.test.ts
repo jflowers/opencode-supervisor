@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { Hooks, PluginInput, ToolContext } from '@opencode-ai/plugin';
+import type { Hooks, PluginInput } from '@opencode-ai/plugin';
 import plugin, { resolveHookConfig, sessionState } from '../index.ts';
 import {
   addReport,
@@ -25,33 +25,15 @@ import {
 } from '../src/console.ts';
 import { buildMemo } from '../src/memo.ts';
 import { PLUGIN_ID } from '../src/plugin-id.ts';
-import { silentClientSurface, silentPluginInput } from './mocks.ts';
+import { completedReasoningPart, silentClientSurface, silentPluginInput, toolContext, withCleanSupervisorEnv } from './mocks.ts';
 
 /** A stored report with a fixed timestamp — the module never touches the clock. */
 function report(kind: AgentReport['kind'], text: string): AgentReport {
   return { kind, text, addedAt: '2026-10-25T00:00:00.000Z' };
 }
 
-/** Minimal ToolContext: the tools only read `sessionID`. */
-function toolContext(sessionID: string): ToolContext {
-  return { sessionID } as unknown as ToolContext;
-}
-
 /** Event-hook input shape, for casting deliberately undeclared event payloads. */
 type EventHookInput = Parameters<NonNullable<Hooks['event']>>[0];
-
-/** A synthetic completed reasoning part (the SDK's terminal publication shape). */
-function completedReasoningPart(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
-    id: 'part-1',
-    sessionID: 'event-session-1',
-    messageID: 'msg-1',
-    type: 'reasoning',
-    text: 'the rate = 24 * 15 = 360',
-    time: { start: 1, end: 2 },
-    ...overrides,
-  };
-}
 
 /** Dispatches one message.part.updated event through the hook. */
 function dispatchPart(hooks: Hooks, part: unknown): Promise<void> {
@@ -85,54 +67,6 @@ async function dispatchMemoTransform(hooks: Hooks, sessionID: string): Promise<u
 function messageText(message: unknown): string {
   const parts = (message as { parts?: Array<{ type?: string; text?: unknown }> }).parts ?? [];
   return parts.filter((part) => part.type === 'text').map((part) => String(part.text)).join('\n');
-}
-
-/** Every OPENCODE_SUPERVISOR_* knob, for env-cleaning around hook-layer tests. */
-const CONSOLE_ENV_NAMES = [
-  'OPENCODE_SUPERVISOR_MODEL',
-  'OPENCODE_SUPERVISOR_VARIANT',
-  'OPENCODE_SUPERVISOR_MAX_REGENERATIONS',
-  'OPENCODE_SUPERVISOR_STRIP_MODE',
-  'OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING',
-  'OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_SOLVED_ITEMS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_CRITIQUES',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS',
-  'OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS',
-];
-
-/** Saves/deletes the supervisor env knobs and isolates XDG_CONFIG_HOME around `run`, restoring after. */
-async function withCleanConsoleEnv(run: () => Promise<void>): Promise<void> {
-  const saved: Record<string, string | undefined> = {};
-  for (const name of CONSOLE_ENV_NAMES) {
-    saved[name] = process.env[name];
-    delete process.env[name];
-  }
-  // Isolate the global config tier (review round 5): a real
-  // ~/.config/opencode/supervisor/config.json on the host must not
-  // leak into tier resolution through XDG_CONFIG_HOME.
-  const savedXdgHome = process.env.XDG_CONFIG_HOME;
-  const isolatedXdgRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-xdg-'));
-  process.env.XDG_CONFIG_HOME = isolatedXdgRoot;
-  try {
-    await run();
-  } finally {
-    for (const name of CONSOLE_ENV_NAMES) {
-      const value = saved[name];
-      if (value === undefined) {
-        delete process.env[name];
-      } else {
-        process.env[name] = value;
-      }
-    }
-    if (savedXdgHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME;
-    } else {
-      process.env.XDG_CONFIG_HOME = savedXdgHome;
-    }
-    fs.rmSync(isolatedXdgRoot, { recursive: true, force: true });
-  }
 }
 
 /**
@@ -317,7 +251,7 @@ test('buildMemo bounds the Agent reports section by maxReports', () => {
 // ── Tool layer: report (FR-034, FR-035) ──
 
 test('report stores a report and echoes it back', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const result = await hooks.tool!.report.execute(
       { kind: 'blocker', text: '  the auth service is down  ' },
@@ -338,7 +272,7 @@ test('report stores a report and echoes it back', async () => {
 });
 
 test('report rejects an unknown kind without storing anything', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const result = await hooks.tool!.report.execute(
       { kind: 'incident', text: 'something happened' },
@@ -350,7 +284,7 @@ test('report rejects an unknown kind without storing anything', async () => {
 });
 
 test('report rejects whitespace-only text without creating session state', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const result = await hooks.tool!.report.execute(
       { kind: 'note', text: '   ' },
@@ -362,7 +296,7 @@ test('report rejects whitespace-only text without creating session state', async
 });
 
 test('report truncates over-length text and notes it in the result', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const result = await hooks.tool!.report.execute(
       { kind: 'note', text: 'a'.repeat(2500) },
@@ -375,7 +309,7 @@ test('report truncates over-length text and notes it in the result', async () =>
 });
 
 test('report bounds stored reports to the configured maxReports', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     process.env.OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS = '2';
     const hooks = await plugin.server(silentPluginInput());
     const context = toolContext('console-report-bound');
@@ -398,7 +332,7 @@ test('report bounds stored reports to the configured maxReports', async () => {
 });
 
 test('report says reports are disabled and stores nothing when maxReports is 0 (FR-077)', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     process.env.OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS = '0';
     const hooks = await plugin.server(silentPluginInput());
     const result = await hooks.tool!.report.execute(
@@ -415,7 +349,7 @@ test('report says reports are disabled and stores nothing when maxReports is 0 (
 });
 
 test('the memo transform injects stored reports as a memo message', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'console-report-memo';
     await hooks.tool!.report.execute({ kind: 'deviation', text: 'skipped the flaky test' }, toolContext(sessionID));
@@ -431,7 +365,7 @@ test('the memo transform injects stored reports as a memo message', async () => 
 // ── Tool layer: recall (FR-033, design D3 retention) ──
 
 test('recall returns the full retained solved items beyond the memo render cap', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'console-recall-retention';
     for (const step of ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight']) {
@@ -454,7 +388,7 @@ test('recall returns the full retained solved items beyond the memo render cap',
 });
 
 test('recall reads without creating session state', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const result = await hooks.tool!.recall.execute({ what: 'goal' }, toolContext('console-recall-peek'));
     assert.equal(result, 'No goal is stored for this session.');
@@ -463,7 +397,7 @@ test('recall reads without creating session state', async () => {
 });
 
 test('recall lists the supported sections for an unknown what', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const result = await hooks.tool!.recall.execute({ what: 'tasks' }, toolContext('console-recall-unknown'));
     assert.equal(result, 'Unknown section "tasks" — supported values: goal, reminders, solved, critiques, all.');
@@ -473,7 +407,7 @@ test('recall lists the supported sections for an unknown what', async () => {
 // ── Tool layer: request_audit (FR-037..FR-039) ──
 
 test('request_audit records a passing focus in the verified trace', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditInput(PASSED_AUDIT);
     const hooks = await plugin.server(input);
     const result = await hooks.tool!.request_audit.execute(
@@ -490,7 +424,7 @@ test('request_audit records a passing focus in the verified trace', async () => 
 });
 
 test('request_audit names the assurance level when no auditor model resolved', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     // Review round 5: no model anywhere — env knobs are cleared, the
     // config files are absent, and the host config serves none — so
     // deterministic invariants are the whole audit and the result
@@ -523,7 +457,7 @@ test('request_audit names the assurance level when no auditor model resolved', a
 });
 
 test('request_audit names the assurance level when the audit infrastructure fails open', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     // Review round 5: the derived model resolves, but the side-session
     // prompt rejects — the audit fails open (FR-005) and the result
     // must say so instead of a plain "Audit passed".
@@ -556,7 +490,7 @@ test('request_audit names the assurance level when the audit infrastructure fail
 });
 
 test('request_audit returns the critique in the result without steering on failure', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditInput(PASSED_AUDIT);
     const hooks = await plugin.server(input);
     // A deterministic arithmetic failure (FR-003): the invariant catches
@@ -580,7 +514,7 @@ test('request_audit returns the critique in the result without steering on failu
 });
 
 test('request_audit rejects a whitespace-only focus without consuming the bound', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const result = await hooks.tool!.request_audit.execute({ focus: '   ' }, toolContext('console-audit-empty'));
     assert.equal(result, 'Audit focus is empty after trimming — state the claim or step to check.');
@@ -589,7 +523,7 @@ test('request_audit rejects a whitespace-only focus without consuming the bound'
 });
 
 test('request_audit rejects a focus that strips to no formal content', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditInput(PASSED_AUDIT);
     const hooks = await plugin.server(input);
     const result = await hooks.tool!.request_audit.execute(
@@ -607,7 +541,7 @@ test('request_audit rejects a focus that strips to no formal content', async () 
 });
 
 test('request_audit is bounded per session', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     process.env.OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS = '1';
     const { input, calls } = auditInput(PASSED_AUDIT);
     const hooks = await plugin.server(input);
@@ -626,7 +560,7 @@ test('request_audit is bounded per session', async () => {
 });
 
 test('a session-config maxOnDemandAudits override beats the environment', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     process.env.OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS = '1';
     const session = { config: { plugins: { [PLUGIN_ID]: { maxOnDemandAudits: 4 } } } };
     assert.equal(resolveHookConfig(session).maxOnDemandAudits, 4);
@@ -646,7 +580,7 @@ test('prepareAuditFocus trims, rejects empty focus, and truncates at MAX_AUDIT_F
 });
 
 test('request_audit caps an over-length focus before the audit, trace, and result (FR-078)', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditInput(PASSED_AUDIT);
     const hooks = await plugin.server(input);
     const focus = `x = 1 + 1 = 2 ${'y'.repeat(MAX_AUDIT_FOCUS)} TAIL_BEYOND_CAP`;
@@ -664,7 +598,7 @@ test('request_audit caps an over-length focus before the audit, trace, and resul
 });
 
 test('failed on-demand critiques retain only the most recent CRITIQUE_RETENTION_CAP entries', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     process.env.OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS = '40';
     const hooks = await plugin.server(silentPluginInput());
     const context = toolContext('console-audit-retention');
@@ -683,7 +617,7 @@ test('failed on-demand critiques retain only the most recent CRITIQUE_RETENTION_
 // ── FR-042: self-reported text never enters the audit prompt ──
 
 test('stored report text never enters the audit prompt', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditInput(PASSED_AUDIT);
     const hooks = await plugin.server(input);
     const context = toolContext('console-trust-boundary');
@@ -700,7 +634,7 @@ test('stored report text never enters the audit prompt', async () => {
 // ── FR-040: side sessions get an inert result, never state ──
 
 test('console tools return an inert result in auditor side sessions', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     // A parked audit keeps side session 'auditor-side-live' registered for
     // self-suppression while the console tools are exercised against it —
     // exactly the window in which a side session could see the tools.
@@ -762,7 +696,7 @@ test('console tools return an inert result in auditor side sessions', async () =
 // ── FR-041: fail-open bodies on odd payloads ──
 
 test('console tool bodies never throw on odd payloads', async () => {
-  await withCleanConsoleEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const context = toolContext('console-odd-payloads');
     // Non-string kind falls to the unknown-kind listing; nothing stores.

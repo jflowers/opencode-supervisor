@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { Hooks, PluginInput } from '@opencode-ai/plugin';
 import plugin, { createInvokeModel, PLUGIN_VERSION, resolveHookConfig, sessionState, traceAwaitState } from '../index.ts';
-import { recordingPluginInput, silentClientSurface, silentPluginInput } from './mocks.ts';
+import { completedReasoningPart, recordingPluginInput, silentClientSurface, silentPluginInput, withCleanSupervisorEnv } from './mocks.ts';
 import { stripNarrative } from '../src/stripper.ts';
 import {
   checkDeterministicInvariants,
@@ -1289,67 +1289,6 @@ test('tool.execute.before blocks reward hacking (--no-verify)', async () => {
 
 // ── Event-hook audit path (task 3.2): live wiring, mocked client ──
 
-/** Env knobs the live audit path reads; pinned clean for determinism. */
-const AUDIT_ENV_NAMES = [
-  'OPENCODE_SUPERVISOR_MODEL',
-  'OPENCODE_SUPERVISOR_VARIANT',
-  'OPENCODE_SUPERVISOR_MAX_REGENERATIONS',
-  'OPENCODE_SUPERVISOR_STRIP_MODE',
-  'OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING',
-  'OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_SOLVED_ITEMS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_CRITIQUES',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS',
-  'OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS',
-  'OPENCODE_SUPERVISOR_MAX_COVERED_TIMEOUT_FAIL_OPENS',
-];
-
-/** Saves/deletes the auditor env knobs and isolates XDG_CONFIG_HOME around `run`, restoring after. */
-async function withCleanAuditEnv(run: () => Promise<void>): Promise<void> {
-  const saved: Record<string, string | undefined> = {};
-  for (const name of AUDIT_ENV_NAMES) {
-    saved[name] = process.env[name];
-    delete process.env[name];
-  }
-  // Isolate the global config tier (review round 5): a real
-  // ~/.config/opencode/supervisor/config.json on the host must not
-  // leak into tier resolution through XDG_CONFIG_HOME.
-  const savedXdgHome = process.env.XDG_CONFIG_HOME;
-  const isolatedXdgRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-xdg-'));
-  process.env.XDG_CONFIG_HOME = isolatedXdgRoot;
-  try {
-    await run();
-  } finally {
-    for (const name of AUDIT_ENV_NAMES) {
-      const value = saved[name];
-      if (value === undefined) {
-        delete process.env[name];
-      } else {
-        process.env[name] = value;
-      }
-    }
-    if (savedXdgHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME;
-    } else {
-      process.env.XDG_CONFIG_HOME = savedXdgHome;
-    }
-    fs.rmSync(isolatedXdgRoot, { recursive: true, force: true });
-  }
-}
-
-/** A synthetic completed reasoning part (the SDK's terminal publication shape). */
-function completedReasoningPart(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
-    id: 'part-1',
-    sessionID: 'event-session-1',
-    messageID: 'msg-1',
-    type: 'reasoning',
-    text: 'the rate = 24 * 15 = 360',
-    time: { start: 1, end: 2 },
-    ...overrides,
-  };
-}
-
 /**
  * Widened hook-map view for the dispatch helpers (review finding #16):
  * the tests deliberately feed raw and odd payloads, so the helpers take
@@ -1445,7 +1384,7 @@ function auditHarness(
 }
 
 test('event hook observes a completed reasoning part once and never rejects', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness(['{"passed":true}']);
     const hooks = await plugin.server(input);
 
@@ -1480,7 +1419,7 @@ test('event hook observes a completed reasoning part once and never rejects', as
 });
 
 test('event hook audits a completed reasoning part exactly once and records the passed step', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness([
       '{"passed":true,"failedStep":null,"severity":null,"critique":"All steps verified."}',
     ]);
@@ -1512,7 +1451,7 @@ test('event hook audits a completed reasoning part exactly once and records the 
 });
 
 test('event hook records only passed steps in the verified trace', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness([
       '{"passed":false,"failedStep":1,"severity":"minor","critique":"Step 1 misstates the capacity bound."}',
       '{"passed":true,"failedStep":null,"severity":null,"critique":"All steps verified."}',
@@ -1550,7 +1489,7 @@ test('event hook records only passed steps in the verified trace', async () => {
 });
 
 test('event hook strips narrative before the audit and the trace', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness(['{"passed":true,"failedStep":null,"severity":null,"critique":"Verified."}']);
     const hooks = await plugin.server(input);
 
@@ -1575,7 +1514,7 @@ test('event hook strips narrative before the audit and the trace', async () => {
 });
 
 test('event hook still dedupes duplicate publications with the live audit path', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness([]);
     const hooks = await plugin.server(input);
 
@@ -1594,7 +1533,7 @@ test('event hook still dedupes duplicate publications with the live audit path',
 });
 
 test('event hook skips narrative-only parts without an audit', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness([]);
     const hooks = await plugin.server(input);
 
@@ -1617,7 +1556,7 @@ test('event hook skips narrative-only parts without an audit', async () => {
 });
 
 test('event hook never rejects when the audit client fails (fail-open)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const createCalls: unknown[] = [];
     const input = {
       client: {
@@ -1650,7 +1589,7 @@ test('event hook never rejects when the audit client fails (fail-open)', async (
 });
 
 test('event hook keeps a minor arithmetic failure in the trace marked unpassed (FR-063)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness([]);
     const hooks = await plugin.server(input);
     const sessionID = 'audit-session-no-evict';
@@ -1681,7 +1620,7 @@ test('event hook keeps a minor arithmetic failure in the trace marked unpassed (
 });
 
 test('event hook keeps an off-by-one failure in the trace marked unpassed (FR-063)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness([]);
     const hooks = await plugin.server(input);
     const sessionID = 'audit-session-off-by-one';
@@ -1704,7 +1643,7 @@ test('event hook keeps an off-by-one failure in the trace marked unpassed (FR-06
 });
 
 test('event hook evicts severe findings and peer failures from the trace entirely (FR-063)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     // Severe (reward hacking): evicted — the reasoning is not trustworthy
     // as a path ledger, and the session is interrupted (FR-008).
     const severeHarness = auditHarness([]);
@@ -1741,7 +1680,7 @@ test('event hook evicts severe findings and peer failures from the trace entirel
 // ── Critique delivery (task 3.3): steer, bound, interrupt ─────────
 
 test('event hook steers a minor audit failure through promptAsync', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness([
       '{"passed":false,"failedStep":1,"severity":"minor","critique":"Step 1 misstates the capacity bound."}',
     ]);
@@ -1770,7 +1709,7 @@ test('event hook steers a minor audit failure through promptAsync', async () => 
 });
 
 test('event hook withholds critiques once maxRegenerations is reached', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     process.env.OPENCODE_SUPERVISOR_MAX_REGENERATIONS = '1';
     const { input, calls } = auditHarness([]);
     const hooks = await plugin.server(input);
@@ -1807,7 +1746,7 @@ test('event hook withholds critiques once maxRegenerations is reached', async ()
 });
 
 test('event hook bounds deliveries to the default maxRegenerations of 2', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness([]);
     const hooks = await plugin.server(input);
 
@@ -1835,7 +1774,7 @@ test('event hook bounds deliveries to the default maxRegenerations of 2', async 
 });
 
 test('event hook aborts the session before delivering a severe critique', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness([
       '{"passed":false,"failedStep":1,"severity":"severe","critique":"Step 1 proposes weakening the test gates."}',
     ]);
@@ -1862,7 +1801,7 @@ test('event hook aborts the session before delivering a severe critique', async 
 });
 
 test('event hook bounds severe aborts once maxRegenerations is reached', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     process.env.OPENCODE_SUPERVISOR_MAX_REGENERATIONS = '1';
     const { input, calls } = auditHarness([]);
     const hooks = await plugin.server(input);
@@ -1901,7 +1840,7 @@ test('event hook bounds severe aborts once maxRegenerations is reached', async (
 });
 
 test('event hook treats an unclassified failure as minor and does not abort', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness([
       '{"passed":false,"failedStep":1,"critique":"Unclassified logic error."}',
     ]);
@@ -1919,7 +1858,7 @@ test('event hook treats an unclassified failure as minor and does not abort', as
 });
 
 test('event hook fails open when the critique delivery transport rejects', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness([], { promptAsync: new Error('prompt transport down') });
     const hooks = await plugin.server(input);
 
@@ -1943,7 +1882,7 @@ test('event hook fails open when the critique delivery transport rejects', async
 });
 
 test('event hook still delivers a severe critique when the abort rejects', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness(
       ['{"passed":false,"failedStep":1,"severity":"severe","critique":"Step 1 proposes bypassing review."}'],
       { abort: new Error('abort transport down') }
@@ -1964,7 +1903,7 @@ test('event hook still delivers a severe critique when the abort rejects', async
 });
 
 test('event hook consumes the severe slot when delivery fails after the abort', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     process.env.OPENCODE_SUPERVISOR_MAX_REGENERATIONS = '1';
     const { input, calls } = auditHarness(
       ['{"passed":false,"failedStep":1,"severity":"severe","critique":"Step 1 proposes weakening the test gates."}'],
@@ -2138,7 +2077,7 @@ test('chat.message ignores whitespace-only user text for goal capture', async ()
 });
 
 test('tool.execute.after appends solved items with truncated, single-line outcomes', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'solved-session-shape';
 
@@ -2163,7 +2102,7 @@ test('tool.execute.after appends solved items with truncated, single-line outcom
 });
 
 test('tool.execute.after derives megabyte-scale outcomes with the same bounded shape', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'solved-session-huge';
 
@@ -2183,7 +2122,7 @@ test('tool.execute.after derives megabyte-scale outcomes with the same bounded s
 });
 
 test('tool.execute.after accumulates solved items per session, isolated across sessions', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
 
     await dispatchToolAfter(hooks, 'solved-session-a', 'bash', { title: 't', output: 'ran the suite', metadata: {} });
@@ -2201,7 +2140,7 @@ test('tool.execute.after accumulates solved items per session, isolated across s
 });
 
 test('tool.execute.after retains solved items beyond the memo render cap (design D3)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     process.env.OPENCODE_SUPERVISOR_MEMO_MAX_SOLVED_ITEMS = '2';
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'solved-session-bounded';
@@ -2229,7 +2168,7 @@ test('tool.execute.after retains solved items beyond the memo render cap (design
 });
 
 test('critique delivery retains the critique log beyond the memo render cap (design D3)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     process.env.OPENCODE_SUPERVISOR_MAX_REGENERATIONS = '3';
     process.env.OPENCODE_SUPERVISOR_MEMO_MAX_CRITIQUES = '2';
     const { input, calls } = auditHarness([]);
@@ -2261,7 +2200,7 @@ test('critique delivery retains the critique log beyond the memo render cap (des
 });
 
 test('messages transform appends the supervision memo as a user message', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'memo-session-full';
 
@@ -2304,7 +2243,7 @@ test('messages transform appends the supervision memo as a user message', async 
 });
 
 test('messages transform leaves the payload untouched when nothing is populated', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'memo-session-empty';
 
@@ -2319,7 +2258,7 @@ test('messages transform leaves the payload untouched when nothing is populated'
 });
 
 test('messages transform degrades gracefully without a session or on odd payloads', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
 
     // No sessionID derivable from the payload messages: nothing to
@@ -2340,7 +2279,7 @@ test('messages transform degrades gracefully without a session or on odd payload
 });
 
 test('chat.message and tool.execute.after never reject on odd payloads', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
 
     // Absent message/parts and non-array parts: no goal, no rejection.
@@ -2375,7 +2314,7 @@ function dispatchToolBefore(hooks: DispatchHooks, sessionID: string, tool: strin
  */
 
 test('tool.execute.before proceeds for any file path when no verified trace exists', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'guard-empty-trace';
 
@@ -2392,7 +2331,7 @@ test('tool.execute.before proceeds for any file path when no verified trace exis
 });
 
 test('tool.execute.before still blocks reward-hacking arguments with an empty trace', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'guard-empty-trace-hack';
 
@@ -2413,7 +2352,7 @@ test('tool.execute.before still blocks reward-hacking arguments with an empty tr
 });
 
 test('tool.execute.before blocks an unreferenced path with an actionable reason', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'guard-unreferenced';
     sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
@@ -2435,7 +2374,7 @@ test('tool.execute.before blocks an unreferenced path with an actionable reason'
 });
 
 test('tool.execute.before proceeds for referenced paths by full path or basename', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
 
     // FR-010: full-path match — trace and arguments both name src/a.ts.
@@ -2459,7 +2398,7 @@ test('tool.execute.before proceeds for referenced paths by full path or basename
 });
 
 test('tool.execute.before blocks every reward-hacking pattern with check and marker named', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'guard-hack-patterns';
     sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
@@ -2496,7 +2435,7 @@ test('tool.execute.before blocks every reward-hacking pattern with check and mar
 });
 
 test('tool guard consumes the live verified trace populated by the event hook', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness(['{"passed":true,"failedStep":null,"severity":null,"critique":"Verified."}']);
     const hooks = await plugin.server(input);
     const sessionID = 'guard-live-trace';
@@ -2540,7 +2479,7 @@ test('tool guard consumes the live verified trace populated by the event hook', 
 });
 
 test('tool.execute.before fails open when the guard infrastructure throws', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, logEntries } = recordingPluginInput();
     const hooks = await plugin.server(input);
     const sessionID = 'guard-corrupted-state';
@@ -2562,7 +2501,7 @@ test('tool.execute.before fails open when the guard infrastructure throws', asyn
 });
 
 test('tool.execute.before logs every block with the reason before throwing', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, logEntries } = recordingPluginInput();
     const hooks = await plugin.server(input);
     const sessionID = 'guard-block-log';
@@ -2592,7 +2531,7 @@ test('tool.execute.before honors disabled guard checks via configuration', async
   // input carries no session object, so the session-config tier
   // cannot reach this hook (its precedence is covered by the
   // resolveHookConfig test above).
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     process.env.OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING = 'false';
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'guard-config-reward-off';
@@ -2603,7 +2542,7 @@ test('tool.execute.before honors disabled guard checks via configuration', async
   });
 
   // File-path trace check disabled: an unreferenced path proceeds.
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     process.env.OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS = 'false';
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'guard-config-trace-off';
@@ -2618,7 +2557,7 @@ test('tool.execute.before honors disabled guard checks via configuration', async
 });
 
 test('tool.execute.before satisfies a wildcard from a trace reference end to end (FR-066)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
 
     // The #36 field scenario, end to end: the trace names a concrete
@@ -2645,7 +2584,7 @@ test('tool.execute.before satisfies a wildcard from a trace reference end to end
 });
 
 test('tool.execute.before leaves the request_audit channel open end to end (FR-065)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'guard-console-exempt';
     sessionState.get(sessionID).verifiedSteps.push({ text: 'edit src/a.ts to export the helper', passed: true });
@@ -2696,7 +2635,7 @@ test('dispose clears all session state', async () => {
 // ── Self-suppression (review iteration 2): the plugin's own side ──
 
 test("hooks ignore the plugin's own auditor side sessions (self-suppression)", async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     // A client whose session.prompt parks until the test releases it,
     // so the side session is LIVE — registered for self-suppression —
     // while the side-session traffic below is dispatched: exactly the
@@ -2852,7 +2791,7 @@ function raceHarness(): {
 const PASSED_VERDICT = '{"passed":true,"failedStep":null,"severity":null,"critique":"Verified."}';
 
 test('tool.execute.before waits for an in-flight audit and allows once the step lands (FR-067)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const harness = raceHarness();
     const hooks = await plugin.server(harness.input);
     const sessionID = 'race-settled';
@@ -2893,7 +2832,7 @@ test('tool.execute.before waits for an in-flight audit and allows once the step 
 });
 
 test('a rejected in-flight audit settles the trace-check wait without throwing into the hook (FR-067)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const harness = raceHarness();
     const hooks = await plugin.server(harness.input);
     const sessionID = 'race-rejected';
@@ -2932,7 +2871,7 @@ test('a rejected in-flight audit settles the trace-check wait without throwing i
 });
 
 test('a covered trace-check wait that times out fails open on its own budget (FR-067, FR-070)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const harness = raceHarness();
     const hooks = await plugin.server(harness.input);
     const sessionID = 'race-timeout';
@@ -2974,7 +2913,7 @@ test('a covered trace-check wait that times out fails open on its own budget (FR
 });
 
 test('a covered timeout keeps its pre-wait coverage after that audit settles (design D4, FR-070)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const harness = raceHarness();
     const hooks = await plugin.server(harness.input);
     const sessionID = 'race-two-audits';
@@ -3041,7 +2980,7 @@ test('a covered timeout keeps its pre-wait coverage after that audit settles (de
 });
 
 test('the event hook records step tokens without spread limits on adversarial parts (review iteration 3)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const harness = raceHarness();
     const hooks = await plugin.server(harness.input);
     const sessionID = 'race-spread-limit';
@@ -3079,7 +3018,7 @@ test('the event hook records step tokens without spread limits on adversarial pa
 });
 
 test('repeated uncovered trace-check timeouts block at the per-session fail-open cap (FR-067)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     // Cap 1 through the env tier: the first timeout fails open
     // (below the cap), the second blocks (past it).
     process.env.OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS = '1';
@@ -3140,7 +3079,7 @@ test('repeated uncovered trace-check timeouts block at the per-session fail-open
 });
 
 test('repeated covered timeouts block at the covered fail-open cap (FR-070)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     // Covered cap 1 through the env tier: the first covered timeout
     // fails open, the second blocks past it.
     process.env.OPENCODE_SUPERVISOR_MAX_COVERED_TIMEOUT_FAIL_OPENS = '1';
@@ -3198,7 +3137,7 @@ test('repeated covered timeouts block at the covered fail-open cap (FR-070)', as
 });
 
 test('a settled wait whose correction was audited but evicted says so (FR-070)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const harness = raceHarness();
     const hooks = await plugin.server(harness.input);
     const sessionID = 'race-evicted';
@@ -3248,7 +3187,7 @@ test('a settled wait whose correction was audited but evicted says so (FR-070)',
 });
 
 test('a settled wait re-blocked on a different path names that path, not an eviction (FR-070)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const harness = raceHarness();
     const hooks = await plugin.server(harness.input);
     const sessionID = 'race-fresh-unmatched';
@@ -3293,7 +3232,7 @@ test('a settled wait re-blocked on a different path names that path, not an evic
 });
 
 test('a settled trace with no in-flight audits still blocks absent paths (FR-067 teeth)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const hooks = await plugin.server(silentPluginInput());
     const sessionID = 'race-teeth';
     sessionState.get(sessionID).verifiedSteps.push({ text: 'Edit src/a.ts to export the helper.', passed: true });
@@ -3310,7 +3249,7 @@ test('a settled trace with no in-flight audits still blocks absent paths (FR-067
 });
 
 test('the empty-trace allow imposes no wait even with an audit in flight (FR-011, FR-067)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const harness = raceHarness();
     const hooks = await plugin.server(harness.input);
     const sessionID = 'race-empty-trace';
@@ -3337,7 +3276,7 @@ test('the empty-trace allow imposes no wait even with an audit in flight (FR-011
 });
 
 test('the corrective instruction loop closes end to end: block, prose re-statement, retry (FR-068)', async () => {
-  await withCleanAuditEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness([PASSED_VERDICT]);
     const hooks = await plugin.server(input);
     const sessionID = 'corrective-e2e';
