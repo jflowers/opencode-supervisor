@@ -14,6 +14,8 @@
  * design D5) so an agent cannot grow the memo without limit.
  */
 
+import { takeMostRecent } from './records.ts';
+
 /** One stored reminder (FR-020): id, text, and ISO timestamp of registration. */
 export interface Reminder {
   /** Stable id (`r<n>`, per-session sequence, never recycled — design D3). */
@@ -68,11 +70,7 @@ export function prepareReminderText(raw: string): PreparedReminderText {
  * @returns The next bounded reminders array.
  */
 export function addReminder(reminders: Reminder[], reminder: Reminder, cap: number): Reminder[] {
-  if (cap <= 0) {
-    return [];
-  }
-  const next = [...reminders, reminder];
-  return next.length > cap ? next.slice(next.length - cap) : next;
+  return takeMostRecent([...reminders, reminder], cap);
 }
 
 /**
@@ -104,10 +102,10 @@ export function clearReminder(reminders: Reminder[], id: string): Reminder[] | n
  * @returns The section text, or null when empty (or the cap is zero or less).
  */
 export function renderReminders(reminders: Reminder[], cap: number): string | null {
-  if (cap <= 0 || reminders.length === 0) {
+  const shown = takeMostRecent(reminders, cap);
+  if (shown.length === 0) {
     return null;
   }
-  const shown = reminders.length > cap ? reminders.slice(reminders.length - cap) : reminders;
   const lines = shown.map((reminder) => `- ${reminder.id}: ${reminder.text}`);
   return `Reminders:\n${lines.join('\n')}`;
 }

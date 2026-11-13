@@ -19,6 +19,8 @@
 
 import type { PluginInput } from '@opencode-ai/plugin';
 
+import { PLUGIN_ID } from './plugin-id.ts';
+
 /** Log levels the plugin logger emits, mapping 1:1 to /log levels. */
 export type PluginLogLevel = 'info' | 'warn' | 'error';
 
@@ -41,7 +43,7 @@ export interface PluginLogger {
 }
 
 /** Service tag every entry carries in the OpenCode server log. */
-export const PLUGIN_LOG_SERVICE = 'opencode-supervisor';
+export const PLUGIN_LOG_SERVICE = PLUGIN_ID;
 
 /**
  * Cap on dedupe keys (review round 1, LOW): once the set holds this

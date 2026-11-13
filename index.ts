@@ -118,6 +118,7 @@ import {
   type SupervisorFileConfig,
 } from './src/config-file.ts';
 import { createPluginLogger, silentPluginLogger, type PluginLogger } from './src/plugin-log.ts';
+import { PLUGIN_ID } from './src/plugin-id.ts';
 import {
   MAX_PROFILE_ANCESTRY,
   normalizeCommand,
@@ -219,7 +220,7 @@ export const logIdentityState = {
 export const traceAwaitState = { timeoutMs: 10_000 };
 
 /** Session shape carrying plugin config overrides — the same key `resolveAuditorConfig` reads, so one override object governs the whole plugin. */
-const PLUGIN_CONFIG_KEY = 'opencode-supervisor';
+const PLUGIN_CONFIG_KEY = PLUGIN_ID;
 
 interface SessionWithPluginConfig {
   config?: { plugins?: Record<string, unknown> };
@@ -3053,6 +3054,6 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
 };
 
 /** OpenCode plugin module (spike 1.4: file-source plugins must carry `id`). The id matches `PLUGIN_CONFIG_KEY` so a user discovering the registered plugin id can use it as the session-config key (review finding #5). */
-export const plugin = { id: 'opencode-supervisor', server } satisfies PluginModule;
+export const plugin = { id: PLUGIN_ID, server } satisfies PluginModule;
 
 export default plugin;

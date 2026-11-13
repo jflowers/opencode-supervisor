@@ -13,7 +13,7 @@
  * clock — `addedAt` is injected by the hook layer.
  */
 
-import type { CritiqueRecord, SolvedItem } from './memo.ts';
+import { takeMostRecent, type CritiqueRecord, type SolvedItem } from './records.ts';
 import { renderReminders, type Reminder } from './reminders.ts';
 
 /** Fixed ceiling on stored report text (FR-034, design D2), deliberately not configurable. */
@@ -90,11 +90,7 @@ export function prepareReportText(raw: string): PreparedReportText {
  * @returns The next bounded reports array.
  */
 export function addReport(reports: AgentReport[], report: AgentReport, cap: number): AgentReport[] {
-  if (cap <= 0) {
-    return [];
-  }
-  const next = [...reports, report];
-  return next.length > cap ? next.slice(next.length - cap) : next;
+  return takeMostRecent([...reports, report], cap);
 }
 
 /**
@@ -108,10 +104,10 @@ export function addReport(reports: AgentReport[], report: AgentReport, cap: numb
  * @returns The section text, or null when empty (or the cap is zero or less).
  */
 export function renderReports(reports: AgentReport[], cap: number): string | null {
-  if (cap <= 0 || reports.length === 0) {
+  const shown = takeMostRecent(reports, cap);
+  if (shown.length === 0) {
     return null;
   }
-  const shown = reports.length > cap ? reports.slice(reports.length - cap) : reports;
   const lines = shown.map((report) => `- [${report.kind}] ${report.text}`);
   return `Agent reports:\n${lines.join('\n')}`;
 }

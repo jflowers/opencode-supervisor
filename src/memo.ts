@@ -17,24 +17,14 @@
  * Maps and passes plain data in.
  */
 
-import type { AuditSeverity } from './auditor.ts';
 import { renderReports, type AgentReport } from './console.ts';
 import { renderDirectives, type DirectiveText } from './directives.ts';
+import { takeMostRecent, type CritiqueRecord, type SolvedItem } from './records.ts';
 import { renderReminders, type Reminder } from './reminders.ts';
 
-export interface SolvedItem {
-  /** Tool name from the completed call (FR-014). */
-  tool: string;
-  /** Short outcome summary recorded when the call completed (FR-014). */
-  outcome: string;
-}
-
-export interface CritiqueRecord {
-  text: string;
-  severity: AuditSeverity;
-  /** Whether the critique was delivered to the session or withheld (FR-015 records both). */
-  delivered: boolean;
-}
+// The record shapes live in the records leaf module (AP-006: it breaks
+// the memo ↔ console cycle); re-exported so existing imports keep working.
+export type { CritiqueRecord, SolvedItem } from './records.ts';
 
 export interface MemoInput {
   /** Session goal — the first user message (FR-013); absent until captured. */
@@ -68,16 +58,26 @@ export const DEFAULT_MEMO_LIMITS: MemoLimits = {
 };
 
 /**
- * Bounds a log to its most recent entries (FR-017): the end of the array
- * is the most recent entry, so bounding keeps the tail. A cap of zero or
- * less yields no entries — `slice(-0)` would return the whole array,
- * since -0 === 0.
+ * Normalizes caller-supplied memo limits at runtime (FR-077): every
+ * field that is missing or not a finite number takes its
+ * DEFAULT_MEMO_LIMITS value. JavaScript callers written before
+ * `maxReminders` and `maxReports` existed pass objects without them;
+ * unnormalized, those caps were `undefined` and bounded nothing.
+ *
+ * @param limits The caller's limits, possibly partial or malformed.
+ * @returns A complete limits object.
  */
-function takeMostRecent<T>(items: T[], cap: number): T[] {
-  if (cap <= 0) {
-    return [];
-  }
-  return items.slice(-cap);
+export function normalizeMemoLimits(limits: Partial<MemoLimits> | undefined): MemoLimits {
+  const pick = (key: keyof MemoLimits): number => {
+    const value = limits?.[key];
+    return typeof value === 'number' && Number.isFinite(value) ? value : DEFAULT_MEMO_LIMITS[key];
+  };
+  return {
+    maxSolvedItems: pick('maxSolvedItems'),
+    maxCritiques: pick('maxCritiques'),
+    maxReminders: pick('maxReminders'),
+    maxReports: pick('maxReports'),
+  };
 }
 
 /**
@@ -86,7 +86,8 @@ function takeMostRecent<T>(items: T[], cap: number): T[] {
  * self-reported events (FR-036), and recent critiques (FR-015), each
  * section present only when it has content. Reminders, solved items,
  * agent reports, and critiques are bounded to their most recent entries
- * within the configured caps (FR-017, FR-023, FR-035). Reminder ids
+ * within the configured caps (FR-017, FR-023, FR-035), each cap applied
+ * once; limits are normalized first (FR-077). Reminder ids
  * render with their text so `forget_reminder` is usable from the
  * memo alone (FR-021). Both
  * delivered and withheld critiques render, marked with severity and
@@ -98,20 +99,24 @@ function takeMostRecent<T>(items: T[], cap: number): T[] {
  * @param limits Caps on reminders, solved items, and critiques shown; defaults to DEFAULT_MEMO_LIMITS.
  * @returns The memo text with sections joined by blank lines, or null when empty.
  */
-export function buildMemo(input: MemoInput, limits: MemoLimits = DEFAULT_MEMO_LIMITS): string | null {
+export function buildMemo(input: MemoInput, limits: Partial<MemoLimits> = DEFAULT_MEMO_LIMITS): string | null {
+  const caps = normalizeMemoLimits(limits);
   const goal = input.goal?.trim();
   const directives = input.directives ?? [];
-  const reminders = takeMostRecent(input.reminders ?? [], limits.maxReminders);
-  const solvedItems = takeMostRecent(input.solvedItems, limits.maxSolvedItems);
-  const agentReports = takeMostRecent(input.agentReports ?? [], limits.maxReports);
-  const critiques = takeMostRecent(input.critiques, limits.maxCritiques);
+  const solvedItems = takeMostRecent(input.solvedItems, caps.maxSolvedItems);
+  const critiques = takeMostRecent(input.critiques, caps.maxCritiques);
+  // The section renderers own the reminder and report caps, so each
+  // applies exactly once; null means the section is empty.
+  const remindersSection = renderReminders(input.reminders ?? [], caps.maxReminders);
+  const reportsSection = renderReports(input.agentReports ?? [], caps.maxReports);
+  const directivesSection = directives.length > 0 ? renderDirectives(directives) : null;
 
   if (
     !goal &&
     directives.length === 0 &&
-    reminders.length === 0 &&
+    remindersSection === null &&
     solvedItems.length === 0 &&
-    agentReports.length === 0 &&
+    reportsSection === null &&
     critiques.length === 0
   ) {
     return null;
@@ -123,18 +128,12 @@ export function buildMemo(input: MemoInput, limits: MemoLimits = DEFAULT_MEMO_LI
     sections.push(`Session goal:\n${goal}`);
   }
 
-  if (directives.length > 0) {
-    const rendered = renderDirectives(directives);
-    if (rendered !== null) {
-      sections.push(rendered);
-    }
+  if (directivesSection !== null) {
+    sections.push(directivesSection);
   }
 
-  if (reminders.length > 0) {
-    const rendered = renderReminders(reminders, limits.maxReminders);
-    if (rendered !== null) {
-      sections.push(rendered);
-    }
+  if (remindersSection !== null) {
+    sections.push(remindersSection);
   }
 
   if (solvedItems.length > 0) {
@@ -142,11 +141,8 @@ export function buildMemo(input: MemoInput, limits: MemoLimits = DEFAULT_MEMO_LI
     sections.push(`Recently solved:\n${lines.join('\n')}`);
   }
 
-  if (agentReports.length > 0) {
-    const rendered = renderReports(input.agentReports ?? [], limits.maxReports);
-    if (rendered !== null) {
-      sections.push(rendered);
-    }
+  if (reportsSection !== null) {
+    sections.push(reportsSection);
   }
 
   if (critiques.length > 0) {
