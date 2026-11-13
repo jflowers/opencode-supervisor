@@ -13,16 +13,16 @@
 
 ## 2. Console honesty and caps (FR-077, FR-078)
 
-- [ ] 2.1 `index.ts`: `remind_me` returns the disabled result
+- [x] 2.1 `index.ts`: `remind_me` returns the disabled result
   at cap ≤ 0 without consuming an id; `report` likewise; both
   interpolate the text constants in their truncation notes
-- [ ] 2.2 `src/memo.ts`: `normalizeMemoLimits`; `buildMemo`
+- [x] 2.2 `src/memo.ts`: `normalizeMemoLimits`; `buildMemo`
   normalizes and applies each cap once
-- [ ] 2.3 `src/console.ts`: `MAX_AUDIT_FOCUS`,
+- [x] 2.3 `src/console.ts`: `MAX_AUDIT_FOCUS`,
   `prepareAuditFocus`; `index.ts` `request_audit` uses it
   before stripping and notes truncation
-- [ ] 2.4 `index.ts`: `recall` reads state with `peek`
-- [ ] 2.5 tests: cap-0 results for both tools, older limits
+- [x] 2.4 `index.ts`: `recall` reads state with `peek`
+- [x] 2.5 tests: cap-0 results for both tools, older limits
   objects, focus cap (prompt, trace, result), session-config
   override of `maxOnDemandAudits`
 
@@ -42,9 +42,9 @@
 
 ## 4. Hygiene refactors (no behavior change)
 
-- [ ] 4.1 `src/plugin-id.ts` `PLUGIN_ID` used by `index.ts`,
+- [x] 4.1 `src/plugin-id.ts` `PLUGIN_ID` used by `index.ts`,
   `src/auditor.ts`, `src/plugin-log.ts`
-- [ ] 4.2 `src/records.ts`: `SolvedItem`, `CritiqueRecord`,
+- [x] 4.2 `src/records.ts`: `SolvedItem`, `CritiqueRecord`,
   `takeMostRecent`; break the memo ↔ console cycle; reminders
   and reports reuse the helper
 - [x] 4.3 `src/directives.ts`: generic `normalizeRules`, shared

@@ -276,9 +276,24 @@ test('remind_me truncates over-length text and notes it in the result', async ()
       { text: 'a'.repeat(2500) },
       toolContext('reminders-tool-truncate')
     );
-    assert.ok(result.includes('(truncated to 2000 characters)'));
+    assert.ok(result.includes(`(truncated to ${MAX_REMINDER_TEXT_LENGTH} characters)`));
     const state = sessionState.get('reminders-tool-truncate');
     assert.equal(state.reminders[0].text.length, MAX_REMINDER_TEXT_LENGTH);
+  });
+});
+
+test('remind_me says reminders are disabled and consumes no id when maxReminders is 0 (FR-077)', async () => {
+  await withCleanReminderEnv(async () => {
+    process.env.OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS = '0';
+    const hooks = await plugin.server(silentPluginInput());
+    const result = await hooks.tool!.remind_me.execute({ text: 'use bun' }, toolContext('reminders-tool-disabled'));
+    assert.equal(result, 'Reminders are disabled (maxReminders is 0) — nothing was stored.');
+    assert.ok(!result.includes('memo'));
+    assert.equal(sessionState.peek('reminders-tool-disabled'), undefined);
+    // Re-enabled, the first stored reminder still gets r1: no id was burned.
+    process.env.OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS = '5';
+    const stored = await hooks.tool!.remind_me.execute({ text: 'use bun' }, toolContext('reminders-tool-disabled'));
+    assert.ok(stored.startsWith('Reminder r1 stored'));
   });
 });
 
