@@ -237,13 +237,22 @@ export function approvalMatches(
   gateKey: string,
   now: Date = new Date()
 ): boolean {
-  return records.some((record) => {
-    if (record.gate !== gateKey) return false;
-    if (typeof record.expires !== 'string') return true;
-    const expiry = Date.parse(`${record.expires}T23:59:59.999Z`);
-    if (Number.isNaN(expiry)) return false;
-    return now.getTime() <= expiry;
-  });
+  return records.some((record) => record.gate === gateKey && expiryActive(record.expires, now));
+}
+
+/**
+ * Whether an engineer-written `expires` date is still active
+ * (FR-044, FR-083): no expiry is always active; a YYYY-MM-DD
+ * expiry is active through the end of that day, UTC
+ * (inclusive); an unparseable expiry is never active (fails
+ * closed). Shared by approval records and external-access
+ * grants.
+ */
+export function expiryActive(expires: string | undefined, now: Date = new Date()): boolean {
+  if (typeof expires !== 'string') return true;
+  const expiry = Date.parse(`${expires}T23:59:59.999Z`);
+  if (Number.isNaN(expiry)) return false;
+  return now.getTime() <= expiry;
 }
 
 /**

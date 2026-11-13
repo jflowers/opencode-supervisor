@@ -10,17 +10,17 @@
 
 ## 1. Pure module (FR-080, FR-081, FR-083, FR-086)
 
-- [ ] 1.1 `src/external-access.ts`: `classifyToolAccess`,
+- [x] 1.1 `src/external-access.ts`: `classifyToolAccess`,
   gate-neutral tools, lexical normalization, home and variable
   expansion, `findExternalPaths`
-- [ ] 1.2 grants: `parseExternalGrants` (bounded, fail-closed
+- [x] 1.2 grants: `parseExternalGrants` (bounded, fail-closed
   parse), `grantCovers` (mode, expiry, literal and glob
   coverage), `decideExternalAccess` (once grants last, reason
   text)
-- [ ] 1.3 `src/gates.ts`: shared `expiryActive`
-- [ ] 1.4 `src/tool-guard.ts`: name the grants file in the
+- [x] 1.3 `src/gates.ts`: shared `expiryActive`
+- [x] 1.4 `src/tool-guard.ts`: name the grants file in the
   protected-state check
-- [ ] 1.5 unit tests: classification, containment (absolute,
+- [x] 1.5 unit tests: classification, containment (absolute,
   `~`, `$HOME`, relative, `../`, root itself, `/dev/null`),
   coverage (glob, mode, read never covers write, expiry),
   parse failures
