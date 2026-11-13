@@ -15,6 +15,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (FR-019) is unchanged, and a regression test now pins it. A stale
   `OPENCODE_AUDITOR_BLOCK_REWARD_HACKING=false` no longer re-arms
   the tool guard silently.
+- Mode-scoped external access supervision (FR-080..FR-089, #45), off
+  by default (`externalAccess: { enabled: false, readPolicy: "allow" }`,
+  env `OPENCODE_SUPERVISOR_EXTERNAL_ACCESS` and
+  `OPENCODE_SUPERVISOR_EXTERNAL_ACCESS_READ_POLICY`). When enabled,
+  tool calls naming paths outside the project root (lexical
+  detection: `~`, `$HOME`, relative and `../` resolution) are gated
+  by access class: writes — bash included — need an engineer grant,
+  reads pass unless `readPolicy: "gate"`. Grants come from the new
+  sixth console tool `request_access`, which returns a plugin-worded
+  `question` for the agent to relay (the engineer answers *Allow
+  once*, *Allow for this session*, or *Deny*; session grants carry
+  into subagents, once grants are spent by one call), or from
+  `.opencode/supervisor/external-access.json` (`{path, mode, note?,
+  expires?}`, read fresh per gated call, fail closed, protected from
+  the agent). A read grant never covers a write; the agent cannot
+  self-grant. The memo shows grants and pending requests; under
+  `lockGuards`, lower tiers cannot disable the gate or relax a global
+  `readPolicy: "gate"`.
 
 ### Fixed
 

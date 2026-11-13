@@ -53,10 +53,10 @@
 
 ## 4. Docs gate
 
-- [ ] 4.1 CHANGELOG `[Unreleased]`
-- [ ] 4.2 README: external-access section, knob rows, six
+- [x] 4.1 CHANGELOG `[Unreleased]`
+- [x] 4.2 README: external-access section, knob rows, six
   console tools, limitations, test file list
-- [ ] 4.3 AGENTS.md: overview, structure, architecture,
+- [x] 4.3 AGENTS.md: overview, structure, architecture,
   session state, node test command
 - [x] 4.4 package.json `test:node`; both runners, typecheck,
   `verify:package`
