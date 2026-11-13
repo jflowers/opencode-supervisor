@@ -5,6 +5,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.9.1] - 2026-11-13
+
+### Changed
+
+- First release published by GitHub Actions through npm trusted
+  publishing, with provenance; it validates the trusted publisher.
+  2.9.0 was published by hand from 3b7dad3, which has no tag. The
+  plugin code is unchanged from 2.9.0.
+
 ## [2.9.0] - 2026-11-13
 
 ### Added

@@ -68,7 +68,7 @@ Requires OpenCode **1.19.0** or later.
 ### 3.1 Install for yourself
 
 ```bash
-opencode plugin opencode-agent-supervisor@2.9.0 --global
+opencode plugin opencode-agent-supervisor@2.9.1 --global
 ```
 
 OpenCode downloads the package and adds it to the `plugin` array of
@@ -84,7 +84,7 @@ the repository runs the same supervisor version:
 
 ```json
 {
-  "plugin": ["opencode-agent-supervisor@2.9.0"]
+  "plugin": ["opencode-agent-supervisor@2.9.1"]
 }
 ```
 

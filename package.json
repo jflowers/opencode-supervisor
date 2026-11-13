@@ -1,6 +1,6 @@
 {
   "name": "opencode-agent-supervisor",
-  "version": "2.9.0",
+  "version": "2.9.1",
   "description": "Agent supervision middleware for OpenCode: a reasoning-audit loop, session memo, tool guard, and consoles for agent self-serve tools and engineer directives.",
   "license": "MIT",
   "author": "Jay Flowers",
