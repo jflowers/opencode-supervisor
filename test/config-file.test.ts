@@ -15,6 +15,7 @@ import {
   type SupervisorFileConfig,
 } from '../src/config-file.ts';
 import { DEFAULT_MEMO_LIMITS } from '../src/memo.ts';
+import { completedReasoningPart, withCleanSupervisorEnv } from './mocks.ts';
 
 // ── Pure validation (FR-057) ──────────────────────────────────────
 
@@ -113,59 +114,17 @@ test('parseSupervisorConfigFile parses valid JSON and reports malformed JSON', (
 
 // ── Resolution precedence (FR-056) ─────────────────────────────────
 
-/** Every OPENCODE_SUPERVISOR_* knob, for env-cleaning around tier tests. */
-const CONFIG_ENV_NAMES = [
-  'OPENCODE_SUPERVISOR_MODEL',
-  'OPENCODE_SUPERVISOR_VARIANT',
-  'OPENCODE_SUPERVISOR_MAX_REGENERATIONS',
-  'OPENCODE_SUPERVISOR_STRIP_MODE',
-  'OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING',
-  'OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_SOLVED_ITEMS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_CRITIQUES',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS',
-  'OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS',
-  'OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS',
-  'OPENCODE_SUPERVISOR_MAX_COVERED_TIMEOUT_FAIL_OPENS',
-];
-
-/** Cleans every supervisor env knob and log-identity flag, isolating XDG_CONFIG_HOME, around one tier test. */
+/**
+ * The shared env isolation plus a log-identity reset: the identity line
+ * and its no-model follow-up are once-per-process (FR-055), so each
+ * tier test's harness observes its own.
+ */
 async function withCleanConfigEnv(run: () => Promise<void>): Promise<void> {
-  const saved: Record<string, string | undefined> = {};
-  for (const name of CONFIG_ENV_NAMES) {
-    saved[name] = process.env[name];
-    delete process.env[name];
-  }
-  // The identity line and its no-model follow-up are once-per-process
-  // (FR-055); reset so each tier test's harness observes its own.
-  logIdentityState.identityLogged = false;
-  logIdentityState.identitySaidNoModel = false;
-  // Isolate the global config tier (review round 5): a real
-  // ~/.config/opencode/supervisor/config.json on the host must not
-  // leak into tier resolution through XDG_CONFIG_HOME. Tests that
-  // set their own XDG root re-isolate on top of this one.
-  const savedXdgHome = process.env.XDG_CONFIG_HOME;
-  const isolatedXdgRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-xdg-'));
-  process.env.XDG_CONFIG_HOME = isolatedXdgRoot;
-  try {
+  await withCleanSupervisorEnv(async () => {
+    logIdentityState.identityLogged = false;
+    logIdentityState.identitySaidNoModel = false;
     await run();
-  } finally {
-    for (const name of CONFIG_ENV_NAMES) {
-      const value = saved[name];
-      if (value === undefined) {
-        delete process.env[name];
-      } else {
-        process.env[name] = value;
-      }
-    }
-    if (savedXdgHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME;
-    } else {
-      process.env.XDG_CONFIG_HOME = savedXdgHome;
-    }
-    fs.rmSync(isolatedXdgRoot, { recursive: true, force: true });
-  }
+  });
 }
 
 test('resolveHookConfig tiers the auditor model project → options → global → derived', async () => {
@@ -262,19 +221,6 @@ test('resolveHookConfig keeps the environment above the file tiers', async () =>
 
 /** Event-hook input shape, for casting deliberately undeclared event payloads. */
 type EventHookInput = Parameters<NonNullable<Hooks['event']>>[0];
-
-/** A synthetic completed reasoning part with formal content (passes invariants). */
-function completedReasoningPart(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
-    id: 'part-1',
-    sessionID: 'config-session-1',
-    messageID: 'msg-1',
-    type: 'reasoning',
-    text: 'the rate = 24 * 15 = 360',
-    time: { start: 1, end: 2 },
-    ...overrides,
-  };
-}
 
 /** Dispatches one message.part.updated event through the hook. */
 function dispatchPart(hooks: Hooks, part: unknown): Promise<void> {

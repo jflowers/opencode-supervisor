@@ -53,7 +53,7 @@
 - [x] 4.4 `extractArgPaths`: confirm a direct test exists (keep
   the export) or unexport — already done: direct FR-066 tests
   in `test/audit.test.ts` import it; export kept
-- [ ] 4.5 `test/mocks.ts`: `toolContext`,
+- [x] 4.5 `test/mocks.ts`: `toolContext`,
   `completedReasoningPart`, `SUPERVISOR_ENV_NAMES`,
   `withCleanSupervisorEnv`; remove the copies; drop the unused
   `REPORT_KINDS` import

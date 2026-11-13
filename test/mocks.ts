@@ -1,4 +1,84 @@
-import type { PluginInput } from '@opencode-ai/plugin';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import type { PluginInput, ToolContext } from '@opencode-ai/plugin';
+
+/** Minimal ToolContext: the console tools only read `sessionID` (review round 2, #22). */
+export function toolContext(sessionID: string): ToolContext {
+  return { sessionID } as unknown as ToolContext;
+}
+
+/**
+ * A synthetic completed reasoning part (the SDK's terminal publication
+ * shape) whose text passes the deterministic invariants. Overrides
+ * replace any field, including `sessionID`.
+ */
+export function completedReasoningPart(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'part-1',
+    sessionID: 'event-session-1',
+    messageID: 'msg-1',
+    type: 'reasoning',
+    text: 'the rate = 24 * 15 = 360',
+    time: { start: 1, end: 2 },
+    ...overrides,
+  };
+}
+
+/** Every OPENCODE_SUPERVISOR_* knob, cleaned around hook-layer tests (#22: one list, not one per file). */
+export const SUPERVISOR_ENV_NAMES = [
+  'OPENCODE_SUPERVISOR_MODEL',
+  'OPENCODE_SUPERVISOR_VARIANT',
+  'OPENCODE_SUPERVISOR_MAX_REGENERATIONS',
+  'OPENCODE_SUPERVISOR_STRIP_MODE',
+  'OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING',
+  'OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS',
+  'OPENCODE_SUPERVISOR_MEMO_MAX_SOLVED_ITEMS',
+  'OPENCODE_SUPERVISOR_MEMO_MAX_CRITIQUES',
+  'OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS',
+  'OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS',
+  'OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS',
+  'OPENCODE_SUPERVISOR_MAX_TIMEOUT_FAIL_OPENS',
+  'OPENCODE_SUPERVISOR_MAX_COVERED_TIMEOUT_FAIL_OPENS',
+  'OPENCODE_SUPERVISOR_MODE',
+  'OPENCODE_SUPERVISOR_REPAIR_MODEL',
+];
+
+/**
+ * Saves and deletes every supervisor env knob and isolates
+ * XDG_CONFIG_HOME around `run`, restoring both afterward. The XDG
+ * isolation (review round 5) keeps a real
+ * ~/.config/opencode/supervisor/config.json on the host out of tier
+ * resolution. Tests that set their own XDG root re-isolate on top.
+ */
+export async function withCleanSupervisorEnv(run: () => Promise<void>): Promise<void> {
+  const saved: Record<string, string | undefined> = {};
+  for (const name of SUPERVISOR_ENV_NAMES) {
+    saved[name] = process.env[name];
+    delete process.env[name];
+  }
+  const savedXdgHome = process.env.XDG_CONFIG_HOME;
+  const isolatedXdgRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-xdg-'));
+  process.env.XDG_CONFIG_HOME = isolatedXdgRoot;
+  try {
+    await run();
+  } finally {
+    for (const name of SUPERVISOR_ENV_NAMES) {
+      const value = saved[name];
+      if (value === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
+    if (savedXdgHome === undefined) {
+      delete process.env.XDG_CONFIG_HOME;
+    } else {
+      process.env.XDG_CONFIG_HOME = savedXdgHome;
+    }
+    fs.rmSync(isolatedXdgRoot, { recursive: true, force: true });
+  }
+}
 
 /**
  * Shared hook-layer test mock (review round 2, CS-004): a plugin

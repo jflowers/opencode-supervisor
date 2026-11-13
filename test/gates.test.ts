@@ -9,9 +9,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { Hooks, PluginInput, ToolContext } from '@opencode-ai/plugin';
+import type { Hooks, PluginInput } from '@opencode-ai/plugin';
 import plugin from '../index.ts';
-import { recordingPluginInput, silentClientSurface, silentPluginInput } from './mocks.ts';
+import { recordingPluginInput, silentClientSurface, silentPluginInput, toolContext, withCleanSupervisorEnv } from './mocks.ts';
 import {
   approvalMatches,
   compileGates,
@@ -52,65 +52,12 @@ function writeApprovals(dir: string, content: string): void {
 // recordingPluginInput and silentPluginInput now live in ./mocks.ts
 // (review rounds 2 and 4).
 
-/** Minimal ToolContext: the console tools only read `sessionID`. */
-function toolContext(sessionID: string): ToolContext {
-  return { sessionID } as unknown as ToolContext;
-}
-
 /** Event-hook input shape, for casting deliberately undeclared event payloads. */
 type EventHookInput = Parameters<NonNullable<Hooks['event']>>[0];
 
 /** Dispatches one tool.execute.before through the hook with raw args. */
 function dispatchToolBefore(hooks: Hooks, sessionID: string, tool: string, args: unknown): Promise<void> {
   return hooks['tool.execute.before']!({ tool, sessionID, callID: 'call-1' }, { args });
-}
-
-/** Every OPENCODE_SUPERVISOR_* knob, for env-cleaning around hook-layer tests. */
-const GATES_ENV_NAMES = [
-  'OPENCODE_SUPERVISOR_MODEL',
-  'OPENCODE_SUPERVISOR_VARIANT',
-  'OPENCODE_SUPERVISOR_MAX_REGENERATIONS',
-  'OPENCODE_SUPERVISOR_STRIP_MODE',
-  'OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING',
-  'OPENCODE_SUPERVISOR_REQUIRE_STEP_REFERENCE_IN_TOOLS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_SOLVED_ITEMS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_CRITIQUES',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_REMINDERS',
-  'OPENCODE_SUPERVISOR_MEMO_MAX_REPORTS',
-  'OPENCODE_SUPERVISOR_MAX_ON_DEMAND_AUDITS',
-];
-
-/** Saves/deletes the supervisor env knobs and isolates XDG_CONFIG_HOME around `run`, restoring after. */
-async function withCleanGatesEnv(run: () => Promise<void>): Promise<void> {
-  const saved: Record<string, string | undefined> = {};
-  for (const name of GATES_ENV_NAMES) {
-    saved[name] = process.env[name];
-    delete process.env[name];
-  }
-  // Isolate the global config tier (review round 5): a real
-  // ~/.config/opencode/supervisor/config.json on the host must not
-  // leak into tier resolution through XDG_CONFIG_HOME.
-  const savedXdgHome = process.env.XDG_CONFIG_HOME;
-  const isolatedXdgRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-xdg-'));
-  process.env.XDG_CONFIG_HOME = isolatedXdgRoot;
-  try {
-    await run();
-  } finally {
-    for (const name of GATES_ENV_NAMES) {
-      const value = saved[name];
-      if (value === undefined) {
-        delete process.env[name];
-      } else {
-        process.env[name] = value;
-      }
-    }
-    if (savedXdgHome === undefined) {
-      delete process.env.XDG_CONFIG_HOME;
-    } else {
-      process.env.XDG_CONFIG_HOME = savedXdgHome;
-    }
-    fs.rmSync(isolatedXdgRoot, { recursive: true, force: true });
-  }
 }
 
 /**
@@ -435,7 +382,7 @@ test('evaluateReviewGates matches trace references case-insensitively', () => {
 // ── Hook layer: approve gates, review gates, and the audit path (FR-043..FR-048) ──
 
 test('an unapproved approve gate blocks the call with the gate key and instruction', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({
       'gates.md': directiveFile('Deploys are gated.', { approve: [{ id: 'deploy', tool: 'bash' }] }),
     });
@@ -460,7 +407,7 @@ test('an unapproved approve gate blocks the call with the gate key and instructi
 });
 
 test('a recorded approval admits the gate and logs the grant once', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({
       'gates.md': directiveFile('Deploys are gated.', { approve: [{ id: 'deploy', tool: 'bash' }] }),
     });
@@ -484,7 +431,7 @@ test('a recorded approval admits the gate and logs the grant once', async () => 
 });
 
 test('removing the approval blocks the next call', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({
       'gates.md': directiveFile('Deploys are gated.', { approve: [{ id: 'deploy', tool: 'bash' }] }),
     });
@@ -505,7 +452,7 @@ test('removing the approval blocks the next call', async () => {
 });
 
 test('a malformed approvals file fails closed with the parse error', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({
       'gates.md': directiveFile('Deploys are gated.', { approve: [{ id: 'deploy', tool: 'bash' }] }),
     });
@@ -530,7 +477,7 @@ test('a malformed approvals file fails closed with the parse error', async () =>
 });
 
 test('an absent approvals file blocks with the instruction, not an error', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({
       'gates.md': directiveFile('Deploys are gated.', { approve: [{ id: 'deploy', tool: 'bash' }] }),
     });
@@ -553,7 +500,7 @@ test('an absent approvals file blocks with the instruction, not an error', async
 });
 
 test('a review gate blocks a path without a trace reference', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({
       'review-gates.md': directiveFile('Billing changes need review.', { review: [{ path: 'src/billing/**' }] }),
     });
@@ -577,7 +524,7 @@ test('a review gate blocks a path without a trace reference', async () => {
 });
 
 test('a review-gated call proceeds after request_audit references the path', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({
       'review-gates.md': directiveFile('Billing changes need review.', { review: [{ path: 'src/billing/**' }] }),
     });
@@ -608,7 +555,7 @@ test('a review-gated call proceeds after request_audit references the path', asy
 });
 
 test('a call that matches no gate proceeds untouched', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({
       'gates.md': directiveFile('Deploys are gated.', { approve: [{ tool: 'bash' }] }),
     });
@@ -623,7 +570,7 @@ test('a call that matches no gate proceeds untouched', async () => {
 });
 
 test('an overlapping approve gate set blocks on the first unapproved gate', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({
       'broad.md': directiveFile('Broad gate.', { approve: [{ id: 'broad', tool: 'bash' }] }),
       'narrow.md': directiveFile('Narrow gate.', { approve: [{ id: 'narrow', tool: 'bash', path: 'ops/**' }] }),
@@ -648,7 +595,7 @@ test('an overlapping approve gate set blocks on the first unapproved gate', asyn
 });
 
 test('a review gate blocks a trailing-slash path on an empty trace', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({
       'review-gates.md': directiveFile('Billing changes need review.', { review: [{ path: 'src/billing/**' }] }),
     });
@@ -786,7 +733,7 @@ test('checkProtectedState blocks bash glob spellings end to end', () => {
 });
 
 test('the agent cannot touch the approvals file', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({});
     try {
       const hooks = await plugin.server(silentPluginInput(dir));
@@ -809,7 +756,7 @@ test('the agent cannot touch the approvals file', async () => {
 });
 
 test('the agent cannot touch the supervisor config file', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({});
     try {
       const hooks = await plugin.server(silentPluginInput(dir));
@@ -832,7 +779,7 @@ test('the agent cannot touch the supervisor config file', async () => {
 });
 
 test('traversal spellings of the supervisor config file are still blocked (FR-061)', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({});
     try {
       const hooks = await plugin.server(silentPluginInput(dir));
@@ -855,7 +802,7 @@ test('traversal spellings of the supervisor config file are still blocked (FR-06
 });
 
 test('slash-free cd spellings of the supervisor config file are still blocked (FR-061)', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({});
     try {
       const hooks = await plugin.server(silentPluginInput(dir));
@@ -881,7 +828,7 @@ test('slash-free cd spellings of the supervisor config file are still blocked (F
 });
 
 test('the agent cannot touch the supervisor directives directory (FR-061)', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({});
     try {
       const hooks = await plugin.server(silentPluginInput(dir));
@@ -904,7 +851,7 @@ test('the agent cannot touch the supervisor directives directory (FR-061)', asyn
 });
 
 test('the agent cannot delete the supervisor state directory (FR-061)', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({});
     try {
       const hooks = await plugin.server(silentPluginInput(dir));
@@ -927,7 +874,7 @@ test('the agent cannot delete the supervisor state directory (FR-061)', async ()
 });
 
 test('write-tool content that mentions protected state is not blocked (FR-061)', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({});
     try {
       const hooks = await plugin.server(silentPluginInput(dir));
@@ -949,7 +896,7 @@ test('write-tool content that mentions protected state is not blocked (FR-061)',
 });
 
 test('custom tool keys cannot touch the approvals file (FR-061)', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({});
     try {
       const hooks = await plugin.server(silentPluginInput(dir));
@@ -976,7 +923,7 @@ test('custom tool keys cannot touch the approvals file (FR-061)', async () => {
 });
 
 test('lookalike approval filenames are not blocked (FR-061)', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({});
     try {
       const hooks = await plugin.server(silentPluginInput(dir));
@@ -997,7 +944,7 @@ test('lookalike approval filenames are not blocked (FR-061)', async () => {
 });
 
 test('bash glob spellings cannot touch protected state (FR-061)', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({});
     try {
       const hooks = await plugin.server(silentPluginInput(dir));
@@ -1023,7 +970,7 @@ test('bash glob spellings cannot touch protected state (FR-061)', async () => {
 });
 
 test('an oversized approvals file fails closed', async () => {
-  await withCleanGatesEnv(async () => {
+  await withCleanSupervisorEnv(async () => {
     const dir = makeDirectiveDir({
       'gates.md': directiveFile('Deploys are gated.', { approve: [{ id: 'prod-deploy', tool: 'bash' }] }),
     });
