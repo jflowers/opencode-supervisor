@@ -9,9 +9,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- npm distribution as `@jflowers/opencode-supervisor` (the unscoped
-  name belongs to an unrelated package): install with
-  `opencode plugin @jflowers/opencode-supervisor@2.9.0 --global`, or
+- npm distribution as `opencode-agent-supervisor` (the npm name
+  `opencode-supervisor` belongs to an unrelated package): install with
+  `opencode plugin opencode-agent-supervisor@2.9.0 --global`, or
   commit the pinned entry to a project's `opencode.json` for a team.
   The package ships the TypeScript sources (`exports["./server"]`),
   declares `engines.opencode: ">=1.19.0"`, and takes
@@ -19,8 +19,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   covers team installs, pinning (OpenCode never refreshes a cached
   `@latest`), running from a clone, and releasing.
 - CI (typecheck, Bun and Node tests, tarball check) and a Publish
-  workflow that releases any unpublished `package.json` version from
-  `main` through npm trusted publishing with provenance, then tags it.
+  workflow that publishes when a `v<version>` tag matching
+  `package.json` is pushed, through npm trusted publishing (OIDC, no
+  token) with provenance.
 - MIT `LICENSE` file (the license was declared but the file was missing).
 - Task-scoped guard profiles (FR-072..FR-074, #48, #47): the supervisor
   records each session's slash command (`command.execute.before`, kept

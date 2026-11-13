@@ -68,7 +68,7 @@ Requires OpenCode **1.19.0** or later.
 ### 3.1 Install for yourself
 
 ```bash
-opencode plugin @jflowers/opencode-supervisor@2.9.0 --global
+opencode plugin opencode-agent-supervisor@2.9.0 --global
 ```
 
 OpenCode downloads the package and adds it to the `plugin` array of
@@ -84,7 +84,7 @@ the repository runs the same supervisor version:
 
 ```json
 {
-  "plugin": ["@jflowers/opencode-supervisor@2.9.0"]
+  "plugin": ["opencode-agent-supervisor@2.9.0"]
 }
 ```
 
@@ -100,7 +100,7 @@ Always name a version. OpenCode caches each npm plugin under
 `~/.cache/opencode/packages/<spec>/` and never refreshes a cached
 entry, so a bare name or `@latest` stays on whichever version was
 current at first install. To upgrade, change the version in the
-`plugin` entry (or run `opencode plugin @jflowers/opencode-supervisor@<new> --global --force`)
+`plugin` entry (or run `opencode plugin opencode-agent-supervisor@<new> --global --force`)
 and restart OpenCode. Releases are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ### 3.4 Run from a clone (development)
@@ -133,25 +133,53 @@ Prefer no middleware? See [Section 8](#8-middleware-or-skill).
 
 ### 3.5 Releasing
 
-A release is a version bump merged to `main`: the Publish workflow
-publishes any `package.json` version not yet on npm, with provenance,
-then pushes a `v<version>` tag. It authenticates through npm trusted
-publishing, so the repository stores no npm token. Bump `version` in
-`package.json`, move the CHANGELOG's Unreleased entries under the new
-version, and update the version in the install commands above.
+A release takes three steps:
 
-The first release is manual, because npm can only register a trusted
-publisher for a package that exists:
+1. In a PR, bump `version` in `package.json` and `PLUGIN_VERSION` in
+   `index.ts` (a test keeps them in lockstep), move the CHANGELOG's
+   Unreleased entries under the new version, and update the version in
+   the install commands above.
+2. Merge it.
+3. Push the tag from `main`: `git tag v<version> && git push origin v<version>`.
+
+The tag starts the Publish workflow (`.github/workflows/publish.yml`).
+It checks that the tag matches `package.json`, skips a version already
+on npm, runs the typecheck, both test suites and the package check,
+then publishes with provenance. It authenticates through npm trusted
+publishing, so no npm token exists. A new version can take a couple of
+minutes to appear on the registry; an install in that window fails
+with "No matching version found" and works on retry.
+
+**First release (once).** npm can only attach a trusted publisher to a
+package that exists, so the first version is published by hand:
 
 ```bash
 npm login
-npm run typecheck && npm run verify:package
-npm publish --access public
+npm publish --provenance=false
 ```
 
-Then, on npmjs.com, open the package's settings and add a trusted
-publisher: GitHub Actions, repository `jflowers/opencode-supervisor`,
-workflow `publish.yml`.
+`prepublishOnly` runs the typecheck and package check first. npm holds a
+new package's first upload for approval: until it is approved, the
+registry shows only a `0.0.0-stage` placeholder. Approve it on
+npmjs.com under your avatar menu → **Staged Packages**, with your
+security key.
+
+Then, in the package's **Settings** on npmjs.com:
+
+- **Trusted Publisher** — GitHub Actions, `jflowers` /
+  `opencode-supervisor` / `publish.yml`, no environment. Tick
+  **Allow `npm publish`**: without it the connection only accepts
+  staged uploads and the workflow's publish is rejected. These choices
+  can't be edited later.
+- **Publishing access** — "Require two-factor authentication and
+  disallow tokens", saved with its own **Update Package Settings**
+  button.
+
+The new trusted publisher shows **Pending validation** until the
+workflow publishes once, and npm sets a deadline of about two days for
+that. The hand-published version doesn't count (the workflow skips it),
+so release the next patch version through the three steps above right
+away.
 
 ---
 

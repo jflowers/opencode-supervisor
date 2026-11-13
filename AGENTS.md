@@ -34,9 +34,16 @@ opencode plugin "$(pwd)"
 
 - No build step: OpenCode executes the TypeScript directly, and the npm
   package ships the `.ts` sources (`exports["./server"]` is `./index.ts`).
-- Published to npm as `@jflowers/opencode-supervisor`. A release is a
-  `package.json` version bump merged to `main`; `.github/workflows/publish.yml`
-  publishes unpublished versions through npm trusted publishing and tags them.
+- Published to npm as `opencode-agent-supervisor`. Release: in a PR, bump
+  `version` in `package.json` and `PLUGIN_VERSION` in `index.ts` (a test
+  keeps them in lockstep), move the CHANGELOG's Unreleased entries under the
+  new version, and update the pinned version in the README's install
+  commands. After it merges, push tag `v<version>` from `main`;
+  `.github/workflows/publish.yml` publishes to npm. It authenticates through
+  npm trusted publishing (OIDC: the package settings on npmjs.com trust
+  `jflowers/opencode-supervisor` + `publish.yml`), so no npm token exists.
+  Renaming `publish.yml` breaks publishing until the trusted publisher is
+  updated to match.
 - CI (`.github/workflows/ci.yml`) runs the typecheck, both test runners,
   and the package check on pull requests and pushes to `main`.
 - No lint step is configured; match existing code style.
