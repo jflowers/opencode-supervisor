@@ -1,26 +1,64 @@
 import { Buffer } from "node:buffer"
-import { execFileSync } from "node:child_process"
-import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
-import { lstat, readFile, readdir, writeFile } from "node:fs/promises"
+import { execFile, execFileSync } from "node:child_process"
+import { accessSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { lstat, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
 import { basename, resolve } from "node:path"
 import { tool, type PluginInput, type PluginModule } from "@opencode-ai/plugin"
 import { z } from "zod"
 import {
   DEFAULT_TIMEOUT_MILLISECONDS,
+  MAX_TIMEOUT_MILLISECONDS,
   PromptSchema,
-  TimeoutSchema,
+  directModelIdentity,
   executeAgentSession,
   resolveHostModel,
   StructuralHostModelError,
   type InvocationProvenance,
   type InvocationUsage,
+  type ModelIdentity,
+  type TimeoutDetails,
 } from "../../lib/agent-executor.js"
 import { classifyBranch } from "../../lib/branch-classification.js"
+import {
+  ClassifierCascade,
+  createClassifierCache,
+  loadModelMatrix,
+  resolveSelection,
+  type ClassifierCache,
+  type ModelMatrix,
+  type SelectionResult,
+  type SelectionSource,
+} from "../../lib/model-matrix.js"
 import {
   DISPATCH_ARTIFACT_DIRECTORY,
   parseReviewDispatchArtifact,
   type ReviewDispatchArtifactSummary,
 } from "../../lib/review-dispatch-artifact.js"
+import {
+  PREFLIGHT_MODES,
+  PreflightConfigError,
+  runDeclaredChecks,
+  type DeclaredChecksData,
+  type PreflightDeclaredDependencies,
+  type ProcessResult,
+} from "../../lib/preflight-declared.js"
+import {
+  CreateChildIssueInputSchema,
+  FeedbackOperationError,
+  FileFeedbackIssueInputSchema,
+  PostFeedbackRepliesInputSchema,
+  PostIssueCommentInputSchema,
+  createChildIssue,
+  defaultFeedbackGhExec,
+  feedbackFailure,
+  feedbackSuccess,
+  fileFeedbackIssue,
+  postFeedbackReplies,
+  postIssueComment,
+  type FeedbackReplyDeps,
+} from "../../lib/feedback-replies.js"
+import { createBunYamlParser, type YamlParser } from "../../lib/reviewer-manifest.js"
 import {
   BASE_REF_CANDIDATES,
   resolveBaseRefWithDivergence,
@@ -352,6 +390,32 @@ function recordAutoCheckpoint(
 // Checkpoint tool factories (exported for testability)
 // ---------------------------------------------------------------------------
 
+/** Phase-scoped checkpoint argument shape (`implement-phase-<number>` records). */
+const PhaseCheckpointArgSchema = z.object({
+  number: z.number().int().min(1).max(1000),
+  verdict: z.enum(["green", "failed"]),
+  inventory: z
+    .array(
+      z.object({
+        name: z.string().min(1).max(512),
+        classification: z.enum([
+          "pre-existing",
+          "environmental",
+          "change-caused",
+        ]),
+      }),
+    )
+    .max(200)
+    .default([]),
+})
+
+/**
+ * Validation for the checkpoint tool's `phase` argument inside execute: the
+ * host does not enforce the args shape, and a bare `phase: 5` previously
+ * surfaced as "requires step implement-phase-undefined" (issue #936).
+ */
+const CheckpointPhaseInputSchema = z.object({ phase: PhaseCheckpointArgSchema.optional() })
+
 /** Factory for the checkpoint tool (FR-001). */
 export function createCheckpointTool(exec: GitExec, cwd: string) {
   return tool({
@@ -371,24 +435,7 @@ export function createCheckpointTool(exec: GitExec, cwd: string) {
       key: z.string().optional().describe(
         "Optional state key override; defaults to sanitized current git branch",
       ),
-      phase: z
-        .object({
-          number: z.number().int().min(1).max(1000),
-          verdict: z.enum(["green", "failed"]),
-          inventory: z
-            .array(
-              z.object({
-                name: z.string().min(1).max(512),
-                classification: z.enum([
-                  "pre-existing",
-                  "environmental",
-                  "change-caused",
-                ]),
-              }),
-            )
-            .max(200)
-            .default([]),
-        })
+      phase: PhaseCheckpointArgSchema
         .optional()
         .describe(
           "Optional phase-scoped record; requires step implement-phase-<number>. " +
@@ -411,14 +458,11 @@ export function createCheckpointTool(exec: GitExec, cwd: string) {
           dataToMerge = JSON.parse(args.data) as Record<string, unknown>
         }
 
-        const phaseRecord =
-          args.phase === undefined
-            ? undefined
-            : {
-                number: args.phase.number,
-                verdict: args.phase.verdict,
-                inventory: args.phase.inventory ?? [],
-              }
+        const parsedPhase = parseToolInput(CheckpointPhaseInputSchema, { phase: args.phase })
+        if (!parsedPhase.ok) {
+          return { output: parsedPhase.failureOutput }
+        }
+        const phaseRecord = parsedPhase.value.phase
 
         const state = upsertCheckpointStep(
           cwd,
@@ -595,28 +639,207 @@ export function createGitFetchTool(exec: GitExec, cwd: string) {
   })
 }
 
+/**
+ * Git ref-name argument guard for the push tools: non-empty, no leading
+ * `-` (option injection), no whitespace, no `:` (refspec separator), and
+ * not `HEAD` (which would create refs/heads/HEAD on the remote).
+ */
+const PushRefNameSchema = z
+  .string()
+  .min(1)
+  .max(255)
+  .refine((value) => !value.startsWith("-") && !/[\s:]/.test(value) && value !== "HEAD", {
+    message: "must not be HEAD, start with '-', or contain whitespace or ':'",
+  })
+
+/**
+ * Remote-name argument guard for the push tools: a remote is a git
+ * config nickname, and git's remote-name validation rejects `/`, so a
+ * slash-bearing push target would be treated as a local repository
+ * path instead of a configured remote. `.` and `..` are rejected for
+ * the same reason: git resolves them as local repository paths (the
+ * working directory and its parent), so a push with such a "remote"
+ * would target a different local repository and execute its hooks.
+ */
+const RemoteNameSchema = PushRefNameSchema.refine(
+  (value) => !value.includes("/") && value !== "." && value !== "..",
+  {
+    message: "must not be '.', '..', or contain '/'",
+  },
+)
+
+const GitPushInputSchema = z.object({
+  branch: PushRefNameSchema,
+  remote: RemoteNameSchema.optional(),
+  setUpstream: z.boolean().optional(),
+})
+
+const GitPushForceWithLeaseInputSchema = z.object({
+  branch: PushRefNameSchema,
+  remote: RemoteNameSchema.optional(),
+  expected_sha: z
+    .string()
+    .regex(/^[0-9a-fA-F]{7,64}$/, "must be a 7-64 character hex commit SHA")
+    .optional(),
+})
+
+/**
+ * Structured output shared by git_push and git_push_force_with_lease.
+ * `old_sha` is the remote ref's value before the push (null when the
+ * push created the branch); `updated` is false when the remote already
+ * held `new_sha`, so a no-op push is distinguishable from an update.
+ * `warning` (git_push only) is set when the push landed but a
+ * follow-up step such as tracking configuration failed.
+ */
+export interface GitPushData {
+  readonly remote: string
+  readonly ref: string
+  readonly old_sha: string | null
+  readonly new_sha: string
+  readonly updated: boolean
+  readonly warning?: string
+}
+
+/**
+ * Refuse a push whose `branch` is not the checked-out branch: the push
+ * source is the HEAD commit, so a checkout switched underneath the
+ * caller would otherwise push the wrong commits under the named ref.
+ * Compares full ref names (`symbolic-ref`, which fails on a detached
+ * HEAD) so a same-name tag cannot make the check ambiguous. When the
+ * symbolic-ref probe itself fails, a second `rev-parse --git-dir` probe
+ * distinguishes a detached HEAD from a git-level failure so the error
+ * names the real cause. Returns the failure-output JSON, or null when
+ * HEAD is on `branch`.
+ */
+function pushBranchMismatchOutput(exec: GitExec, cwd: string, branch: string): string | null {
+  let current: string | null
+  let branchProbeFailed = false
+  try {
+    current = exec(["symbolic-ref", "-q", "HEAD"], cwd)
+  } catch {
+    current = null
+    try {
+      exec(["rev-parse", "--git-dir"], cwd)
+    } catch {
+      branchProbeFailed = true
+    }
+  }
+  if (current === `refs/heads/${branch}`) {
+    return null
+  }
+  const detail = branchProbeFailed
+    ? "the current branch could not be determined (git error)"
+    : current === null || current === ""
+      ? "the checkout is on a detached HEAD"
+      : `the checkout is on branch "${current.replace(/^refs\/heads\//, "")}"`
+  return JSON.stringify(
+    failure(`Refusing to push "${branch}": ${detail}`, {
+      retryable: false,
+      code: "BRANCH_MISMATCH",
+    }),
+  )
+}
+
+/**
+ * Porcelain status flag and summary for `ref` from `git push
+ * --porcelain` output, or null when no status line names the ref.
+ */
+function pushStatusLine(output: string, ref: string): { flag: string; summary: string } | null {
+  for (const line of output.split("\n")) {
+    const fields = line.split("\t")
+    if (fields.length >= 3 && fields[1].endsWith(`:${ref}`)) {
+      return { flag: fields[0].trim(), summary: fields[2] }
+    }
+  }
+  return null
+}
+
+/**
+ * Build the push report from porcelain output. `=` means the remote
+ * already held HEAD (no-op), `*` means the push created the ref, and any
+ * other accepted status updated it from `oldSha(summary)`.
+ */
+function pushReport(
+  remote: string,
+  ref: string,
+  newSha: string,
+  output: string,
+  oldSha: (summary: string) => string | null,
+): GitPushData {
+  const status = pushStatusLine(output, ref)
+  if (status?.flag === "=") {
+    return { remote, ref, old_sha: newSha, new_sha: newSha, updated: false }
+  }
+  if (status?.flag === "*") {
+    return { remote, ref, old_sha: null, new_sha: newSha, updated: true }
+  }
+  const old = oldSha(status?.summary ?? "")
+  return { remote, ref, old_sha: old, new_sha: newSha, updated: old !== newSha }
+}
+
 /** Factory for the git_push tool. */
 export function createGitPushTool(exec: GitExec, cwd: string) {
   return tool({
     description:
-      "Push commits to the remote repository. " +
-      "Optionally set upstream tracking for a branch.",
+      "Push the checked-out branch to the remote with an explicit refspec " +
+      "(<HEAD sha>:refs/heads/<branch>). Refuses with BRANCH_MISMATCH when the " +
+      "checkout is not on `branch`. Returns {remote, ref, old_sha, new_sha, " +
+      "updated}; updated is false when the remote was already up to date. When " +
+      "setUpstream is set and the push lands but the tracking configuration " +
+      "fails, the result is still success with a warning field describing it.",
     args: {
-      setUpstream: z.boolean().optional().describe(
-        "Set upstream tracking (--set-upstream origin <branch>)",
+      branch: z.string().describe(
+        "Branch to push; MUST be the currently checked-out branch",
       ),
-      branch: z.string().optional().describe(
-        "Branch name (required when setUpstream is true)",
+      remote: z.string().optional().describe("Remote name (default: origin)"),
+      setUpstream: z.boolean().optional().describe(
+        "Set upstream tracking to <remote>/<branch> after the push",
       ),
     },
-    execute: async (args: { setUpstream?: boolean; branch?: string }) => {
+    async execute(args) {
+      const parsed = parseToolInput(GitPushInputSchema, args)
+      if (!parsed.ok) {
+        return { output: parsed.failureOutput }
+      }
+      const { branch, setUpstream } = parsed.value
+      const remote = parsed.value.remote ?? "origin"
+      const ref = `refs/heads/${branch}`
       try {
-        const gitArgs =
-          args.setUpstream && args.branch
-            ? ["push", "--set-upstream", "origin", args.branch]
-            : ["push"]
-        exec(gitArgs, cwd)
-        return { output: JSON.stringify(success({ success: true })) }
+        const mismatch = pushBranchMismatchOutput(exec, cwd, branch)
+        if (mismatch !== null) {
+          return { output: mismatch }
+        }
+        const newSha = exec(["rev-parse", "HEAD"], cwd)
+        // Push the verified commit, not HEAD, so a checkout switched
+        // after the branch check cannot change what is pushed.
+        const output = exec(["push", "--porcelain", remote, `${newSha}:${ref}`], cwd)
+        // The push has already landed, so a tracking-configuration failure
+        // must not surface as a push error; report it as a warning instead.
+        let warning: string | undefined
+        if (setUpstream) {
+          try {
+            exec(["branch", `--set-upstream-to=${remote}/${branch}`, branch], cwd)
+          } catch {
+            warning =
+              `the push landed but setting the upstream tracking to ${remote}/${branch} failed; ` +
+              `run git branch --set-upstream-to=${remote}/${branch} ${branch} manually`
+          }
+        }
+        // A fast-forward summary is "<old>..<new>"; the old commit is an
+        // ancestor of HEAD, so it resolves locally to its full SHA.
+        const data = pushReport(remote, ref, newSha, output, (summary) => {
+          const abbrev = summary.split("..")[0]
+          if (!/^[0-9a-f]+$/i.test(abbrev)) {
+            return null
+          }
+          try {
+            return exec(["rev-parse", "--verify", `${abbrev}^{commit}`], cwd)
+          } catch {
+            return null
+          }
+        })
+        const payload: GitPushData = warning === undefined ? data : { ...data, warning }
+        return { output: JSON.stringify(success(payload)) }
       } catch (err: unknown) {
         return { output: failureFromError(err, "GIT_PUSH_ERROR", true) }
       }
@@ -628,22 +851,76 @@ export function createGitPushTool(exec: GitExec, cwd: string) {
 export function createGitPushForceWithLeaseTool(exec: GitExec, cwd: string) {
   return tool({
     description:
-      "Force-push with lease safety. Pushes to the remote using " +
-      "--force-with-lease to prevent overwriting others' work.",
-    execute: async () => {
+      "Force-push the checked-out branch under a lease: runs git push " +
+      "--force-with-lease=refs/heads/<branch>:<expected_sha> <remote> " +
+      "<HEAD sha>:refs/heads/<branch>. Without expected_sha the lease is the " +
+      "remote-tracking ref plus --force-if-includes, so a fetch that moved " +
+      "it to a commit never integrated locally is rejected. Refuses with " +
+      "BRANCH_MISMATCH when the checkout is not on `branch`, and with " +
+      "EXPECTED_SHA_UNKNOWN when expected_sha is not a local commit. Returns " +
+      "{remote, ref, old_sha, new_sha, updated}; updated is false when the " +
+      "remote was already up to date.",
+    args: {
+      branch: z.string().describe(
+        "Branch to push; MUST be the currently checked-out branch",
+      ),
+      remote: z.string().optional().describe("Remote name (default: origin)"),
+      expected_sha: z.string().optional().describe(
+        "Commit SHA the remote branch is expected to hold (the lease); " +
+          "record it before any fetch. Default: the remote-tracking ref " +
+          "<remote>/<branch> with --force-if-includes, or \"must not exist\" " +
+          "when there is none",
+      ),
+    },
+    async execute(args) {
+      const parsed = parseToolInput(GitPushForceWithLeaseInputSchema, args)
+      if (!parsed.ok) {
+        return { output: parsed.failureOutput }
+      }
+      const { branch } = parsed.value
+      const remote = parsed.value.remote ?? "origin"
+      const ref = `refs/heads/${branch}`
       try {
-        exec(["push", "--force-with-lease"], cwd)
-        return { output: JSON.stringify(success({ success: true })) }
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err)
-        return {
-          output: JSON.stringify(
-            failure(msg, {
-              retryable: false,
-              code: "GIT_PUSH_FORCE_ERROR",
-            }),
-          ),
+        const mismatch = pushBranchMismatchOutput(exec, cwd, branch)
+        if (mismatch !== null) {
+          return { output: mismatch }
         }
+        let expected = ""
+        let leaseArgs: string[]
+        if (parsed.value.expected_sha !== undefined) {
+          try {
+            expected = exec(["rev-parse", "--verify", `${parsed.value.expected_sha}^{commit}`], cwd)
+          } catch {
+            return {
+              output: JSON.stringify(
+                failure(
+                  `expected_sha "${parsed.value.expected_sha}" is not a commit in the local ` +
+                    "repository; fetch it or pass the full SHA of a known commit. Nothing was pushed.",
+                  { retryable: false, code: "EXPECTED_SHA_UNKNOWN" },
+                ),
+              ),
+            }
+          }
+          leaseArgs = [`--force-with-lease=${ref}:${expected}`]
+        } else {
+          try {
+            expected = exec(["rev-parse", "--verify", `refs/remotes/${remote}/${branch}`], cwd)
+            // git ignores --force-if-includes with an explicit expect
+            // value, so the default lease names only the ref.
+            leaseArgs = [`--force-with-lease=${ref}`, "--force-if-includes"]
+          } catch {
+            // No remote-tracking ref: lease on the branch not existing yet.
+            expected = ""
+            leaseArgs = [`--force-with-lease=${ref}:`]
+          }
+        }
+        const newSha = exec(["rev-parse", "HEAD"], cwd)
+        const output = exec(["push", "--porcelain", ...leaseArgs, remote, `${newSha}:${ref}`], cwd)
+        // An accepted leased push replaced exactly the expected value.
+        const data = pushReport(remote, ref, newSha, output, () => expected || null)
+        return { output: JSON.stringify(success(data)) }
+      } catch (err: unknown) {
+        return { output: failureFromError(err, "GIT_PUSH_FORCE_ERROR") }
       }
     },
   })
@@ -1559,6 +1836,454 @@ export function createUnleashResolveIssueTool(runner: GhRunner, cwd: string): Re
 }
 
 // ---------------------------------------------------------------------------
+// checkout_pr_head tool
+// ---------------------------------------------------------------------------
+
+/**
+ * Failure codes checkout_pr_head returns (OpenSpec change checkout-pr-head,
+ * issue #965). Each maps to one STOP condition the /uf.address-feedback
+ * Section 1.2.1 prose carried before the extraction.
+ */
+export const CHECKOUT_PR_HEAD_ERROR_CODES = [
+  "DIRTY_TREE",
+  "CHECKOUT_FAILED",
+  "UNRELATED_BRANCH",
+  "READ_ONLY_MERGE_REF",
+  "NO_PUSH_TARGET",
+  "UNSAFE_PUSH_TARGET",
+] as const
+
+/** One checkout_pr_head failure code. */
+export type CheckoutPrHeadErrorCode = (typeof CHECKOUT_PR_HEAD_ERROR_CODES)[number]
+
+/** Structured output from checkout_pr_head. */
+export interface CheckoutPrHeadData {
+  /**
+   * The actual checked-out branch name. It may differ from head_ref: a
+   * cross-repo PR whose head is the fork's default branch checks out as
+   * `<owner>/<branch>` (for example `contrib/main`).
+   */
+  branch: string
+  /** `branch.<branch>.remote`: a remote name or an https URL. */
+  head_remote: string
+  /** `branch.<branch>.merge`: always `refs/heads/<head_ref>` on success. */
+  merge_ref: string
+  /**
+   * True when HEAD is a strict descendant of head_sha (unpushed commits
+   * from a prior run, for example a failed-push retry).
+   */
+  ahead_of_head_sha: boolean
+  /** True when the tool ran `gh pr checkout` to reach the PR head. */
+  checked_out: boolean
+}
+
+/**
+ * Conservative refname charset for PR-derived values that later reach a
+ * rendered shell template (Section 4.4 push/fetch): `$`, backtick, and `"`
+ * are legal git refname characters that stay active inside double quotes,
+ * so quoting alone does not neutralize them.
+ */
+const SAFE_REFNAME_PATTERN = /^[A-Za-z0-9._/-]+$/
+
+/** A push remote is a plain remote name or an https URL without userinfo. */
+const SAFE_REMOTE_NAME_PATTERN = /^[A-Za-z0-9._-]+$/
+const SAFE_REMOTE_URL_PATTERN = /^https:\/\/[A-Za-z0-9._/-]+$/
+
+/** git's message when untracked files collide with tracked files on checkout. */
+const UNTRACKED_COLLISION_PATTERN = /untracked working tree files would be overwritten/i
+
+/**
+ * Whether a remote value is safe to render into the Section 4.4 templates.
+ * `.` and `..` match the name charset but resolve as local repository
+ * paths, so they are rejected like RemoteNameSchema rejects them.
+ */
+function isSafePushRemote(remote: string): boolean {
+  if (remote === "." || remote === "..") return false
+  return SAFE_REMOTE_NAME_PATTERN.test(remote) || SAFE_REMOTE_URL_PATTERN.test(remote)
+}
+
+/**
+ * Extract the most specific error text from a thrown exec error: the
+ * child's stderr when execFileSync captured it, else the error message.
+ */
+function execErrorDetail(err: unknown): string {
+  if (typeof err === "object" && err !== null && "stderr" in err) {
+    const stderr = (err as { stderr?: unknown }).stderr
+    const text = typeof stderr === "string" ? stderr : Buffer.isBuffer(stderr) ? stderr.toString("utf8") : ""
+    if (text.trim() !== "") return text.trim()
+  }
+  return err instanceof Error ? err.message : String(err)
+}
+
+/**
+ * Read a git config value; an unset key (git exits 1) reads as "".
+ * The key is passed as one argv element, so no branch character can
+ * reach a shell.
+ */
+function readGitConfig(exec: GitExec, cwd: string, key: string): string {
+  try {
+    return exec(["config", "--get", key], cwd).trim()
+  } catch {
+    return ""
+  }
+}
+
+/**
+ * Classify HEAD against the frozen head SHA: `equal`, `descendant`
+ * (`git merge-base --is-ancestor <head_sha> HEAD` exits 0), or
+ * `unrelated` (any non-zero exit, including an unknown head_sha object).
+ */
+function classifyHeadIdentity(
+  exec: GitExec,
+  cwd: string,
+  head: string,
+  headSha: string,
+): "equal" | "descendant" | "unrelated" {
+  if (head === headSha) return "equal"
+  try {
+    exec(["merge-base", "--is-ancestor", headSha, "HEAD"], cwd)
+    return "descendant"
+  } catch {
+    return "unrelated"
+  }
+}
+
+/** Build a checkout_pr_head failure output. */
+function checkoutFailure(code: CheckoutPrHeadErrorCode, message: string, retryable = false): { output: string } {
+  return { output: JSON.stringify(failure(message, { retryable, code })) }
+}
+
+/**
+ * Factory that creates the checkout_pr_head tool with injectable git and
+ * gh executors (argument arrays, no shell) for testability.
+ *
+ * Decision sequence (the /uf.address-feedback Section 1.2.1 contract):
+ * 1. Identity is keyed on HEAD, not the branch name: HEAD equal to or
+ *    descending from head_sha continues without a checkout.
+ * 2. Otherwise a dirty tracked tree (`git status --porcelain
+ *    --untracked-files=no`) fails DIRTY_TREE; else `gh pr checkout <N>`
+ *    runs. A failed checkout (including its implicit fetch) fails
+ *    CHECKOUT_FAILED with the specific git/gh error, and names the
+ *    `git stash -u` remediation for the untracked-file collision.
+ * 3. After a checkout, HEAD is re-verified; a branch unrelated to
+ *    head_sha fails UNRELATED_BRANCH with both SHAs.
+ * 4. The push target is read from the actual checked-out branch:
+ *    detached HEAD or an unset remote/merge fails NO_PUSH_TARGET; a
+ *    `refs/pull/` merge ref fails READ_ONLY_MERGE_REF; a merge ref other
+ *    than `refs/heads/<head_ref>` fails UNRELATED_BRANCH (ancestry alone
+ *    cannot reject a `main` that absorbed the merged PR); values outside
+ *    the conservative charsets fail UNSAFE_PUSH_TARGET.
+ *
+ * Local commits are never reset or discarded.
+ *
+ * @param exec Git executor (argument array).
+ * @param gh gh executor (argument array).
+ * @param cwd Repository root.
+ * @returns The checkout_pr_head tool.
+ */
+export function createCheckoutPrHeadTool(exec: GitExec, gh: GhRunner, cwd: string): ReturnType<typeof tool> {
+  return tool({
+    description:
+      "Put the working tree on a PR's head branch and resolve its push target. " +
+      "Verifies HEAD identity against the frozen head SHA (equal or descendant), " +
+      "gates on a dirty tree, runs gh pr checkout when needed, and reads the push " +
+      "remote/merge ref from the actual checked-out branch name. Returns " +
+      "{branch, head_remote, merge_ref, ahead_of_head_sha, checked_out}; failure " +
+      "codes DIRTY_TREE, CHECKOUT_FAILED, UNRELATED_BRANCH, READ_ONLY_MERGE_REF, " +
+      "NO_PUSH_TARGET, UNSAFE_PUSH_TARGET. Never resets or discards local commits.",
+    args: {
+      pr_number: z.number().int().positive().describe("PR number from the frozen input context"),
+      head_ref: z.string().min(1).describe("Frozen PR head branch name (headRefName)"),
+      head_sha: z
+        .string()
+        .regex(/^[0-9a-f]{40}$/, "must be a 40-character lowercase commit SHA")
+        .describe("Frozen PR head commit SHA (headRefOid)"),
+    },
+    execute: async (args: { pr_number: number; head_ref: string; head_sha: string }) => {
+      try {
+        let head = exec(["rev-parse", "HEAD"], cwd).trim()
+        let identity = classifyHeadIdentity(exec, cwd, head, args.head_sha)
+        let checkedOut = false
+
+        if (identity === "unrelated") {
+          const dirty = exec(["status", "--porcelain", "--untracked-files=no"], cwd).trim()
+          if (dirty !== "") {
+            return checkoutFailure(
+              "DIRTY_TREE",
+              `Working tree has uncommitted changes. Commit or stash them, then rerun \`/uf.address-feedback ${args.pr_number}\`.`,
+            )
+          }
+          try {
+            gh(["pr", "checkout", String(args.pr_number)], cwd)
+          } catch (err: unknown) {
+            const detail = execErrorDetail(err)
+            if (UNTRACKED_COLLISION_PATTERN.test(detail)) {
+              return checkoutFailure(
+                "CHECKOUT_FAILED",
+                `gh pr checkout ${args.pr_number} failed: untracked working tree files would be overwritten ` +
+                  "by tracked files on the PR branch (the dirty check excludes untracked files). Remove, " +
+                  "rename, or stash them (`git stash -u` includes untracked files; plain `git stash` " +
+                  `skips them), then rerun \`/uf.address-feedback ${args.pr_number}\`. Git error: ${detail}`,
+              )
+            }
+            return checkoutFailure(
+              "CHECKOUT_FAILED",
+              `gh pr checkout ${args.pr_number} failed (fetch or checkout error): ${detail}`,
+              true,
+            )
+          }
+          checkedOut = true
+          head = exec(["rev-parse", "HEAD"], cwd).trim()
+          identity = classifyHeadIdentity(exec, cwd, head, args.head_sha)
+          if (identity === "unrelated") {
+            return checkoutFailure(
+              "UNRELATED_BRANCH",
+              `After gh pr checkout ${args.pr_number}, HEAD ${head} is neither equal to nor a descendant of ` +
+                `the PR head ${args.head_sha}: the branch is unrelated to the PR head. Local commits were not ` +
+                "reset or discarded.",
+            )
+          }
+        }
+
+        const branch = exec(["branch", "--show-current"], cwd).trim()
+        if (branch === "") {
+          return checkoutFailure(
+            "NO_PUSH_TARGET",
+            `HEAD ${head} is detached: the PR head has no configured push target. Run ` +
+              `\`gh pr checkout ${args.pr_number}\` to check out the PR head branch.`,
+          )
+        }
+        if (!SAFE_REFNAME_PATTERN.test(branch)) {
+          return checkoutFailure(
+            "UNSAFE_PUSH_TARGET",
+            "Checked-out branch name contains characters outside the conservative set A-Za-z0-9._/- " +
+              "and cannot be rendered into the push templates.",
+          )
+        }
+
+        const headRemote = readGitConfig(exec, cwd, `branch.${branch}.remote`)
+        const mergeRef = readGitConfig(exec, cwd, `branch.${branch}.merge`)
+        if (headRemote === "" || mergeRef === "") {
+          return checkoutFailure(
+            "NO_PUSH_TARGET",
+            `The PR head has no configured push target: branch.${branch}.remote or ` +
+              `branch.${branch}.merge is unset.`,
+          )
+        }
+        if (mergeRef.startsWith("refs/pull/")) {
+          return checkoutFailure(
+            "READ_ONLY_MERGE_REF",
+            `Branch ${branch} merges from the read-only ref ${mergeRef} (a fork PR with maintainer edits ` +
+              "disabled), so a push would always be rejected: the PR head cannot be pushed to from this clone.",
+          )
+        }
+        const expectedMergeRef = `refs/heads/${args.head_ref}`
+        if (mergeRef !== expectedMergeRef) {
+          return checkoutFailure(
+            "UNRELATED_BRANCH",
+            `The working tree is on branch ${branch} whose push target is ${mergeRef}, not the PR head ` +
+              `branch ${args.head_ref} (${expectedMergeRef}). Never push this PR's commits to a different ` +
+              "branch: ancestry alone cannot make this distinction, since any branch that merely contains " +
+              "head_sha passes the descendant check.",
+          )
+        }
+        if (!SAFE_REFNAME_PATTERN.test(mergeRef) || !isSafePushRemote(headRemote)) {
+          return checkoutFailure(
+            "UNSAFE_PUSH_TARGET",
+            "The push target contains characters outside the conservative sets (merge ref A-Za-z0-9._/-; " +
+              "remote a plain name A-Za-z0-9._- or an https URL without userinfo) and cannot be rendered " +
+              "into the push templates.",
+          )
+        }
+
+        const data: CheckoutPrHeadData = {
+          branch,
+          head_remote: headRemote,
+          merge_ref: mergeRef,
+          ahead_of_head_sha: identity === "descendant",
+          checked_out: checkedOut,
+        }
+        return { output: JSON.stringify(success(data)) }
+      } catch (err: unknown) {
+        return { output: failureFromError(err, "CHECKOUT_PR_HEAD_ERROR") }
+      }
+    },
+  })
+}
+
+// ---------------------------------------------------------------------------
+// post_feedback_replies and file_feedback_issue tools (feedback-reply-tools)
+// ---------------------------------------------------------------------------
+
+/** Render a zod validation failure as the feedback tools' invalid_input envelope. */
+function feedbackInvalidInput(error: z.ZodError): string {
+  const details = error.issues
+    .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+    .join("; ")
+  return JSON.stringify(feedbackFailure("invalid_input", details))
+}
+
+/** Render a thrown error as the feedback tools' failure envelope. */
+function feedbackErrorOutput(err: unknown): string {
+  if (err instanceof FeedbackOperationError) {
+    return JSON.stringify(feedbackFailure(err.code, err.message, err.retryable))
+  }
+  const message = err instanceof Error ? err.message : String(err)
+  return JSON.stringify(feedbackFailure("internal_error", message))
+}
+
+/**
+ * Factory for the post_feedback_replies tool (issue #966): files each
+ * FILE item's issue, posts every confirmed reply, and resolves the
+ * approved review threads in one call. Judgment products (reply text,
+ * decisions, the resolve decision) arrive as parameters; the chain runs
+ * in lib/feedback-replies.ts. Failures use the fetch-tool error
+ * contract (`error: true`, code, message, retryable) alongside
+ * `status: "error"`.
+ *
+ * @param deps gh executor, repository root, and checkpoint recorder.
+ * @returns The post_feedback_replies tool.
+ */
+export function createPostFeedbackRepliesTool(deps: FeedbackReplyDeps): ReturnType<typeof tool> {
+  return tool({
+    description:
+      "Post /uf.address-feedback replies and resolve addressed review threads in one call. " +
+      "Files each file item's issue first (one retry, cached so a re-run never files twice), " +
+      "posts each reply through a temp-file request body to the review-thread or PR-conversation " +
+      "endpoint, stops posting at the first failed post, maps review comments to GraphQL thread " +
+      "IDs, and, when resolve_threads is true, resolves the threads of accept, modify, file, and " +
+      "reply review items whose replies are posted. Progress is recorded per item in " +
+      ".uf/feedback/pr-<N>/state.json, so re-running with the same items resumes. Records the " +
+      "reply-comments checkpoint when nothing is left to do. Returns per-item outcomes and a " +
+      "rendered summary line.",
+    args: PostFeedbackRepliesInputSchema.shape,
+    async execute(args) {
+      const parsed = PostFeedbackRepliesInputSchema.safeParse(args)
+      if (!parsed.success) {
+        return { output: feedbackInvalidInput(parsed.error) }
+      }
+      try {
+        return { output: JSON.stringify(feedbackSuccess(postFeedbackReplies(parsed.data, deps))) }
+      } catch (err: unknown) {
+        return { output: feedbackErrorOutput(err) }
+      }
+    },
+  })
+}
+
+/**
+ * Factory for the file_feedback_issue tool (issue #998): files one
+ * finding as a GitHub issue with one retry, returning the issue number
+ * and URL. A finding already filed for the same comment (per the
+ * feedback cache) is returned without filing again.
+ *
+ * @param deps gh executor and repository root.
+ * @returns The file_feedback_issue tool.
+ */
+export function createFileFeedbackIssueTool(deps: FeedbackReplyDeps): ReturnType<typeof tool> {
+  return tool({
+    description:
+      "File one /uf.address-feedback finding as a GitHub issue. The title and body reach gh " +
+      "as an argument-array element and a temp file, never shell text. Retries gh issue create " +
+      "once; if the feedback cache already records an issue for the same comment, returns it " +
+      "with deduplicated true instead of filing again. Returns issue_number and issue_url and " +
+      "records them in .uf/feedback/pr-<N>/state.json.",
+    args: FileFeedbackIssueInputSchema.shape,
+    async execute(args) {
+      const parsed = FileFeedbackIssueInputSchema.safeParse(args)
+      if (!parsed.success) {
+        return { output: feedbackInvalidInput(parsed.error) }
+      }
+      try {
+        return { output: JSON.stringify(feedbackSuccess(fileFeedbackIssue(parsed.data, deps))) }
+      } catch (err: unknown) {
+        return { output: feedbackErrorOutput(err) }
+      }
+    },
+  })
+}
+
+// ---------------------------------------------------------------------------
+// post_issue_comment and create_child_issue tools (feedback-reply-tools)
+// ---------------------------------------------------------------------------
+
+/**
+ * Factory for the post_issue_comment tool (the /uf.triage-issue 4.3 DE-005
+ * extraction, PR #1024 review): posts one author-confirmed comment on a
+ * GitHub issue. The confirmed body arrives as a validated parameter; the
+ * tool owns temp-file creation, 0o600 permissions, JSON serialization,
+ * `gh api --input`, failure-stop, and all-paths cleanup.
+ *
+ * @param deps gh executor and repository root.
+ * @returns The post_issue_comment tool.
+ */
+export function createPostIssueCommentTool(deps: FeedbackReplyDeps): ReturnType<typeof tool> {
+  return tool({
+    description:
+      "Post one confirmed comment on a GitHub issue (/uf.triage-issue step 4.3). The body reaches gh " +
+      "as a JSON-serialized temp-file request body, never shell text. The comment body MUST be the " +
+      "exact text the author confirmed; the human-confirmation gate stays in the calling command. " +
+      "Returns the issue's repo, issue_number, and the posted comment_id and comment_url (null only " +
+      "when gh printed unparseable output after a successful POST).",
+    args: PostIssueCommentInputSchema.shape,
+    async execute(args) {
+      const parsed = PostIssueCommentInputSchema.safeParse(args)
+      if (!parsed.success) {
+        return { output: feedbackInvalidInput(parsed.error) }
+      }
+      try {
+        return { output: JSON.stringify(feedbackSuccess(postIssueComment(parsed.data, deps))) }
+      } catch (err: unknown) {
+        return { output: feedbackErrorOutput(err) }
+      }
+    },
+  })
+}
+
+/**
+ * Factory for the create_child_issue tool (the /uf.triage-issue 4.4 DE-005
+ * extraction, PR #1024 review): creates one author-confirmed GitHub issue.
+ * The confirmed title and body arrive as validated parameters; the tool
+ * owns temp-file creation, 0o600 permissions, `gh issue create
+ * --body-file`, one retry, and all-paths cleanup.
+ *
+ * @param deps gh executor and repository root.
+ * @returns The create_child_issue tool.
+ */
+export function createCreateChildIssueTool(deps: FeedbackReplyDeps): ReturnType<typeof tool> {
+  return tool({
+    description:
+      "Create one confirmed GitHub issue (/uf.triage-issue step 4.4). The title and body reach gh " +
+      "as an argument-array element and a temp body file, never shell text. Retries gh issue create " +
+      "once and fails with a structured error when it still fails. The title and body MUST be the " +
+      "exact text the author confirmed; the human-confirmation gate stays in the calling command. " +
+      "Returns the repo, issue_number, issue_url, and attempt count.",
+    args: CreateChildIssueInputSchema.shape,
+    async execute(args) {
+      const parsed = CreateChildIssueInputSchema.safeParse(args)
+      if (!parsed.success) {
+        return { output: feedbackInvalidInput(parsed.error) }
+      }
+      try {
+        return { output: JSON.stringify(feedbackSuccess(createChildIssue(parsed.data, deps))) }
+      } catch (err: unknown) {
+        return { output: feedbackErrorOutput(err) }
+      }
+    },
+  })
+}
+
+/** Production dependencies for the feedback reply tools. */
+function feedbackReplyDeps(cwd: string): FeedbackReplyDeps {
+  return {
+    gh: defaultFeedbackGhExec,
+    cwd,
+    recordCheckpoint: (step, data) =>
+      recordAutoCheckpoint(cwd, resolveKey(defaultGitExec, cwd), "uf.address-feedback", step, data),
+  }
+}
+
+// ---------------------------------------------------------------------------
 // uf_delegate_command tool
 // ---------------------------------------------------------------------------
 
@@ -1581,6 +2306,43 @@ const PLAN_ARTIFACT_STOP_MESSAGE =
  */
 const TASKS_ARTIFACT_STOP_MESSAGE =
   "Task generation failed -- tasks.md was not created. Check the agent output for errors."
+
+/**
+ * Wall-clock ceiling for prompt-only delegations, derived from the
+ * executor TimeoutSchema bound shared with invoke_agent so the two
+ * cannot drift apart.
+ */
+export const MAX_PROMPT_DELEGATION_TIMEOUT_MS = MAX_TIMEOUT_MILLISECONDS
+
+/**
+ * Wall-clock ceiling for command-path delegations (4 hours;
+ * delegation-timeout-budgets D3). Command files own durable checkpoints,
+ * so the idle timeout is the primary stall detector and the wall clock
+ * is a backstop.
+ */
+export const MAX_COMMAND_DELEGATION_TIMEOUT_MS = 14_400_000
+
+/** Default idle (no-progress) window for every delegation (design D2). */
+export const DEFAULT_DELEGATE_IDLE_TIMEOUT_MS = 600_000
+
+/** Bounds accepted for idle_timeout. */
+export const MIN_DELEGATE_IDLE_TIMEOUT_MS = 60_000
+export const MAX_DELEGATE_IDLE_TIMEOUT_MS = 1_800_000
+
+/**
+ * Durable progress a timed-out command-path delegation left behind
+ * (design D4), read through the same readState path get_progress uses.
+ */
+export interface DelegateResumeState {
+  /** State command name (command file basename without .md). */
+  command: string
+  /** Progress state key (sanitized current branch). */
+  key: string
+  /** The state's current_step, or null when no state exists. */
+  last_checkpoint_step: string | null
+  /** Recorded steps, empty when no state exists. */
+  completed_steps: string[]
+}
 
 /** Structured output from uf_delegate_command. */
 export interface DelegateCommandData {
@@ -1613,6 +2375,34 @@ export interface DelegateCommandData {
    * filtering is applied; null when none was supplied.
    */
   skill_absent_reason: string | null
+  /**
+   * Model-matrix selection outcome for this delegation (model-matrix
+   * design D7, MM-FR-007): the precedence-chain winner. "host" is the
+   * zero-config fallback -- every delegation records this field, even
+   * when no matrix is configured.
+   */
+  selection_source: SelectionSource
+  /**
+   * Convention pack resolved by selection, when any (explicit input,
+   * profile's pack, or classifier-selected). The same pack is rendered
+   * into the composed prompt as a tool-rendered directive (task 5.3).
+   */
+  selection_pack: string | null
+  /** Matrix capability the selection resolved through, when any. */
+  selection_capability: string | null
+  /**
+   * Resolved provider/model identity for the child session (explicit
+   * input or matrix profile); null when the child runs on the host
+   * model (selection_source "host").
+   */
+  selection_model: string | null
+  /** Classifier confidence for classifier-driven selections, when reported. */
+  selection_confidence: number | null
+  /**
+   * Why selection fell through to a later chain step (e.g. classifier
+   * failure), when the matrix recorded one; null otherwise.
+   */
+  selection_fallback_reason: string | null
   /** Child session usage, when the executor reported step-finish parts. */
   usage: InvocationUsage | null
   /** Request, host-resolution, and child-report provenance. */
@@ -1632,6 +2422,63 @@ export interface DelegateCommandDependencies {
   readonly readText: (path: string) => Promise<string>
   /** File-existence checker for expected-artifact verification. */
   readonly fileExists: FileExists
+  /**
+   * Directory checker for skill references naming a path (#934 review):
+   * an existing directory is not a script. Default: statSync-backed.
+   */
+  readonly isDirectory?: (path: string) => boolean
+  /**
+   * Model-matrix selection dependencies (model-matrix-delegation designs
+   * D1/D2/D5, tasks 5.1-5.4). Grouped so existing test sites extend with
+   * one line instead of five, mirroring the review-dispatch dependency
+   * convention.
+   */
+  readonly modelMatrix: ModelMatrixSelectionDependencies
+}
+
+/**
+ * Parent-session context the classifier agent-engine spawn binds for each
+ * delegation invocation (agent-executor pattern: child sessions carry their
+ * parent's session/message context so the host associates them correctly).
+ */
+export interface ClassifierSpawnContext {
+  readonly sessionID: string
+  readonly messageID: string
+  readonly directory: string
+}
+
+/**
+ * Model-matrix selection seams for uf_delegate_command (design D5): the
+ * YAML parser (Bun in production, JSON-subset stubs in Node-side tests),
+ * the classifier engine's HTTP/env seams, and the hidden classifier
+ * subagent spawn. Selection is fail-closed and never launches the content
+ * child session before it resolves (UF-FR-002).
+ */
+export interface ModelMatrixSelectionDependencies {
+  /** Parses .uf/model-matrix.yaml / .uf/model-matrix.override.yaml text. */
+  readonly parseYaml: YamlParser
+  /** HTTP fetch seam for the LLM engine (global fetch in production). */
+  readonly classifierFetch: typeof fetch
+  /** Environment reader for the LLM engine (process.env lookup in production). */
+  readonly classifierReadEnv: (name: string) => string | undefined
+  /**
+   * Runs the hidden model-matrix-classifier subagent and returns its final
+   * text (agent-engine path, MM-FR-005). Rejects on any engine failure so
+   * the cascade records an agent-engine fallback -- classification never
+   * blocks delegation.
+   */
+  readonly spawnClassifierAgent: (
+    context: ClassifierSpawnContext,
+    agent: string,
+    prompt: string,
+    signal: AbortSignal,
+  ) => Promise<string>
+  /**
+   * Classifier result cache shared across invocations of one tool instance.
+   * Injected by tests for isolation; production constructs one per plugin
+   * instance (never module-level, design D5).
+   */
+  readonly classifierCache?: ClassifierCache
 }
 
 /**
@@ -1658,7 +2505,16 @@ const DelegateCommandInputSchema = z
     expected_artifact: z.string().min(1).max(1024).optional(),
     checkpoint_step: z.string().min(1).max(128).optional(),
     phase: z.number().int().min(1).max(1000).optional(),
-    timeout: TimeoutSchema.optional(),
+    // Delegation-timeout-budgets D3: the ceiling depends on delegation
+    // kind, so the shared bound is the command-path ceiling and the
+    // superRefine below holds prompt-only calls to the executor bound.
+    timeout: z.number().int().positive().max(MAX_COMMAND_DELEGATION_TIMEOUT_MS).optional(),
+    idle_timeout: z
+      .number()
+      .int()
+      .min(MIN_DELEGATE_IDLE_TIMEOUT_MS)
+      .max(MAX_DELEGATE_IDLE_TIMEOUT_MS)
+      .optional(),
     // Delegation-skill-enforcement D1: the caller classifies the delegated
     // work and the tool validates the declared answer's consequences.
     // Absence of a skill reference is expressed by omitting the field or
@@ -1673,6 +2529,38 @@ const DelegateCommandInputSchema = z
       .string()
       .min(1, "empty string is invalid -- absence is expressed by omitting the field")
       .max(512)
+      .optional(),
+    // Model-matrix selection params (model-matrix-delegation UF-FR-002,
+    // MM-FR-003). Selection is MUTUALLY INDEPENDENT of the classification
+    // contract above: classification governs deterministic-work skill
+    // enforcement, selection governs which model the child session runs
+    // on. A call may carry both (e.g. deterministic Go work with
+    // pack: "go" and skill enforcement) -- one is never a substitute for
+    // the other. Precedence order (MM-FR-003): explicit model > profile >
+    // pack > agent pin > task-kind default > classifier cascade > host.
+    model: z
+      .string()
+      .min(3)
+      .max(256)
+      .regex(
+        /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._@-]*(?:\/[A-Za-z0-9][A-Za-z0-9._@-]*)*$/,
+        "model must be a provider/model identity (e.g. provider/model)",
+      )
+      .optional(),
+    variant: z
+      .string()
+      .max(64)
+      .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, "variant must match the agent-executor VariantSchema shape")
+      .optional(),
+    profile: z
+      .string()
+      .min(1, "empty string is invalid -- omit the parameter when no profile applies")
+      .max(128)
+      .optional(),
+    pack: z
+      .string()
+      .min(1, "empty string is invalid -- omit the parameter when no pack applies")
+      .max(128)
       .optional(),
   })
   .strict()
@@ -1696,6 +2584,21 @@ const DelegateCommandInputSchema = z
         message:
           "prompt-only delegation (no command_path) must declare task_classification -- " +
           "classify the work as deterministic or judgment before delegating",
+      })
+    }
+    // Delegation-timeout-budgets D3: only command-path delegations, whose
+    // command files own durable checkpoints, may exceed the executor bound.
+    if (
+      input.command_path === undefined &&
+      input.timeout !== undefined &&
+      input.timeout > MAX_PROMPT_DELEGATION_TIMEOUT_MS
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["timeout"],
+        message:
+          `prompt-only delegation timeout must not exceed ${MAX_PROMPT_DELEGATION_TIMEOUT_MS} ms -- ` +
+          "only command-path delegations may run longer",
       })
     }
     // D1: name the skill, or record why none exists -- never both.
@@ -1723,6 +2626,17 @@ const DelegateCommandInputSchema = z
           })
         }
       }
+    }
+    // MM-FR-003: variant is model's companion parameter. The precedence
+    // chain gives a variant without a model no defined meaning (profiles
+    // own their variants; host fallback does not read the input variant),
+    // so the pair is validated together, fail-closed with remediation.
+    if (input.variant !== undefined && input.model === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["variant"],
+        message: "variant requires model -- pair the runtime variant with an explicit provider/model identity",
+      })
     }
   })
 
@@ -1784,19 +2698,34 @@ function resolveToolParam(
   return { ok: true, abs }
 }
 
+/** Default directory checker: true only for an existing directory. */
+function defaultIsDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory()
+  } catch {
+    return false
+  }
+}
+
 /**
  * Repo skill roots searched for a `skill` value carrying no path
  * separator, in resolution order (delegation-skill-enforcement D2).
- * Both roots exist in this repository; a name present in both resolves
- * to the first root. A future layout change is a one-constant edit.
+ * The legacy `.opencode/skill` root is not searched: `uf init` migrates
+ * it into `.opencode/skills` (#933), so a stale legacy copy can never be
+ * what a reference resolves to. A future layout change is a one-constant
+ * edit.
  */
-const SKILL_ROOTS = [".opencode/skills", ".opencode/skill"] as const
+const SKILL_ROOTS = [".opencode/skills"] as const
 
 /**
  * Resolve a deterministic delegation's skill reference (design D2): a
  * value without `/` is a skill name probed under each repo skill root in
- * order — first root wins on collision; a value containing `/` is a
- * repo-relative script path under the standard traversal guard.
+ * order — first root wins on collision — and, when no root holds it, a
+ * repo-root file (`Makefile`, `build-all.sh`); a value containing `/` is
+ * a repo-relative script path (`./Makefile` names a root file
+ * explicitly). Both path forms use the standard traversal guard. A
+ * command string such as `make plugin-test` is never a reference: it
+ * fails SKILL_NOT_FOUND with a pointer to skill_absent_reason.
  * Resolution is an existence check on the injected fileExists dependency
  * — no content is read (the child loads the skill or runs the script
  * through its own tooling). Returns the resolved repo-relative reference
@@ -1808,10 +2737,28 @@ function resolveSkillReference(
   cwd: string,
   skill: string,
   fileExists: FileExists,
+  isDirectory: (path: string) => boolean = defaultIsDirectory,
 ): { ok: true; resolved: string } | { ok: false; failureOutput: string } {
+  // A path-form reference must name a file: a directory is not a script.
+  const isFileReference = (abs: string): boolean => fileExists(abs) && !isDirectory(abs)
   const remediation =
     "Remediation: pass an existing skill name or a repo-relative script path, " +
     "or record skill_absent_reason when no repo skill applies; retrying will not fix this."
+  if (/\s/.test(skill)) {
+    // A command or make target ("make plugin-test") is not a file
+    // reference; name the file that defines it or record the reason.
+    return {
+      ok: false,
+      failureOutput: JSON.stringify(
+        failure(
+          `Skill reference "${skill}" does not resolve: commands and make targets are not ` +
+            "skill references. Reference the script file that defines the procedure " +
+            `(e.g. Makefile) or record skill_absent_reason naming the command. ${remediation}`,
+          { retryable: false, code: "SKILL_NOT_FOUND" },
+        ),
+      ),
+    }
+  }
   if (!skill.includes("/")) {
     // Skill name: probe each root in order; the first existing entry wins
     // (spec scenario: skill-root collision resolves to the first root).
@@ -1821,7 +2768,15 @@ function resolveSkillReference(
         return { ok: true, resolved: candidate }
       }
     }
-    const searchedLocations = SKILL_ROOTS.map((root) => `${root}/${skill}/SKILL.md`).join(", ")
+    // No skill by that name: fall back to a repo-root file (#934).
+    const rootFile = resolveRepoRelative(cwd, skill)
+    if (rootFile !== null && isFileReference(rootFile)) {
+      return { ok: true, resolved: skill }
+    }
+    const searchedLocations = [
+      ...SKILL_ROOTS.map((root) => `${root}/${skill}/SKILL.md`),
+      `${skill} (repo-root file)`,
+    ].join(", ")
     return {
       ok: false,
       failureOutput: JSON.stringify(
@@ -1838,7 +2793,7 @@ function resolveSkillReference(
   if (!pathParam.ok) {
     return { ok: false, failureOutput: pathParam.failureOutput }
   }
-  if (!fileExists(pathParam.abs)) {
+  if (!isFileReference(pathParam.abs)) {
     return {
       ok: false,
       failureOutput: JSON.stringify(
@@ -1896,6 +2851,29 @@ function renderSkillDirective(resolvedReference: string): string {
   )
 }
 
+/**
+ * Render the tool-rendered convention-pack directive injected into the
+ * composed prompt (model-matrix-delegation design D6, task 5.3). The exact
+ * wording is a design constant — tool-rendered, never agent-reconstructed,
+ * and never the pack content inlined (the child loads
+ * `.opencode/uf/packs/<pack>.md` itself, MM-FR-005's double duty) — pinned
+ * by golden-shape tests: a header line naming the pack, then the fixed
+ * paragraph instructing the child to load the pack file and treat it as
+ * the source of truth. Rendered only for calls whose selection carries a
+ * pack (explicitly supplied or classifier-selected), at the fixed
+ * position — after the feature-dir context and any skill directive,
+ * immediately before the extra prompt (UF-FR-002); task 5.4 records the
+ * same pack in the audit trail.
+ */
+function renderPackDirective(pack: string): string {
+  return (
+    `Required convention pack: ${pack}\n\n` +
+    `Before writing, load the convention pack at .opencode/uf/packs/${pack}.md and apply ` +
+    "its rules to this task. The pack file is the source of truth for its conventions — " +
+    "do not reconstruct its content from memory or improvise equivalent rules."
+  )
+}
+
 /** Standard catch-all failure envelope from a thrown unknown error. */
 function failureFromError(err: unknown, code: string, retryable = false): string {
   const msg = err instanceof Error ? err.message : String(err)
@@ -1916,6 +2894,89 @@ function expectedArtifactStopMessage(expectedArtifact: string): string {
     return TASKS_ARTIFACT_STOP_MESSAGE
   }
   return `Artifact generation failed -- ${expectedArtifact} was not created. Check the agent output for errors.`
+}
+
+/**
+ * Read the durable progress a timed-out command-path delegation left
+ * behind (delegation-timeout-budgets D4): the state command is the
+ * command file's basename without `.md`, keyed by the current branch
+ * exactly as get_progress derives it. Any read failure yields null so
+ * the timeout itself is never masked.
+ */
+function readDelegateResumeState(exec: GitExec, cwd: string, commandPath: string): DelegateResumeState | null {
+  try {
+    const command = basename(commandPath).replace(/\.md$/, "")
+    const key = resolveKey(exec, cwd)
+    const state = readState(cwd, key, sanitizeSlug(command))
+    return {
+      command,
+      key,
+      last_checkpoint_step: state?.current_step ?? null,
+      completed_steps: state?.completed_steps ?? [],
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Production classifier agent-engine spawn (model-matrix-delegation design
+ * D5, MM-FR-005): runs the hidden model-matrix-classifier subagent through
+ * the shared executeAgentSession session path with the invocation's
+ * parent-session context. The classifier child inherits the session model
+ * hierarchy — the spawn resolves the host model for its own child session,
+ * independent of the delegation's selection — and any failure here rejects
+ * the seam so the cascade records an agent-engine fallback (classification
+ * never blocks delegation). read_only marks the least-privilege
+ * investigator; the agent file itself denies edit/bash/webfetch.
+ */
+async function spawnClassifierAgentSession(
+  client: PluginInput["client"],
+  context: ClassifierSpawnContext,
+  agent: string,
+  prompt: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const host = await resolveHostModel(
+    {
+      client,
+      sessionID: context.sessionID,
+      messageID: context.messageID,
+      directory: context.directory,
+    },
+    signal,
+  )
+  const result = await executeAgentSession(
+    {
+      client,
+      sessionID: context.sessionID,
+      directory: context.directory,
+      parentAbort: signal,
+      timeoutMilliseconds: DEFAULT_TIMEOUT_MILLISECONDS,
+    },
+    agent,
+    prompt,
+    host.identity,
+    host.variant,
+    true,
+    {
+      agent,
+      requested_model: null,
+      requested_variant: null,
+      resolved_parent_model: host.identity.combined,
+      resolved_parent_variant: host.variant ?? null,
+      reported_child_model: null,
+      model_mismatch: false,
+      read_only: true,
+    },
+  )
+  if (result.status !== "success" || result.error !== null) {
+    throw new Error(
+      `classifier agent run ended with status "${result.status}"` +
+        (result.error !== null ? ` (${result.error.code}: ${result.error.message})` : ""),
+    )
+  }
+  return result.text
 }
 
 /**
@@ -1942,10 +3003,25 @@ function expectedArtifactStopMessage(expectedArtifact: string): string {
  * - the prompt is composed deterministically: command text when present,
  *   then feature-dir context, then the tool-rendered skill directive
  *   (delegation-skill-enforcement D3, rendered only when a skill
- *   reference resolved), then the extra prompt
+ *   reference resolved), then the tool-rendered convention-pack directive
+ *   (model-matrix-delegation D6, rendered only when selection carries a
+ *   pack), then the extra prompt
+ * - model-matrix selection (model-matrix-delegation D2/D8, MM-FR-003)
+ *   runs after skill resolution and before host introspection: an absent
+ *   matrix (the default) skips to the host model with zero behavioral
+ *   change; a present matrix resolves the child model and pack through
+ *   the precedence chain (explicit model > profile > pack > agent pin >
+ *   task-kind default > classifier cascade > host), with profile/pack
+ *   validation failures returned pre-spawn (one tool round-trip, zero
+ *   child sessions) and a structurally invalid matrix failing closed
+ *   (MATRIX_INVALID); a matrix-resolved model skips host introspection
+ *   entirely, while host fallback preserves the pre-change
+ *   variant-fallback and structural-failure semantics verbatim
  * - the child session runs through the shared executeAgentSession executor
  *   (host model resolution via parent introspection, parenting, abort
- *   linkage, timeout — default 600,000 ms) and expected_artifact is
+ *   linkage, timeout — default 600,000 ms, up to 14,400,000 ms for
+ *   command-path calls, clamped to any inherited parent budget; idle
+ *   timeout default 600,000 ms) and expected_artifact is
  *   verified after the run; a missing artifact returns the command's exact
  *   STOP message (EXPECTED_ARTIFACT_MISSING)
  * - on success (child completed and artifact verified when supplied) the
@@ -1954,11 +3030,19 @@ function expectedArtifactStopMessage(expectedArtifact: string): string {
  *   delegation facts as data -- including the classification contract's
  *   audit trail (delegation-skill-enforcement D5): task_classification,
  *   the resolved skill reference, and skill_absent_reason when present,
- *   also surfaced in the success envelope
+ *   and the model-matrix selection audit trail (model-matrix-delegation
+ *   D7, MM-FR-007): selection_source always, plus pack, capability,
+ *   model, confidence, and fallback_reason when non-null -- both also
+ *   surfaced in the success envelope
+ * - limit-ended runs (delegation-timeout-budgets D4) return
+ *   DELEGATE_FAILED with the executor's `timeout` details and, for
+ *   command-path calls, `resume` (state key, last checkpoint step,
+ *   completed steps) so callers resume instead of restarting
  *
  * @param exec Git executor used to derive the auto-checkpoint state key.
  * @param cwd Repository root used for repo-relative path resolution.
- * @param deps Client, command-file reader, and artifact-existence dependencies.
+ * @param deps Client, command-file reader, artifact-existence, and
+ *   model-matrix selection dependencies.
  * @returns The uf_delegate_command tool.
  */
 export function createDelegateCommandTool(
@@ -1966,15 +3050,25 @@ export function createDelegateCommandTool(
   cwd: string,
   deps: DelegateCommandDependencies,
 ): ReturnType<typeof tool> {
+  // Model-matrix-delegation D5: the classifier result cache belongs to the
+  // tool instance (one per plugin activation), never module-level state.
+  // The cascade itself is constructed per invocation — its agent-engine
+  // spawn binds the invocation's parent-session context — and shares this
+  // cache, so cache semantics match a per-instance cascade while the
+  // spawn seam stays context-correct for concurrent invocations.
+  const classifierCache = deps.modelMatrix.classifierCache ?? createClassifierCache()
   return tool({
     description:
       "Delegate a command or task to a content agent (default cobalt-crush-dev) in a " +
-      "parented child session with host model resolution. Reads the command file from " +
-      "command_path when supplied (repo-relative, traversal-safe, max 1 MiB), composes " +
-      "the prompt (command text + feature-dir context + extra prompt), verifies " +
+      "parented child session. Reads the command file from command_path when supplied " +
+      "(repo-relative, traversal-safe, max 1 MiB), composes the prompt (command text + " +
+      "feature-dir context + skill/pack directives + extra prompt), verifies " +
       "expected_artifact after the run (missing artifacts return the command's exact " +
-      "STOP message), and auto-checkpoints checkpoint_step on success. Reviewer agents " +
-      "(divisor-*) are rejected — use invoke_agent for review invocations.",
+      "STOP message), and auto-checkpoints checkpoint_step on success. The child model " +
+      "resolves through the model-matrix precedence chain (explicit model > profile > " +
+      "pack > agent pin > task-kind default > classifier cascade > host model) and every " +
+      "selection is recorded in the audit trail. Reviewer agents (divisor-*) are " +
+      "rejected — use invoke_agent for review invocations.",
     args: {
       agent: DelegateCommandInputSchema.shape.agent.describe(
         "Content agent to delegate to (default cobalt-crush-dev). Reviewer agents (divisor-*) are rejected; dispatch them via invoke_agent.",
@@ -1999,7 +3093,13 @@ export function createDelegateCommandTool(
           "for per-task delegation (same numbering as the implement exit variants).",
       ),
       timeout: DelegateCommandInputSchema.shape.timeout.describe(
-        "Optional run timeout in milliseconds (bounded to 1_800_000; default 600_000).",
+        "Optional wall-clock run timeout in milliseconds (default 600_000). Bounded to 14_400_000 " +
+          "for command-path delegations and 1_800_000 for prompt-only delegations. Inside another " +
+          "delegation the timeout is clamped to the parent's remaining budget.",
+      ),
+      idle_timeout: DelegateCommandInputSchema.shape.idle_timeout.describe(
+        "Optional idle (no-progress) timeout in milliseconds (60_000-1_800_000; default 600_000). " +
+          "The run aborts only when no session in the child's subtree changed for this long.",
       ),
       task_classification: DelegateCommandInputSchema.shape.task_classification.describe(
         "Optional classification of the delegated work: \"deterministic\" or \"judgment\". " +
@@ -2007,13 +3107,35 @@ export function createDelegateCommandTool(
       ),
       skill: DelegateCommandInputSchema.shape.skill.describe(
         "Optional repo skill or script reference named for deterministic-classified work " +
-          "(1-256 chars). Mutually exclusive with skill_absent_reason and valid only with " +
+          "(1-256 chars): a skill name, a repo-root file (Makefile), or a repo-relative " +
+          "script path (scripts/build.sh). Commands and make targets are not references. Mutually exclusive with skill_absent_reason and valid only with " +
           "task_classification \"deterministic\".",
       ),
       skill_absent_reason: DelegateCommandInputSchema.shape.skill_absent_reason.describe(
         "Optional reason recorded when deterministic-classified work has no applicable repo " +
           "skill or script, stating what was searched and what was found (1-512 chars). " +
           "Mutually exclusive with skill and valid only with task_classification \"deterministic\".",
+      ),
+      model: DelegateCommandInputSchema.shape.model.describe(
+        "Optional explicit provider/model identity for the child session (e.g. provider/model). " +
+          "Wins the model-selection precedence chain outright, skipping matrix resolution and host " +
+          "introspection; validated by shape only and used verbatim. Pair with variant when a " +
+          "runtime variant applies.",
+      ),
+      variant: DelegateCommandInputSchema.shape.variant.describe(
+        "Optional runtime variant paired with model (requires model). Follows the agent-executor " +
+          "variant shape (max 64 chars).",
+      ),
+      profile: DelegateCommandInputSchema.shape.profile.describe(
+        "Optional model-matrix capability name (1-128 chars, e.g. code-writing). Precedence step 2: " +
+          "resolves the profile's model and pack through .uf/model-matrix.yaml when configured; fails " +
+          "closed when the profile is unknown or no matrix exists.",
+      ),
+      pack: DelegateCommandInputSchema.shape.pack.describe(
+        "Optional UF convention pack name (1-128 chars, e.g. go). Double duty (precedence step 3): " +
+          "resolves the mapped profile's model AND renders a tool-authored directive instructing the " +
+          "child to load .opencode/uf/packs/<pack>.md before writing. Must be a packs key of the " +
+          "loaded matrix; fails closed otherwise.",
       ),
     },
     async execute(args, context) {
@@ -2070,7 +3192,7 @@ export function createDelegateCommandTool(
         // audit trail (task 1.5).
         let resolvedSkill: string | null = null
         if (input.skill !== undefined) {
-          const skillRef = resolveSkillReference(cwd, input.skill, deps.fileExists)
+          const skillRef = resolveSkillReference(cwd, input.skill, deps.fileExists, deps.isDirectory)
           if (!skillRef.ok) {
             return { output: skillRef.failureOutput }
           }
@@ -2152,56 +3274,174 @@ export function createDelegateCommandTool(
         if (resolvedSkill !== null) {
           sections.push(renderSkillDirective(resolvedSkill))
         }
+
+        // ── Model-matrix selection (model-matrix-delegation D2/D8, task
+        // 5.2) ──
+        // Runs after skill resolution and before host introspection, so a
+        // rejected selection costs one tool round-trip and zero child
+        // sessions (same fail-closed position as the skill check above).
+        // The classifier prompt is the base sections plus the extra
+        // prompt — deliberately WITHOUT the pack directive, which is
+        // selection-dependent and cannot participate in its own
+        // selection's input (the circularity D5 rules out); the base
+        // sections also make the cache key stable across selections.
+        const classifierPrompt =
+          input.prompt !== undefined ? [...sections, input.prompt].join("\n\n") : sections.join("\n\n")
+
+        // Zero-config probe (D8): loadModelMatrix treats an absent file as
+        // "absent" (ENOENT through the read seam), a present file parses
+        // and validates through the injected YAML seam, and a structurally
+        // invalid file reports "invalid" — which fails closed here rather
+        // than silently falling back to the host model (a misconfigured
+        // matrix must be loud). Relative matrix paths resolve against the
+        // repository root, mirroring the review-dispatch readText
+        // convention; pack-file existence probes go through the same
+        // fileExists seam expected-artifact verification uses.
+        const load = await loadModelMatrix({
+          readText: (relativePath) => deps.readText(resolve(cwd, relativePath)),
+          parseYaml: deps.modelMatrix.parseYaml,
+          fileExists: (relativePath) => deps.fileExists(resolve(cwd, relativePath)),
+        })
+        if (load.status === "invalid") {
+          return {
+            output: JSON.stringify(
+              failure(
+                `Model matrix at .uf/model-matrix.yaml is structurally invalid: ${load.error}. ` +
+                  "Remediation: fix the matrix file (or remove it to fall back to the host model); " +
+                  "retrying will not fix this.",
+                { retryable: false, code: "MATRIX_INVALID" },
+              ),
+            ),
+          }
+        }
+        const matrix: ModelMatrix | null = load.status === "ok" ? load.matrix : null
+
+        // The classifier cascade is constructed per invocation so its
+        // agent-engine spawn binds this invocation's parent-session
+        // context; it shares the per-tool-instance cache (see factory).
+        // classify() never throws and never blocks selection — engine
+        // failures degrade to the static fallback inside the cascade.
+        const cascade = new ClassifierCascade({
+          spawnAgent: (agent, prompt, signal) =>
+            deps.modelMatrix.spawnClassifierAgent(
+              {
+                sessionID: context.sessionID,
+                messageID: context.messageID,
+                directory: context.directory,
+              },
+              agent,
+              prompt,
+              signal,
+            ),
+          fetch: deps.modelMatrix.classifierFetch,
+          readEnv: deps.modelMatrix.classifierReadEnv,
+          cache: classifierCache,
+        })
+        const selectionInputs = {
+          model: input.model,
+          variant: input.variant,
+          profile: input.profile,
+          pack: input.pack,
+          checkpoint_step: input.checkpoint_step,
+          agent: input.agent,
+        }
+        const outcome = await cascade.classify(matrix, {
+          inputs: selectionInputs,
+          feature_dir: input.feature_dir ?? null,
+          prompt: classifierPrompt,
+        })
+        const resolution = resolveSelection(matrix, selectionInputs, outcome)
+        if (!resolution.ok) {
+          // Non-retryable, pre-spawn: unknown profile, invalid pack, or a
+          // selection param with no matrix configured. The selection
+          // failure code carries the lib's precise reason.
+          return {
+            output: JSON.stringify(
+              failure(
+                `${resolution.error}. Remediation: fix the selection parameter or the matrix at ` +
+                  ".uf/model-matrix.yaml; retrying will not fix this.",
+                { retryable: false, code: resolution.code },
+              ),
+            ),
+          }
+        }
+        const selection: SelectionResult = resolution.selection
+
+        // The pack directive renders at its fixed position (D6): after the
+        // skill directive, immediately before the extra prompt — for
+        // every call whose selection carries a pack, whether explicitly
+        // supplied, profile-resolved, or classifier-selected.
+        if (selection.pack !== null) {
+          sections.push(renderPackDirective(selection.pack))
+        }
         if (input.prompt !== undefined) {
           sections.push(input.prompt)
         }
         const promptText = sections.join("\n\n")
 
-        // Resolve the host model through parent-session introspection so the
-        // child replays the parent's active model and variant.
-        let host: Awaited<ReturnType<typeof resolveHostModel>>
-        try {
-          host = await resolveHostModel(
-            {
-              client: deps.client,
-              sessionID: context.sessionID,
-              messageID: context.messageID,
-              directory: context.directory,
-            },
-            context.abort,
-          )
-        } catch (err: unknown) {
-          if (context.abort.aborted) {
-            return {
-              output: JSON.stringify(
-                failure("uf_delegate_command run was cancelled", {
-                  retryable: false,
-                  code: "DELEGATE_CANCELLED",
-                }),
-              ),
-            }
-          }
-          if (err instanceof StructuralHostModelError) {
-            return {
-              output: JSON.stringify(
-                failure(
-                  `${err.message}. Remediation: ${err.remediation}; retrying will not fix this.`,
-                  { retryable: false, code: "HOST_MODEL_UNAVAILABLE" },
+        // Resolve the child model: a matrix/explicit selection
+        // (MM-FR-003 steps 1-6) supplies the provider/model identity
+        // directly and skips host introspection entirely; host fallback
+        // (step 7, and the zero-config default) preserves the pre-change
+        // variant-fallback and structural-failure semantics verbatim.
+        let childModel: ModelIdentity
+        let childVariant: string | undefined
+        if (selection.model !== null) {
+          // Shape was validated at input (explicit) or in the matrix
+          // schema (profiles), so directModelIdentity cannot split an
+          // invalid identity here.
+          childModel = directModelIdentity(selection.model)
+          childVariant = selection.variant ?? undefined
+        } else {
+          let host: Awaited<ReturnType<typeof resolveHostModel>>
+          try {
+            host = await resolveHostModel(
+              {
+                client: deps.client,
+                sessionID: context.sessionID,
+                messageID: context.messageID,
+                directory: context.directory,
+              },
+              context.abort,
+            )
+          } catch (err: unknown) {
+            if (context.abort.aborted) {
+              return {
+                output: JSON.stringify(
+                  failure("uf_delegate_command run was cancelled", {
+                    retryable: false,
+                    code: "DELEGATE_CANCELLED",
+                  }),
                 ),
-              ),
+              }
             }
+            if (err instanceof StructuralHostModelError) {
+              return {
+                output: JSON.stringify(
+                  failure(
+                    `${err.message}. Remediation: ${err.remediation}; retrying will not fix this.`,
+                    { retryable: false, code: "HOST_MODEL_UNAVAILABLE" },
+                  ),
+                ),
+              }
+            }
+            return { output: failureFromError(err, "HOST_MODEL_UNAVAILABLE", true) }
           }
-          return { output: failureFromError(err, "HOST_MODEL_UNAVAILABLE", true) }
+          childModel = host.identity
+          childVariant = host.variant
         }
 
         // Content delegation writes files (plans, tasks, code), so the
         // provenance records read_only: false, unlike review invocations.
+        // requested_model/requested_variant carry the explicit selection
+        // params; resolved_parent_model carries the model the child
+        // actually ran on (matrix-resolved or host, D7).
         const provenance: InvocationProvenance = {
           agent: input.agent,
-          requested_model: null,
-          requested_variant: null,
-          resolved_parent_model: host.identity.combined,
-          resolved_parent_variant: host.variant ?? null,
+          requested_model: input.model ?? null,
+          requested_variant: input.variant ?? null,
+          resolved_parent_model: childModel.combined,
+          resolved_parent_variant: childVariant ?? null,
           reported_child_model: null,
           model_mismatch: false,
           read_only: false,
@@ -2215,11 +3455,12 @@ export function createDelegateCommandTool(
             directory: context.directory,
             parentAbort: context.abort,
             timeoutMilliseconds: input.timeout ?? DEFAULT_TIMEOUT_MILLISECONDS,
+            idleTimeoutMilliseconds: input.idle_timeout ?? DEFAULT_DELEGATE_IDLE_TIMEOUT_MS,
           },
           input.agent,
           promptText,
-          host.identity,
-          host.variant,
+          childModel,
+          childVariant,
           false,
           provenance,
         )
@@ -2236,12 +3477,22 @@ export function createDelegateCommandTool(
           // executor created one, so callers can inspect the failed or
           // wedged child subtree directly from the delegation result
           // (the field is omitted when no child session ever existed).
+          // Limit-ended runs also carry the timeout classification and,
+          // for command-path delegations, the durable resume state
+          // (delegation-timeout-budgets D4).
           return {
-            output: JSON.stringify(
-              result.childSessionID !== undefined
-                ? { ...envelope, child_session_id: result.childSessionID }
-                : envelope,
-            ),
+            output: JSON.stringify({
+              ...envelope,
+              ...(result.childSessionID !== undefined ? { child_session_id: result.childSessionID } : {}),
+              ...(result.timeout !== undefined
+                ? {
+                    timeout: result.timeout satisfies TimeoutDetails,
+                    ...(input.command_path !== undefined
+                      ? { resume: readDelegateResumeState(exec, cwd, input.command_path) }
+                      : {}),
+                  }
+                : {}),
+            }),
           }
         }
 
@@ -2298,6 +3549,28 @@ export function createDelegateCommandTool(
           if (input.skill_absent_reason !== undefined) {
             checkpointData.skill_absent_reason = input.skill_absent_reason
           }
+          // Model-matrix-delegation D7 (task 5.4, MM-FR-007): the
+          // selection audit trail. selection_source is recorded for every
+          // checkpointed delegation (zero-config calls record "host");
+          // the remaining fields ride along only when they carry values,
+          // so calls that never touch the matrix keep the pre-change
+          // checkpoint shape plus selection_source.
+          checkpointData.selection_source = selection.selection_source
+          if (selection.pack !== null) {
+            checkpointData.selection_pack = selection.pack
+          }
+          if (selection.capability !== null) {
+            checkpointData.selection_capability = selection.capability
+          }
+          if (selection.model !== null) {
+            checkpointData.selection_model = selection.model
+          }
+          if (selection.confidence !== null) {
+            checkpointData.selection_confidence = selection.confidence
+          }
+          if (selection.fallback_reason !== null) {
+            checkpointData.selection_fallback_reason = selection.fallback_reason
+          }
           recordAutoCheckpoint(cwd, key, "uf.unleash", input.checkpoint_step, checkpointData)
           checkpointRecorded = true
         }
@@ -2314,6 +3587,17 @@ export function createDelegateCommandTool(
           task_classification: input.task_classification ?? null,
           skill: resolvedSkill,
           skill_absent_reason: input.skill_absent_reason ?? null,
+          // Model-matrix-delegation D7 (task 5.4, MM-FR-007): the same
+          // selection audit fields the checkpoint records, surfaced
+          // machine-parseably in the success envelope. selection_source
+          // is always present; the rest are null when selection resolved
+          // no value for them (host fallback carries only the source).
+          selection_source: selection.selection_source,
+          selection_pack: selection.pack,
+          selection_capability: selection.capability,
+          selection_model: selection.model,
+          selection_confidence: selection.confidence,
+          selection_fallback_reason: selection.fallback_reason,
           usage: result.usage,
           provenance: result.provenance,
           text: result.text,
@@ -4900,6 +6184,144 @@ export function createPersistUnleashSummaryTool(exec: GitExec, cwd: string): Ret
 }
 
 // ---------------------------------------------------------------------------
+// uf_preflight_declared_checks tool
+// ---------------------------------------------------------------------------
+
+export type { DeclaredChecksData } from "../../lib/preflight-declared.js"
+
+/** True when the path is an executable regular file. */
+function isExecutableFile(path: string): boolean {
+  try {
+    if (!statSync(path).isFile()) {
+      return false
+    }
+    accessSync(path, fsConstants.X_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** True when the path is a regular file (follows symlinks). */
+function isRegularFile(path: string): boolean {
+  try {
+    return statSync(path).isFile()
+  } catch {
+    return false
+  }
+}
+
+/** Output budget for one declared check before execFile kills it. */
+export const PREFLIGHT_MAX_BUFFER_BYTES = 64 * 1024 * 1024
+
+/**
+ * Map an execFile completion onto a ProcessResult. stdout and stderr are
+ * concatenated (stdout first). Three failure classes:
+ * - timeout: execFile killed the child (`killed` + a signal) -> exit 124,
+ *   timedOut true;
+ * - output limit: `code` is ERR_CHILD_PROCESS_STDIO_MAXBUFFER (Node and
+ *   Bun; `killed` is not set) -> exit 1 with an annotation, timedOut false;
+ * - ordinary exit: numeric `code` passes through.
+ */
+export function processResultFromExecFile(error: Error | null, stdout: string, stderr: string): ProcessResult {
+  const output = [stdout, stderr].filter((part) => part.length > 0).join("\n")
+  if (error === null) {
+    return { exitCode: 0, output, timedOut: false }
+  }
+  const failed = error as NodeJS.ErrnoException & { code?: number | string | null; killed?: boolean; signal?: string | null }
+  if (failed.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+    return { exitCode: 1, output: `${output}\n[output limit exceeded: ${failed.message}]`, timedOut: false }
+  }
+  const timedOut = failed.killed === true && failed.signal !== undefined && failed.signal !== null
+  const exitCode = typeof failed.code === "number" ? failed.code : 1
+  return { exitCode: timedOut ? 124 : exitCode, output: output || failed.message, timedOut }
+}
+
+/** Run an executable with an argv list and no shell; see processResultFromExecFile. */
+export function runProcessNoShell(
+  file: string,
+  args: readonly string[],
+  cwd: string,
+  timeoutMs: number,
+  env: Readonly<Record<string, string>>,
+  maxBuffer: number = PREFLIGHT_MAX_BUFFER_BYTES,
+): Promise<ProcessResult> {
+  return new Promise((resolvePromise) => {
+    execFile(
+      file,
+      [...args],
+      { cwd, env: { ...process.env, ...env }, timeout: timeoutMs, maxBuffer, encoding: "utf8", shell: false },
+      (error, stdout, stderr) => resolvePromise(processResultFromExecFile(error, stdout, stderr)),
+    )
+  })
+}
+
+/** Production dependencies for uf_preflight_declared_checks. */
+export function createPreflightDeclaredDependencies(): PreflightDeclaredDependencies {
+  return {
+    readText: (path: string) => readFile(path, "utf8"),
+    fileExists: isRegularFile,
+    isExecutable: isExecutableFile,
+    // Resolved at registration, like uf_delegate_command's matrix parser.
+    parseYaml: createBunYamlParser(),
+    pathEnv: process.env.PATH ?? "",
+    git: defaultGitExec,
+    runProcess: runProcessNoShell,
+    makeTempDir: () => mkdtemp(resolve(tmpdir(), "uf-preflight-baseline-")),
+    removeDir: (path: string) => rm(path, { recursive: true, force: true }),
+  }
+}
+
+/**
+ * Factory for uf_preflight_declared_checks: the pre-flight skill's
+ * Phase 2b as one deterministic call (determinism pack DE-001/DE-003/
+ * DE-005). Parses and validates `.uf/preflight.yaml`, probes `requires`
+ * binaries on PATH and the `run` executable, applies the diff-scope
+ * filter, runs each in-scope check as an argv list without a shell, maps
+ * `required`/`advisory` onto statuses, and returns structured results
+ * plus tool-rendered Execution Results rows and per-check output blocks.
+ *
+ * Failure codes: INVALID_PREFLIGHT_CONFIG (no check ran),
+ * PREFLIGHT_DECLARED_FAILED (unexpected error).
+ */
+export function createPreflightDeclaredChecksTool(cwd: string, deps: PreflightDeclaredDependencies): ReturnType<typeof tool> {
+  return tool({
+    description:
+      "Pre-flight Phase 2b: run the project-declared checks in .uf/preflight.yaml. " +
+      "Validates the file, skips checks whose requires/run are unavailable or whose " +
+      "paths miss the branch diff, runs the rest without a shell, and returns " +
+      "{mode, config_present, scope, checks[], required_failures[], verdict, " +
+      "baseline_method, rendered, rendered_output}. In soft-gate mode required " +
+      "failures are re-run in a merge-base worktree and classified branch-caused / " +
+      "pre-existing / unknown. `rendered` holds the Execution Results rows to " +
+      "insert verbatim; `rendered_output` holds one fenced, untrusted-labelled " +
+      "output block per check that ran with output, to insert verbatim under " +
+      "\"Project-declared check output\"; `verdict` is the declared checks' " +
+      "contribution to the pre-flight verdict; advisory rows never affect it. Failure " +
+      "code INVALID_PREFLIGHT_CONFIG means the file is invalid and no check ran.",
+    args: {
+      mode: z.enum(PREFLIGHT_MODES).describe("Pre-flight execution policy chosen by the consuming command."),
+    },
+    execute: async (args: { mode: (typeof PREFLIGHT_MODES)[number] }) => {
+      try {
+        const data: DeclaredChecksData = await runDeclaredChecks(cwd, deps, args.mode)
+        return { output: JSON.stringify(success(data)) }
+      } catch (error) {
+        if (error instanceof PreflightConfigError) {
+          return { output: JSON.stringify(failure(error.message, { retryable: false, code: "INVALID_PREFLIGHT_CONFIG" })) }
+        }
+        const message = error instanceof Error ? error.message : String(error)
+        return {
+          output: JSON.stringify(
+            failure(`Project-declared pre-flight checks failed: ${message}`, { retryable: false, code: "PREFLIGHT_DECLARED_FAILED" }),
+          ),
+        }
+      }
+    },
+  })
+}
+
+// ---------------------------------------------------------------------------
 // Plugin entry point
 // ---------------------------------------------------------------------------
 
@@ -4925,12 +6347,29 @@ const UfWorkflowPlugin = {
         git_conflict_files: createGitConflictFilesTool(defaultGitExec, cwd),
         git_commit_no_edit: createGitCommitNoEditTool(defaultGitExec, cwd),
         uf_unleash_branch_gate: createUnleashBranchGateTool(defaultGitExec, cwd, defaultFileExists),
+        uf_preflight_declared_checks: createPreflightDeclaredChecksTool(cwd, createPreflightDeclaredDependencies()),
         uf_unleash_route_decision: createUnleashRouteDecisionTool(defaultGitExec, cwd),
         uf_unleash_resolve_issue: createUnleashResolveIssueTool(defaultGhRunner, cwd),
+        checkout_pr_head: createCheckoutPrHeadTool(defaultGitExec, defaultGhRunner, cwd),
+        post_feedback_replies: createPostFeedbackRepliesTool(feedbackReplyDeps(cwd)),
+        file_feedback_issue: createFileFeedbackIssueTool(feedbackReplyDeps(cwd)),
+        post_issue_comment: createPostIssueCommentTool({ gh: defaultFeedbackGhExec, cwd }),
+        create_child_issue: createCreateChildIssueTool({ gh: defaultFeedbackGhExec, cwd }),
         uf_delegate_command: createDelegateCommandTool(defaultGitExec, cwd, {
           client: input.client,
           readText: (path: string) => readFile(path, "utf8"),
           fileExists: defaultFileExists,
+          // Model-matrix-delegation D5 (task 5.2): production selection
+          // seams. The classifier runs on the host-resolved session model
+          // (MM-FR-005); spawnClassifierAgentSession owns that resolution
+          // so it stays independent of the delegation's own selection.
+          modelMatrix: {
+            parseYaml: createBunYamlParser(),
+            classifierFetch: fetch,
+            classifierReadEnv: (name: string) => process.env[name],
+            spawnClassifierAgent: (context, agent, prompt, signal) =>
+              spawnClassifierAgentSession(input.client, context, agent, prompt, signal),
+          },
         }),
         uf_unleash_detect_resume: createUnleashDetectResumeTool(defaultGitExec, cwd, {
           readText: (path: string) => readFile(path, "utf8"),
