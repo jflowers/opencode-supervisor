@@ -5,6 +5,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.10.0] - 2026-11-14
+
 ### Added
 
 - Legacy environment-variable warning (FR-076, #8): when any 1.x
