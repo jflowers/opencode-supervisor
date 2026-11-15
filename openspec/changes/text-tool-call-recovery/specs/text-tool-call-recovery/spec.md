@@ -65,9 +65,18 @@ session idle.
 
 ### Requirement: FR-093 side sessions and duplicate idles
 
-The supervisor MUST NOT check its own side sessions. A message
-already checked MUST NOT be checked again, so the two idle
-notifications of one turn steer at most once.
+The supervisor MUST NOT check its own side sessions. A detection
+in a subagent session (one with a parent) MUST be logged and MUST
+NOT be corrected, since its parent already holds the final text
+as the task result. A message already checked MUST NOT be checked
+again, so the two idle notifications of one turn steer at most
+once.
+
+#### Scenario: subagent session
+
+- **GIVEN** a session whose parent is another session
+- **WHEN** its last turn ends with a text tool call
+- **THEN** the detection is logged and no message is sent
 
 #### Scenario: double idle
 
