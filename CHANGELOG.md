@@ -5,6 +5,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.11.0] - 2026-11-15
+
 ### Added
 
 - Text tool-call recovery (FR-090..FR-095, #65), on by default: when
