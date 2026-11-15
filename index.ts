@@ -126,6 +126,13 @@ import {
 import { createPluginLogger, silentPluginLogger, type PluginLogger } from './src/plugin-log.ts';
 import { PLUGIN_ID } from './src/plugin-id.ts';
 import {
+  DEFAULT_TEXT_TOOL_CALL,
+  assessLastTurn,
+  textToolCallMessage,
+  type TextToolCallConfig,
+  type TurnMessage,
+} from './src/text-tool-call.ts';
+import {
   MAX_PROFILE_ANCESTRY,
   normalizeCommand,
   sanitizeNonGlobalTier,
@@ -179,6 +186,8 @@ const ENV_MODE = 'OPENCODE_SUPERVISOR_MODE';
 const ENV_REPAIR_MODEL = 'OPENCODE_SUPERVISOR_REPAIR_MODEL';
 const ENV_EXTERNAL_ACCESS = 'OPENCODE_SUPERVISOR_EXTERNAL_ACCESS';
 const ENV_EXTERNAL_ACCESS_READ_POLICY = 'OPENCODE_SUPERVISOR_EXTERNAL_ACCESS_READ_POLICY';
+const ENV_TEXT_TOOL_CALL = 'OPENCODE_SUPERVISOR_TEXT_TOOL_CALL';
+const ENV_TEXT_TOOL_CALL_MAX = 'OPENCODE_SUPERVISOR_TEXT_TOOL_CALL_MAX';
 
 /**
  * Hook-layer configuration: the auditor's `AuditConfig` plus the memo
@@ -202,6 +211,8 @@ export interface HookConfig extends AuditConfig {
   argRepair: ArgRepairConfig;
   /** External-access supervision (FR-088): off by default; reads pass unless `readPolicy: 'gate'`. */
   externalAccess: ExternalAccessConfig;
+  /** Text tool-call recovery (FR-090..FR-095): on by default, bounded corrections in a row. */
+  textToolCall: TextToolCallConfig;
 }
 
 /**
@@ -224,6 +235,7 @@ export const pluginConfig: HookConfig = {
   mode: 'full',
   argRepair: { ...DEFAULT_ARG_REPAIR, tools: [...DEFAULT_ARG_REPAIR.tools] },
   externalAccess: { ...DEFAULT_EXTERNAL_ACCESS },
+  textToolCall: { ...DEFAULT_TEXT_TOOL_CALL },
 };
 
 /**
@@ -316,7 +328,8 @@ function argRepairOverrides(value: unknown): Partial<ArgRepairConfig> {
   return typeof value === 'object' && value !== null ? (value as Partial<ArgRepairConfig>) : {};
 }
 
-function externalAccessOverrides(value: unknown): Record<string, unknown> {
+/** A nested override object (`externalAccess`, `textToolCall`), or `{}`. */
+function objectOverrides(value: unknown): Record<string, unknown> {
   return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {};
 }
 
@@ -387,7 +400,8 @@ export function resolveHookConfig(
     locked && value === 'allow' ? undefined : value;
   const memoOverrides = memoLimitOverrides(overrides.memoLimits);
   const repairOverrides = argRepairOverrides(overrides.argRepair);
-  const accessOverrides = externalAccessOverrides(overrides.externalAccess);
+  const accessOverrides = objectOverrides(overrides.externalAccess);
+  const textCallOverrides = objectOverrides(overrides.textToolCall);
   const base = resolveAuditorConfig(pluginConfig, session);
   const auditorModel = tiered(
     base.auditorModel,
@@ -513,6 +527,23 @@ export function resolveHookConfig(
         ) ??
         pluginConfig.externalAccess.readPolicy,
     },
+    // FR-094: not a guard, so the lock leaves it alone.
+    textToolCall: {
+      enabled:
+        pickBoolean(textCallOverrides.enabled) ??
+        envBoolean(ENV_TEXT_TOOL_CALL) ??
+        tiered(sources.project?.textToolCall?.enabled, sources.options?.textToolCall?.enabled, sources.global?.textToolCall?.enabled) ??
+        pluginConfig.textToolCall.enabled,
+      maxPerSession:
+        pickNumber(textCallOverrides.maxPerSession) ??
+        envNumber(ENV_TEXT_TOOL_CALL_MAX) ??
+        tiered(
+          sources.project?.textToolCall?.maxPerSession,
+          sources.options?.textToolCall?.maxPerSession,
+          sources.global?.textToolCall?.maxPerSession
+        ) ??
+        pluginConfig.textToolCall.maxPerSession,
+    },
   };
 }
 
@@ -627,6 +658,16 @@ export interface SessionState {
   pendingAccessRequests: AccessRequest[];
   /** Monotonic request-id sequence: ids are `ax<n>` and never recycled. */
   accessRequestSeq: number;
+  /**
+   * Text tool-call corrections in a row (FR-092, design D4): a clean
+   * idle check or a human-typed message resets it; the bound is
+   * `textToolCall.maxPerSession`.
+   */
+  textToolCallStreak: number;
+  /** The last assistant message the idle check assessed (FR-093): the two idle notifications of a turn check it once. */
+  textToolCallChecked: string | undefined;
+  /** True while an idle check runs (FR-093), set before any await so concurrent idles cannot both steer. */
+  textToolCallInFlight: boolean;
 }
 
 /** Module-level state (design D4), keyed by session ID. */
@@ -661,6 +702,9 @@ function emptySessionState(): SessionState {
     externalGrants: [],
     pendingAccessRequests: [],
     accessRequestSeq: 0,
+    textToolCallStreak: 0,
+    textToolCallChecked: undefined,
+    textToolCallInFlight: false,
   };
 }
 
@@ -2305,6 +2349,102 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
     }
   };
 
+  /**
+   * Text tool-call recovery (FR-090..FR-095, design D2-D4): on idle,
+   * reads the session's last message; when it is an assistant turn
+   * whose last text writes a call to a registered tool and no tool
+   * part follows, steers the session through `promptAsync` to make the
+   * real call. Bounded in a row by `textToolCall.maxPerSession`;
+   * deduped per message; never throws (FR-095).
+   */
+  const recoverTextToolCall = async (sessionID: string, state: SessionState): Promise<void> => {
+    if (state.textToolCallInFlight) {
+      return;
+    }
+    state.textToolCallInFlight = true;
+    try {
+      const config = await buildConfig();
+      if (!config.textToolCall.enabled) {
+        return;
+      }
+      const response = await input.client.session.messages({ path: { id: sessionID } });
+      const messages = response.data;
+      if (!Array.isArray(messages)) {
+        return;
+      }
+      const last = messages[messages.length - 1];
+      if (last === undefined || last.info.role !== 'assistant') {
+        return;
+      }
+      const messageID = last.info.id;
+      if (messageID !== undefined && messageID === state.textToolCallChecked) {
+        return; // FR-093: the turn's second idle notification
+      }
+      const identity =
+        state.modelIdentity ??
+        (last.info.providerID !== '' && last.info.modelID !== ''
+          ? { providerID: last.info.providerID, modelID: last.info.modelID }
+          : undefined);
+      if (identity === undefined) {
+        return;
+      }
+      const toolsList = await fetchToolSchemas(identity.providerID, identity.modelID);
+      if (toolsList === null) {
+        return; // fail open (FR-095); fetchToolSchemas logged it
+      }
+      const toolIds = new Set<string>(toolsList.map((entry) => entry.id));
+      for (const name of Object.keys(hooks.tool ?? {})) {
+        toolIds.add(name);
+      }
+      const assessment = assessLastTurn(messages as unknown as TurnMessage[], toolIds);
+      state.textToolCallChecked = messageID;
+      if (assessment === null) {
+        return;
+      }
+      if (assessment.detection === null) {
+        state.textToolCallStreak = 0;
+        return;
+      }
+      const call = assessment.detection;
+      logger.warn(`text tool call detected in session ${sessionID}: '${call.tool}' written as ${call.shape} text`);
+      // Design D7: a subagent's parent already received its final text
+      // as the task result, so a steer would run a turn nobody reads.
+      if ((await resolveParent(sessionID)) !== null) {
+        logger.warn(`session ${sessionID} is a subagent session; no correction sent (its parent has the result)`);
+        return;
+      }
+      const bound = config.textToolCall.maxPerSession;
+      if (state.textToolCallStreak >= bound) {
+        logger.warn(
+          `text tool-call correction bound (${bound}) reached for session ${sessionID}; the session stays idle`
+        );
+        return;
+      }
+      // Reserve the slot before the await (design D4); released when
+      // delivery fails, so only delivered corrections count (FR-095).
+      state.textToolCallStreak += 1;
+      try {
+        const delivered = await input.client.session.promptAsync({
+          path: { id: sessionID },
+          body: { parts: [{ type: 'text', text: textToolCallMessage(call), synthetic: true }] },
+        });
+        if (delivered.error !== undefined && delivered.error !== null) {
+          throw new Error(responseFailure('text tool-call correction failed', delivered));
+        }
+        logger.info(
+          `text tool-call correction ${state.textToolCallStreak}/${bound} sent to session ${sessionID}: make the '${call.tool}' call`
+        );
+      } catch (error) {
+        state.textToolCallStreak -= 1;
+        logger.error(`text tool-call correction failed open: ${errorText(error)}`);
+      }
+    } catch (error) {
+      logger.error(`text tool-call check failed open: ${errorText(error)}`);
+    } finally {
+      state.textToolCallInFlight = false;
+    }
+  };
+
   const hooks: Hooks = {
     /**
      * Reasoning observation (design D1; spike 1.1, tasks 3.2–3.3).
@@ -2343,6 +2483,9 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
             if (idle.command !== undefined) {
               idle.commandEnded = true;
             }
+            // FR-090..FR-095: a turn that ended with a tool call
+            // written as text gets a bounded correction.
+            await recoverTextToolCall(idleSessionID, idle);
           }
           return;
         }
@@ -2484,6 +2627,11 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         if (state.commandEnded && userMessageText(output?.parts) !== '') {
           state.command = undefined;
           state.commandEnded = false;
+        }
+        // FR-092: a human-typed message starts a fresh run of text
+        // tool-call corrections; the plugin's synthetic steer does not.
+        if (userMessageText(output?.parts) !== '') {
+          state.textToolCallStreak = 0;
         }
         // Tool-arg repair: capture the session's model identity in every
         // mode — it drives the per-model tool-schema lookup.

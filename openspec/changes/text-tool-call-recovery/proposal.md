@@ -29,7 +29,9 @@ looks finished. In unbound-force/unbound-force#1013 two
   ends cleanly or a human-typed message resets the run. At the
   cap the session stays idle and one warning is logged.
 - FR-093 (new): plugin side sessions (auditor, repair) are never
-  checked; one idle burst checks a message at most once.
+  checked; a subagent session's detection is logged, not
+  corrected (its parent already has the result); one idle burst
+  checks a message at most once.
 - FR-094 (new): `textToolCall.enabled` (default `true`) and
   `textToolCall.maxPerSession`, through the usual precedence
   chain, with env `OPENCODE_SUPERVISOR_TEXT_TOOL_CALL` and

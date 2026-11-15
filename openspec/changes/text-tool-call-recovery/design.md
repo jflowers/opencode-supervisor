@@ -67,6 +67,14 @@ registered), so the `event` hook stays unregistered there.
 through session → env → project file → options → global file →
 default. It is not a guard, so `lockGuards` does not touch it.
 
+### D7: Root sessions only
+
+A subagent session's final text is already its parent's `task`
+result when it goes idle, so a steer would run a turn nobody
+reads. A detection in a session with a parent is logged and not
+corrected; the parent sees the text in the result. A failed
+parent lookup counts as a root session.
+
 ## Risks
 
 - A message that quotes a tool call outside code, naming a real

@@ -20,6 +20,7 @@ import type { AuditorVariant } from './auditor.ts';
 import { READ_POLICIES, type ExternalAccessConfig, type ReadPolicy } from './external-access.ts';
 import type { MemoLimits } from './memo.ts';
 import type { StripMode } from './stripper.ts';
+import type { TextToolCallConfig } from './text-tool-call.ts';
 
 /**
  * Read bound for supervisor config files, mirroring the approvals
@@ -60,6 +61,8 @@ export interface SupervisorFileConfig {
   lockGuards?: boolean;
   /** External-access supervision (FR-088); unset keys fall through to the next tier. */
   externalAccess?: Partial<ExternalAccessConfig>;
+  /** Text tool-call recovery (FR-094); unset keys fall through to the next tier. */
+  textToolCall?: Partial<TextToolCallConfig>;
 }
 
 /** Parse outcome: the accepted subset, or an error when rejected. */
@@ -292,6 +295,23 @@ export const validateSupervisorConfig = (value: unknown): ParsedSupervisorConfig
       externalAccess.readPolicy = readPolicy as ReadPolicy;
     }
     config.externalAccess = externalAccess;
+  }
+
+  // FR-094: text tool-call recovery knobs; unknown inner keys are
+  // ignored, a wrong-typed value rejects the tier.
+  const textToolCallRaw = value.textToolCall;
+  if (textToolCallRaw !== undefined) {
+    if (!isRecord(textToolCallRaw)) {
+      return reject('"textToolCall" must be an object');
+    }
+    const textToolCall: Partial<TextToolCallConfig> = {};
+    const enabled = optionalBoolean(textToolCallRaw, 'enabled');
+    if (enabled.error !== null) return reject('"textToolCall.enabled" must be a boolean');
+    if (enabled.value !== undefined) textToolCall.enabled = enabled.value;
+    const maxPerSession = optionalNumber(textToolCallRaw, 'maxPerSession');
+    if (maxPerSession.error !== null) return reject('"textToolCall.maxPerSession" must be a non-negative integer');
+    if (maxPerSession.value !== undefined) textToolCall.maxPerSession = maxPerSession.value;
+    config.textToolCall = textToolCall;
   }
 
   // FR-073 (design D2): profiles validate one by one — a bad
