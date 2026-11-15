@@ -128,7 +128,12 @@ import { PLUGIN_ID } from './src/plugin-id.ts';
 import {
   DEFAULT_TEXT_TOOL_CALL,
   assessLastTurn,
+  lastTextOf,
+  parseTaskResult,
+  replaceTaskResult,
+  subagentTextToolCallNote,
   textToolCallMessage,
+  type TextToolCall,
   type TextToolCallConfig,
   type TurnMessage,
 } from './src/text-tool-call.ts';
@@ -2411,10 +2416,11 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
       }
       const call = assessment.detection;
       logger.warn(`text tool call detected in session ${sessionID}: '${call.tool}' written as ${call.shape} text`);
-      // Design D7: a subagent's parent already received its final text
-      // as the task result, so a steer would run a turn nobody reads.
+      // Design D7 / FR-093: a subagent's parent already holds its final
+      // text as the task result, so a steer here would run a turn nobody
+      // reads; the parent's task boundary corrects it (FR-096).
       if ((await resolveParent(sessionID)) !== null) {
-        logger.warn(`session ${sessionID} is a subagent session; no correction sent (its parent has the result)`);
+        logger.info(`session ${sessionID} is a subagent session; correction is handled at its parent's task call`);
         return;
       }
       const bound = config.textToolCall.maxPerSession;
@@ -2449,6 +2455,138 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
       logger.error(`text tool-call check failed open: ${errorText(error)}`);
     } finally {
       state.textToolCallInFlight = false;
+    }
+  };
+
+  /**
+   * Subagent text tool-call recovery (FR-096..FR-098, subagent design
+   * D1-D5): runs in the parent's `tool.execute.after` for a completed
+   * foreground `task` call, after the subagent's turn ends and before
+   * OpenCode hands the (mutable) output to the parent. A subagent whose
+   * last turn wrote a tool call as text is prompted synchronously with
+   * the correction under its own agent and model, bounded in a row by
+   * `textToolCall.maxPerSession`; the parent's result then carries the
+   * corrected final text, or a note when the call still never ran.
+   * Never throws; before a detection the output is left untouched.
+   */
+  const recoverSubagentTask = async (output: unknown): Promise<void> => {
+    const record = output as { output?: unknown; metadata?: unknown } | null;
+    if (record === null || typeof record !== 'object' || typeof record.output !== 'string') {
+      return;
+    }
+    const metadata = (
+      record.metadata !== null && typeof record.metadata === 'object' ? record.metadata : {}
+    ) as { sessionId?: unknown; background?: unknown };
+    const childID = metadata.sessionId;
+    if (metadata.background === true || typeof childID !== 'string' || childID === '' || isAuditorSessionId(childID)) {
+      return; // FR-098: background runs inject their result later
+    }
+    const originalBody = parseTaskResult(record.output);
+    if (originalBody === null) {
+      return; // FR-098: not a completed task result
+    }
+    let pending: TextToolCall | null = null;
+    let corrected: string | null = null;
+    try {
+      const config = await buildConfig();
+      if (!config.textToolCall.enabled) {
+        return;
+      }
+      const response = await input.client.session.messages({ path: { id: childID }, query: { limit: 1 } });
+      const messages = response.data;
+      let last: TurnMessage | undefined = Array.isArray(messages)
+        ? (messages[messages.length - 1] as unknown as TurnMessage | undefined)
+        : undefined;
+      const info = (last?.info ?? {}) as {
+        role?: unknown;
+        providerID?: unknown;
+        modelID?: unknown;
+        agent?: unknown;
+        mode?: unknown;
+      };
+      if (last === undefined || info.role !== 'assistant') {
+        return;
+      }
+      if (typeof info.providerID !== 'string' || info.providerID === '' || typeof info.modelID !== 'string' || info.modelID === '') {
+        return;
+      }
+      const model = { providerID: info.providerID, modelID: info.modelID };
+      // Design D2: without the subagent's agent OpenCode would answer
+      // the correction with the default agent.
+      const agent =
+        typeof info.agent === 'string' && info.agent !== ''
+          ? info.agent
+          : typeof info.mode === 'string' && info.mode !== ''
+            ? info.mode
+            : undefined;
+      const toolsList = await fetchToolSchemas(model.providerID, model.modelID);
+      if (toolsList === null) {
+        return; // fail open (FR-098); fetchToolSchemas logged it
+      }
+      const toolIds = new Set<string>(toolsList.map((entry) => entry.id));
+      for (const name of Object.keys(hooks.tool ?? {})) {
+        toolIds.add(name);
+      }
+      const state = sessionState.get(childID);
+      const bound = config.textToolCall.maxPerSession;
+      for (;;) {
+        const assessment = assessLastTurn([last], toolIds);
+        if (assessment === null) {
+          break; // an errored or text-less turn: keep what we have
+        }
+        if (assessment.detection === null) {
+          state.textToolCallStreak = 0;
+          pending = null;
+          break;
+        }
+        pending = assessment.detection;
+        logger.warn(
+          `text tool call detected in subagent session ${childID}: '${pending.tool}' written as ${pending.shape} text`
+        );
+        if (state.textToolCallStreak >= bound) {
+          logger.warn(
+            `text tool-call correction bound (${bound}) reached for subagent session ${childID}; the parent gets a note`
+          );
+          break;
+        }
+        state.textToolCallStreak += 1;
+        let reply: { data?: unknown; error?: unknown };
+        try {
+          reply = await input.client.session.prompt({
+            path: { id: childID },
+            body: {
+              ...(agent !== undefined ? { agent } : {}),
+              model,
+              parts: [{ type: 'text', text: textToolCallMessage(pending), synthetic: true }],
+            },
+          });
+          if (reply.error !== undefined && reply.error !== null) {
+            throw new Error(responseFailure('subagent text tool-call correction failed', reply));
+          }
+        } catch (error) {
+          state.textToolCallStreak = Math.max(0, state.textToolCallStreak - 1);
+          logger.error(`subagent text tool-call correction failed open: ${errorText(error)}`);
+          break;
+        }
+        const next = reply.data as TurnMessage | undefined;
+        if (next === undefined || next === null || typeof next !== 'object') {
+          break;
+        }
+        last = next;
+        corrected = lastTextOf(next.parts);
+        logger.info(
+          `text tool-call correction ${state.textToolCallStreak}/${bound} completed in subagent session ${childID}: '${pending.tool}'`
+        );
+      }
+    } catch (error) {
+      logger.error(`subagent text tool-call check failed open: ${errorText(error)}`);
+    }
+    let body = corrected ?? originalBody;
+    if (pending !== null) {
+      body = `${body}\n\n${subagentTextToolCallNote(pending)}`;
+    }
+    if (body !== originalBody) {
+      record.output = replaceTaskResult(record.output, body) ?? record.output;
     }
   };
 
@@ -3100,6 +3238,11 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         // the host, so the agent cannot forge it.
         if (externalAccessAtLoad && hookInput.tool === 'question' && state.pendingAccessRequests.length > 0) {
           mintAccessGrants(hookInput.args, output, state);
+        }
+        // FR-096..FR-098: correct a subagent that wrote a tool call as
+        // text before its result reaches this (parent) session.
+        if (hookInput.tool === 'task') {
+          await recoverSubagentTask(output);
         }
       } catch (error) {
         logger.error(`tool.execute.after hook failed open: ${errorText(error)}`);
