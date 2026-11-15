@@ -5,6 +5,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Text tool-call recovery (FR-090..FR-095, #65), on by default: when
+  a session goes idle and its last assistant turn wrote a call to a
+  registered tool as text (`<invoke name="…">`, `<function_calls>`,
+  `<tool_call>`, or a bare `{"name": …, "arguments": …}` object)
+  with no tool part after it, the supervisor steers the session with
+  one synthetic message asking for the real call. Code blocks and
+  inline code are ignored. At most `textToolCall.maxPerSession`
+  corrections in a row (default 2; a clean turn or a typed message
+  resets it); at the bound the session stays idle with a warning.
+  Subagent sessions are logged, not corrected. Knobs:
+  `textToolCall.enabled` / `OPENCODE_SUPERVISOR_TEXT_TOOL_CALL` and
+  `textToolCall.maxPerSession` /
+  `OPENCODE_SUPERVISOR_TEXT_TOOL_CALL_MAX`.
+
 ## [2.10.0] - 2026-11-14
 
 ### Added
