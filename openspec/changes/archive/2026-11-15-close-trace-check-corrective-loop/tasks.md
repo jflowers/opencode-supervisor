@@ -77,5 +77,9 @@
 - [x] 5.2 docs: README (trace-check sections, knob table),
   CHANGELOG entry, AGENTS.md architecture bullets (FR-069,
   FR-070)
-- [ ] 5.3 `/uf.review-council` (docs #42, blog #43,
+- [x] 5.3 `/uf.review-council` (docs #42, blog #43,
   unbound-force/website capabilities issue), PR
+
+## Archive
+
+Merged in PR #44; `/uf.review-council` ran before merge. Archived 2026-11-15.

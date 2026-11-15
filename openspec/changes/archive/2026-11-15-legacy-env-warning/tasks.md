@@ -21,4 +21,8 @@
 
 - [x] 3.1 both runners green: `bun test` and `npm run test:node`
 - [x] 3.2 docs: README §10.2 note, CHANGELOG Unreleased entry
-- [ ] 3.3 `/uf.review-council`
+- [x] 3.3 `/uf.review-council`
+
+## Archive
+
+Merged in PR #56; `/uf.review-council` ran before merge. Archived 2026-11-15.

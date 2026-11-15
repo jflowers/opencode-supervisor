@@ -64,4 +64,8 @@
   test:node`; `bun run typecheck`; `npm run verify:package`
 - [x] 5.2 docs: CHANGELOG entry, AGENTS.md (structure, new
   modules), README (directive glob anchoring, cap-0 results)
-- [ ] 5.3 `/uf.review-council`
+- [x] 5.3 `/uf.review-council`
+
+## Archive
+
+Merged in PR #57; `/uf.review-council` ran before merge. Archived 2026-11-15.

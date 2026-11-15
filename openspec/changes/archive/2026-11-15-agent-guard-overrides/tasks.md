@@ -47,7 +47,7 @@
 - [x] 5.1 both runners green: `bun test` and
   `node --test test/*.test.ts`
 - [x] 5.2 docs: README, CHANGELOG, AGENTS.md
-- [ ] 5.3 `/uf.review-council` (runs inside OpenCode; draft PR until
+- [x] 5.3 `/uf.review-council` (runs inside OpenCode; draft PR until
   then; docs issue #50, website capabilities issue
   unbound-force/website#412, blog issue #52)
 
@@ -69,3 +69,7 @@
 - [x] 5.7 wildcard exempt globs must start with an MCP server
   prefix
 - [x] 5.8 tests and mutation checks for each fix on both runners
+
+## Archive
+
+Merged in PR #51; `/uf.review-council` ran before merge. Archived 2026-11-15.
