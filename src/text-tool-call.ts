@@ -7,7 +7,10 @@
  * tool call happens, `tool.execute.before` never fires, and the run
  * looks finished. Detection is gated on a registered tool id and
  * ignores code (fenced blocks and inline spans), so prose about tool
- * calls never matches. Pure: no OpenCode imports, no I/O — the hook
+ * calls never matches. Subagents are corrected at their parent's
+ * `task` boundary (FR-096..FR-098), so this module also reads and
+ * rewrites the task tool's result frame. Pure: no OpenCode imports,
+ * no I/O — the hook
  * wiring lives in `index.ts`.
  */
 
@@ -174,5 +177,93 @@ export function textToolCallMessage(call: TextToolCall): string {
   return (
     `[supervisor] Your last message wrote a \`${call.tool}\` tool call as text, so it never ran. ` +
     "Make the actual tool call now; don't repeat the text."
+  );
+}
+
+const COMPLETED_TASK = /^<task id="[^"]*" state="completed">\n/;
+const TASK_RESULT_OPEN = '<task_result>\n';
+const TASK_RESULT_CLOSE = '\n</task_result>';
+
+/**
+ * Locates the result body of a completed `task` tool output (FR-097,
+ * design D3): the text between the frame's `<task_result>` and its
+ * closing tag. The body may itself contain the tag text, so the first
+ * opening and the last closing tag delimit it.
+ *
+ * @param output The `task` tool's output string.
+ * @returns The body's bounds, or null when the output is not a
+ *   completed task result (fail open: the caller skips).
+ */
+function taskResultBounds(output: string): { start: number; end: number } | null {
+  if (!COMPLETED_TASK.test(output)) {
+    return null;
+  }
+  const open = output.indexOf(TASK_RESULT_OPEN);
+  const end = output.lastIndexOf(TASK_RESULT_CLOSE);
+  if (open === -1 || end < open + TASK_RESULT_OPEN.length) {
+    return null;
+  }
+  return { start: open + TASK_RESULT_OPEN.length, end };
+}
+
+/**
+ * Reads the subagent's final text from a completed `task` output
+ * (FR-096/FR-098).
+ *
+ * @param output The `task` tool's output string.
+ * @returns The result body, or null when the output is not a
+ *   completed task result.
+ */
+export function parseTaskResult(output: string): string | null {
+  const bounds = taskResultBounds(output);
+  return bounds === null ? null : output.slice(bounds.start, bounds.end);
+}
+
+/**
+ * Replaces the result body of a completed `task` output, keeping the
+ * frame and task id (FR-097).
+ *
+ * @param output The `task` tool's output string.
+ * @param text The new result body.
+ * @returns The rewritten output, or null when the output is not a
+ *   completed task result.
+ */
+export function replaceTaskResult(output: string, text: string): string | null {
+  const bounds = taskResultBounds(output);
+  return bounds === null ? null : output.slice(0, bounds.start) + text + output.slice(bounds.end);
+}
+
+/**
+ * The text OpenCode's task tool would return for a message: its last
+ * text part, or '' (design D2).
+ *
+ * @param parts The message parts.
+ * @returns The last text part's text.
+ */
+export function lastTextOf(parts: TurnMessage['parts'] | undefined): string {
+  if (!Array.isArray(parts)) {
+    return '';
+  }
+  for (let index = parts.length - 1; index >= 0; index--) {
+    const part = parts[index];
+    if (part?.type === 'text') {
+      return typeof part.text === 'string' ? part.text : '';
+    }
+  }
+  return '';
+}
+
+/**
+ * The note appended to a parent's task result when the subagent
+ * still ends with a text tool call (FR-097): the parent learns the
+ * call never ran instead of taking the text as finished work.
+ *
+ * @param call The text tool call left in the subagent's reply.
+ * @returns The note text.
+ */
+export function subagentTextToolCallNote(call: TextToolCall): string {
+  return (
+    `[supervisor] The subagent's final reply wrote a \`${call.tool}\` tool call as text, so it never ran. ` +
+    'This result is incomplete.'
   );
 }
