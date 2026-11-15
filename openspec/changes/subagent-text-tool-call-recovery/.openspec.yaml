@@ -1,0 +1,11 @@
+schema: spec-driven
+created: 2026-11-15
+originating_issue: 65
+goal: Correct a subagent whose final turn wrote a tool call as text before its parent's task call returns, so the parent receives the real result
+affected_areas:
+  - src/text-tool-call.ts
+  - index.ts
+  - test/text-tool-call.test.ts
+  - README.md
+  - CHANGELOG.md
+  - AGENTS.md
