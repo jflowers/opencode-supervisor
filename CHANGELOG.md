@@ -5,6 +5,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Subagent text tool-call recovery (FR-096..FR-098, #65): a
+  subagent whose final turn wrote a tool call as text is now
+  corrected before its parent sees the result. When a foreground
+  `task` call completes, the supervisor checks the subagent's last
+  turn, prompts it synchronously with the correction under its own
+  agent and model (bounded by `textToolCall.maxPerSession` in a
+  row), and hands the parent the corrected final text. If the call
+  is still text at the bound, the parent's result carries a note
+  that it never ran. Background tasks are left alone. Previously
+  subagent detections were only logged (FR-093, modified).
+
 ## [2.11.0] - 2026-11-15
 
 ### Added

@@ -508,10 +508,17 @@ never ran. Make the actual tool call now; don't repeat the text."*
   row (default 2). A turn that ends cleanly or a message you type
   resets the count. At the bound a warning is logged and the
   session stays idle, so whatever dispatched it can notice.
-- **Not corrected:** the plugin's own side sessions, subagent
-  sessions (the parent already has their final text as the task
-  result; the detection is logged), aborted or failed turns, and
-  `repair-only` mode.
+- **Subagents:** a subagent's final text becomes its parent's
+  `task` result the moment it goes idle, so subagents are corrected
+  at that boundary instead: when a foreground `task` call
+  completes, the supervisor checks the subagent's last turn, prompts
+  it with the same message (under its own agent and model) and
+  waits for the new turn, within the same bound. The parent then
+  gets the corrected final text. If the subagent still ends with a
+  text tool call, the parent's result keeps it and gains a note
+  saying the call never ran. Background tasks are not corrected.
+- **Not corrected:** the plugin's own side sessions, aborted or
+  failed turns, and `repair-only` mode.
 - The supervisor never runs the parsed call itself: the agent makes
   it, so the guard and arg repair see it as usual.
 
