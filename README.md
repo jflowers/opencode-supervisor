@@ -726,9 +726,9 @@ when unset, the side-session prompt omits it.
 | `argRepair.timeoutMs` | *(config file/options only)* | `15000` | Timeout on the repair side session. |
 | `lockGuards` | *(global config file only)* | `false` | When `true`, `blockRewardHacking: false`, `requireStepReferenceInTools: false`, `mode: "repair-only"`, `externalAccess.enabled: false`, and `externalAccess.readPolicy: "allow"` from the project config file, plugin options, or the environment are ignored with a warning, so a committed project config or per-directory env file cannot turn the guards off or unregister them. Fails closed (Section 7.2). |
 | `externalAccess.enabled` | `OPENCODE_SUPERVISOR_EXTERNAL_ACCESS` | `false` | Gate tool calls outside the project root on engineer grants (Section 4.6). `request_access` registers only when this resolves `true` at plugin load. |
-| `textToolCall.enabled` | `OPENCODE_SUPERVISOR_TEXT_TOOL_CALL` | `true` | Correct turns that end with a tool call written as text (Section 4.7). |
-| `textToolCall.maxPerSession` | `OPENCODE_SUPERVISOR_TEXT_TOOL_CALL_MAX` | `2` | Corrections allowed in a row per session; a clean turn or a typed message resets the count. |
 | `externalAccess.readPolicy` | `OPENCODE_SUPERVISOR_EXTERNAL_ACCESS_READ_POLICY` | `allow` | `allow` lets external reads pass; `gate` requires a grant for them too (a `read` grant suffices). |
+| `textToolCall.enabled` | `OPENCODE_SUPERVISOR_TEXT_TOOL_CALL` | `true` | Correct turns that end with a tool call written as text (Section 4.7). |
+| `textToolCall.maxPerSession` | `OPENCODE_SUPERVISOR_TEXT_TOOL_CALL_MAX` | `2` | Corrections allowed in a row per session; a clean turn or a typed message resets the count. `0` still detects and logs but never steers — use `textToolCall.enabled: false` to turn the check off. |
 | `profiles` | *(global config file only)* | *(none)* | Task-scoped grants, matched on slash command and/or agent, that narrow where a guard applies (Section 7.2). |
 
 Gate approvals are not a knob: `approve` rules read the approvals file
