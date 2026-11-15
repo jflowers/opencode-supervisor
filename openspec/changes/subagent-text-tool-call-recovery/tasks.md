@@ -29,4 +29,4 @@
 - [x] 4.1 typecheck, `bun test`, `npm run test:node`,
   `npm run verify:package`
 - [x] 4.2 docs: README §4.7, CHANGELOG Unreleased, AGENTS.md
-- [ ] 4.3 `/uf.review-council`
+- [x] 4.3 `/uf.review-council`
