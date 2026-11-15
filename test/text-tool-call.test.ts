@@ -171,6 +171,12 @@ interface HarnessOptions {
   parentID?: string;
   promptAsyncFails?: boolean;
   toolListFails?: boolean;
+  /**
+   * Invoked from inside the promptAsync mock before it resolves, so a test
+   * can land a human chat.message while a correction delivery is in flight
+   * (the streak-reset race, review round 1).
+   */
+  resetDuringDelivery?: (input: unknown, output: unknown) => Promise<void>;
 }
 
 /** A mock client whose last message the test controls; records steers and log lines. */
@@ -180,6 +186,7 @@ function harness(options: HarnessOptions = {}) {
     steers: [] as Array<{ sessionID: string; text: string; synthetic: unknown }>,
     logs: [] as Array<{ level: string; message: string }>,
     messageFetches: 0,
+    messageQueries: [] as Array<unknown>,
   };
   const input = {
     client: {
@@ -191,6 +198,12 @@ function harness(options: HarnessOptions = {}) {
             path: { id: string };
             body: { parts: Array<{ text: string; synthetic?: unknown }> };
           };
+          if (options.resetDuringDelivery !== undefined) {
+            await options.resetDuringDelivery(
+              { sessionID: path.id },
+              { message: { id: `u-race`, role: 'user' }, parts: [{ type: 'text', text: 'Human interjection.' }] }
+            );
+          }
           if (options.promptAsyncFails === true) {
             return { error: { name: 'Unavailable' } };
           }
@@ -203,8 +216,9 @@ function harness(options: HarnessOptions = {}) {
           const id = (request as { path: { id: string } }).path.id;
           return { data: { id, parentID: options.parentID } };
         },
-        messages: async () => {
+        messages: async (request: unknown) => {
           state.messageFetches += 1;
+          state.messageQueries.push((request as { query?: unknown }).query ?? null);
           return { data: state.messages };
         },
       },
@@ -388,6 +402,42 @@ test('a failed delivery fails open and does not spend the bound', () =>
     endTurn(failing.state, INVOKE_TEXT);
     await idle(hooks, 'ttc-fail');
     assert.equal(failing.state.steers.length, 1, 'the failed attempt left the one slot free');
+  }));
+
+test('the idle check fetches only the last message (bounded query)', () =>
+  withCleanSupervisorEnv(async () => {
+    const { input, state } = harness();
+    const hooks = await load(input);
+    endTurn(state, INVOKE_TEXT);
+    await idle(hooks, 'ttc-bounded');
+    assert.equal(state.steers.length, 1);
+    assert.deepEqual(
+      state.messageQueries,
+      [{ limit: 1 }],
+      'every idle fetch must bound the transcript transfer'
+    );
+  }));
+
+test('a human message landing during a failed delivery keeps the streak non-negative', () =>
+  withCleanSupervisorEnv(async () => {
+    const racing = harness({ promptAsyncFails: true });
+    const hooks = await load(racing.input, { textToolCall: { maxPerSession: 1 } });
+    const chat = hooks['chat.message'] as unknown as (input: unknown, output: unknown) => Promise<void>;
+    racing.options.resetDuringDelivery = chat;
+    endTurn(racing.state, INVOKE_TEXT);
+    await idle(hooks, 'ttc-race');
+    assert.ok(
+      racing.state.logs.some((entry) => entry.level === 'error' && /correction failed open/.test(entry.message)),
+      'the delivery failed after the human message reset the run'
+    );
+    racing.options.promptAsyncFails = false;
+    racing.options.resetDuringDelivery = undefined;
+    endTurn(racing.state, INVOKE_TEXT);
+    await idle(hooks, 'ttc-race');
+    assert.equal(racing.state.steers.length, 1, 'the reset run still has its full bound');
+    endTurn(racing.state, INVOKE_TEXT);
+    await idle(hooks, 'ttc-race');
+    assert.equal(racing.state.steers.length, 1, 'capped at the bound — the failed release never went below zero');
   }));
 
 test('an unavailable tool list skips the check without throwing', () =>

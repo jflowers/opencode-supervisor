@@ -2367,7 +2367,11 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
       if (!config.textToolCall.enabled) {
         return;
       }
-      const response = await input.client.session.messages({ path: { id: sessionID } });
+      // Bounded fetch (FR-095, review round 1): the check reads only the
+      // last message, and the server pages newest-first then reverses to
+      // chronological order, so limit 1 returns exactly that message —
+      // no O(transcript) transfer on every idle turn.
+      const response = await input.client.session.messages({ path: { id: sessionID }, query: { limit: 1 } });
       const messages = response.data;
       if (!Array.isArray(messages)) {
         return;
@@ -2435,7 +2439,10 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           `text tool-call correction ${state.textToolCallStreak}/${bound} sent to session ${sessionID}: make the '${call.tool}' call`
         );
       } catch (error) {
-        state.textToolCallStreak -= 1;
+        // A human message may have reset the run to 0 while the delivery
+        // was in flight; never let a failed release push it below zero
+        // (review round 1), or the session would win one extra correction.
+        state.textToolCallStreak = Math.max(0, state.textToolCallStreak - 1);
         logger.error(`text tool-call correction failed open: ${errorText(error)}`);
       }
     } catch (error) {
