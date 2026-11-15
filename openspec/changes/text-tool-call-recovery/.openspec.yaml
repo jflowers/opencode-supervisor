@@ -1,0 +1,13 @@
+schema: spec-driven
+created: 2026-11-14
+originating_issue: 65
+goal: Detect a turn that ended with a tool call written as text and steer the session to make the real call, bounded per session
+affected_areas:
+  - src/text-tool-call.ts
+  - src/config-file.ts
+  - index.ts
+  - test/text-tool-call.test.ts
+  - test/mocks.ts
+  - README.md
+  - CHANGELOG.md
+  - AGENTS.md
