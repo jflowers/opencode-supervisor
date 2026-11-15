@@ -86,12 +86,12 @@
 
 ## 5. Review and PR
 
-- [ ] 5.1 Run the review council (`/uf.review-council`),
+- [x] 5.1 Run the review council (`/uf.review-council`),
       resolve any REQUEST CHANGES, and record the verdict
       and artifact path here. Verify: consolidate verdict is
       APPROVE or APPROVE WITH ADVISORIES with zero HIGH or
       CRITICAL findings.
-- [ ] 5.2 Open the PR `opsx/directive-gates` -> `main` and
+- [x] 5.2 Open the PR `opsx/directive-gates` -> `main` and
       archive the change via the opsx archive workflow
       after merge. Record the PR number here. Verify: PR is
       open, assigned, and references this change.
@@ -112,3 +112,7 @@
 - Older unarchived changes (agent-reminders,
   rebrand-supervisor, audit-supervisor) can be swept the
   same way as supervisor-tools was.
+
+## Archive
+
+Merged in PR #27; `/uf.review-council` ran before merge. Archived 2026-11-15.

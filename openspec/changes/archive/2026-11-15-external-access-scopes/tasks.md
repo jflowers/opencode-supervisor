@@ -60,9 +60,13 @@
   session state, node test command
 - [x] 4.4 package.json `test:node`; both runners, typecheck,
   `verify:package`
-- [ ] 4.5 documentation issue (filed by the maintainer before
+- [x] 4.5 documentation issue (filed by the maintainer before
   merge)
 
 ## 5. Review
 
-- [ ] 5.1 `/uf.review-council`
+- [x] 5.1 `/uf.review-council`
+
+## Archive
+
+Merged in PR #58; `/uf.review-council` ran before merge; documentation issue #61. Archived 2026-11-15.

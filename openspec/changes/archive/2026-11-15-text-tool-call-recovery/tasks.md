@@ -31,4 +31,8 @@
   `npm run verify:package`
 - [x] 4.2 docs: README section and knob table, CHANGELOG
   Unreleased, AGENTS.md
-- [ ] 4.3 `/uf.review-council`
+- [x] 4.3 `/uf.review-council`
+
+## Archive
+
+Merged in PR #66; `/uf.review-council` ran before merge. Archived 2026-11-15.

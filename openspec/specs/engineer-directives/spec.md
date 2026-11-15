@@ -6,9 +6,7 @@ Define the engineer console's first slice: project directives the
 supervisor loads, enforces at the tool guard, surfaces in the memo
 (always or on trigger), and audits as drift criteria — with fixed
 bounds and fail-open loading.
-
 ## Requirements
-
 ### Requirement: FR-026 — Directive sources
 
 The plugin SHALL merge directives from two sources in deterministic
@@ -206,3 +204,105 @@ malformed content, and invalid rules are skipped with warnings.
 - WHEN rules compile
 - THEN the rule is skipped with a logged warning and the remaining
   rules compile
+
+### Requirement: Approve and review rule kinds in the fence
+
+The supervisor fence SHALL accept two additional rule kinds
+alongside `enforce` and `when`: `approve` (array of approval
+gate rules) and `review` (array of review gate rules).
+Loading, validation, warnings, and bounds for these kinds
+SHALL follow the same fail-open pipeline as the existing
+kinds. Directive options registered via `options.directives`
+SHALL accept the same rule kinds. Rendering of the advisory
+text SHALL NOT include gate rule internals.
+
+#### Scenario: fence with approve rules loads
+- **WHEN** a directive file's supervisor fence contains an
+      `approve` array
+- **THEN** the directive loads with those rules attached
+      and the advisory text rides the memo as before
+
+#### Scenario: options-registered directive carries gates
+- **WHEN** a directive is registered via `options.directives`
+      with `approve` rules
+- **THEN** its gates are compiled and enforced identically
+      to file-loaded directives
+
+#### Scenario: advisory render unchanged by gate rules
+- **WHEN** a directive carries approve and review rules
+- **THEN** the rendered advisory shows the directive id and
+      text without gate rule internals
+
+### Requirement: FR-079 Directive paths match real spellings
+
+A `forbidPath` glob (FR-028) and a `when` path glob (FR-029)
+SHALL match a path candidate when the glob matches the whole
+candidate or any suffix of it that starts after a `/`. Path
+candidates for these two rule kinds SHALL be extracted from
+top-level string arguments and from string values nested in
+array and object arguments, bounded in nesting depth and
+count. A glob that starts with `/` SHALL match only whole
+candidates.
+
+The loader SHALL read at most `MAX_DIRECTIVE_FILES` (25)
+directive files, in name order, and SHALL NOT read or parse
+files past the cap; when files are skipped it SHALL emit one
+warning naming the count. The identity log line SHALL name each
+loaded directive's id and source: `<id>.md` for a file
+directive, `options` for a tuple-registered one.
+
+#### Scenario: Dot-relative spelling is forbidden
+
+- **GIVEN** a directive with `forbidPath` `secrets/**`
+- **WHEN** a `read` call targets `./secrets/token`
+- **THEN** the call is blocked by the directive
+
+#### Scenario: Home and absolute spellings are forbidden
+
+- **GIVEN** a directive with `forbidPath` `secrets/**`
+- **WHEN** a bash call runs `cat ~/secrets/token` or
+  `cat /home/dev/proj/secrets/token`
+- **THEN** the call is blocked by the directive
+
+#### Scenario: Nested argument paths are forbidden
+
+- **GIVEN** a directive with `forbidPath` `secrets/**`
+- **WHEN** a tool call carries `secrets/token` only inside an
+  array of objects (for example `edits[0].filePath`)
+- **THEN** the call is blocked by the directive
+
+#### Scenario: When-path globs trigger on any spelling
+
+- **GIVEN** a directive with `when` path `src/crypto/**`
+- **WHEN** an `edit` call targets
+  `/home/dev/proj/src/crypto/aes.ts` or `./src/crypto/aes.ts`
+- **THEN** the directive is triggered
+
+#### Scenario: Unrelated paths still pass
+
+- **GIVEN** a directive with `forbidPath` `secrets/**`
+- **WHEN** a call targets `src/secrets.ts` or `docs/secrets-faq`
+- **THEN** the call is not blocked by the directive
+
+#### Scenario: A leading slash anchors at the root
+
+- **GIVEN** a directive with `forbidPath` `/etc/**`
+- **WHEN** a call targets `vendor/etc/conf`
+- **THEN** the call is not blocked by the directive
+
+#### Scenario: Files past the read cap are not parsed
+
+- **GIVEN** 27 directive files, two of them sorting last and
+  malformed
+- **WHEN** the plugin loads
+- **THEN** no malformed-file warning is emitted for them
+- **AND** one warning says 2 directive files were not read
+
+#### Scenario: The identity line names loaded directives
+
+- **GIVEN** a file directive `no-secrets.md` and a tuple
+  directive with id `prefer-bun`
+- **WHEN** the identity line is logged
+- **THEN** it names `no-secrets (no-secrets.md)` and
+  `prefer-bun (options)`
+
