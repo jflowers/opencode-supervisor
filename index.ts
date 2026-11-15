@@ -249,7 +249,7 @@ export const pluginConfig: HookConfig = {
  * build. `package.json` cannot be imported from here without a build
  * step, so the constant is the source of truth for the log prefix.
  */
-export const PLUGIN_VERSION = '2.11.0';
+export const PLUGIN_VERSION = '2.12.0';
 
 /**
  * Log-identity state (FR-055): the module-identity line is emitted

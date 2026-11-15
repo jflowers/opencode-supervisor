@@ -5,6 +5,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.12.0] - 2026-11-15
+
 ### Added
 
 - Subagent text tool-call recovery (FR-096..FR-098, #65): a
