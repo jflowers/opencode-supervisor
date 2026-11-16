@@ -5,6 +5,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- README docs for the gaps the docs issues called out (#42, #50,
+  #61, #62, #63, #67, #71):
+  - Troubleshooting (Section 9.1): a run that stopped on a text
+    tool call, and 1.x variables ignored after upgrading.
+  - Worked examples: an external access request, a covered trace
+    wait.
+  - A grants file cookbook and a table of the spellings a
+    directive glob catches.
+  - Why subagents are corrected at the `task` boundary.
+  - What external access detection, the reward-hacking scan, and
+    guard profiles still miss.
+
 ## [2.12.0] - 2026-11-15
 
 ### Added
