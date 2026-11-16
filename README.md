@@ -324,6 +324,38 @@ still blocks, and so does a bash `grep` for it — use the `grep`
 tool. After each tool completes, a solved item (tool name +
 short outcome) joins a bounded log.
 
+The reward-hacking scan still catches a few mentions that are not
+uses. An `apply_patch` payload is scanned in full, prose files
+included, because the patch text is the operation. Knowledge store
+tools that keep their payload under a key other than `content` (for
+example Dewey's `information`) stay scanned too: custom keys fail
+closed. A guard profile (Section 7.2) exempts such a tool from the
+trace check only, not from this scan. If a curation agent needs to
+store a note about `--no-verify`, have it write a Markdown file.
+
+**What does a covered wait look like?** Say the agent tries to edit
+`kb/topics/gov-ci.md` before its reasoning ever named that file.
+
+1. The edit is blocked: the path is absent from the verified trace.
+   The reason asks the agent to name the file in its reasoning,
+   then retry once the audit settles.
+2. The agent reasons about the edit and names
+   `kb/topics/gov-ci.md` (or `kb/topics/*.md`). That step goes to
+   audit.
+3. The agent retries right away, before the audit is back. The
+   guard sees an in-flight audit whose step names the blocked path,
+   so this is a covered wait. It waits up to 10 seconds.
+4. If the audit passes in time, the path is in the trace and the
+   edit runs. If the wait times out, the edit runs anyway and
+   spends one of the session's `maxCoveredTimeoutFailOpens` (6 by
+   default). If the audit fails, the block says the reasoning named
+   the file but did not pass audit, and asks for a factual
+   restatement.
+
+Once the covered budget is spent, a timed-out wait blocks and says
+to wait for the audit to settle. A retry in the next turn usually
+finds the audit done.
+
 ### 4.3 The Supervisor Memo
 
 Before each user prompt, `experimental.chat.messages.transform` appends a
@@ -478,6 +510,68 @@ is logged.
 { "externalAccess": { "enabled": true, "readPolicy": "allow" } }
 ```
 
+**What does a request look like?** Say you put that block in one
+repository's `.opencode/supervisor/config.json`, and the agent
+decides it needs to edit `~/.config/foo/settings.json`.
+
+1. The `edit` call is blocked. The reason names the resolved path,
+   says it needs an engineer grant, and spells out the
+   `request_access` call to make.
+2. The agent calls `request_access` with that path, `mode:
+   "read-write"`, and why it needs it. It gets back `question` tool
+   arguments to relay, nothing more.
+3. The agent relays them and you see:
+
+   ```text
+   [supervisor access request ax1] The agent requests READ-WRITE
+   access outside the project root:
+   /home/dev/.config/foo/settings.json. Justification: ... Grant it?
+   ```
+
+4. You pick *Allow for this session*. The supervisor checks that the
+   request id and question text are unchanged, then mints a session
+   grant for that path, and the memo lists it.
+5. The agent retries the edit and it goes through. So does every
+   later write under that path, in this session and its subagents,
+   until OpenCode restarts.
+
+*Allow once* would cover only the retry. *Deny* mints nothing, and
+the agent has to find another way or ask you directly.
+
+**Grants file cookbook.** A few entries worth copying:
+
+```json
+[
+  { "path": "/home/dev/src/sibling-repo", "mode": "read", "note": "read only reference checkout" },
+  { "path": "~/.config/foo", "mode": "read-write", "expires": "2026-11-30", "note": "foo migration, ticket FOO-12" },
+  { "path": "/tmp/build-cache", "mode": "read-write", "note": "shared build cache" }
+]
+```
+
+- **A sibling checkout to read, not touch.** Use `mode: "read"`.
+  That only matters with `readPolicy: "gate"`, since reads pass
+  anyway under the default. The point of the entry is that writes
+  there stay blocked.
+- **An expiring write.** `expires` is inclusive, so the grant above
+  works through the end of November 30 (UTC) and not after. Good
+  for a migration you don't want to remember to revoke.
+- **A note for the audit trail.** The plugin ignores `note`. It is
+  for you and whoever reads the file next: why the grant exists and
+  who asked.
+
+**What the gate does not see.**
+
+- Detection is lexical. A script that builds a path at runtime and
+  writes to it is invisible, as is anything a called program does
+  on its own (Section 9 has the bash details).
+- Under the default `readPolicy: "allow"`, external reads pass
+  without a grant. That includes the `read` tool on `~/.ssh` (a
+  bash `cat` is a write, so it is gated). Set `"gate"` if reads
+  matter to you.
+- Grants from answered questions live in process memory. Restart
+  OpenCode and they are gone, so the agent has to ask again. Only
+  the grants file persists.
+
 ---
 
 ### 4.7 Text Tool Calls
@@ -517,6 +611,26 @@ never ran. Make the actual tool call now; don't repeat the text."*
   gets the corrected final text. If the subagent still ends with a
   text tool call, the parent's result keeps it and gains a note
   saying the call never ran. Background tasks are not corrected.
+
+  Why not steer the subagent on idle like a root session? By then
+  it is too late. The parent already holds the subagent's final
+  text as its `task` result, so a later correction would land where
+  nobody reads it. Fixing it at the `task` boundary is the last
+  point where the parent still sees the change.
+
+  Two things follow from that. The parent's `task` call waits while
+  the correction turns run, so a slow subagent model makes a slow
+  `task` call. And aborting the parent does not cancel a correction
+  turn already sent to the subagent. At the bound, the parent's
+  result ends with this note:
+
+  ```text
+  [supervisor] The subagent's final reply wrote a `question` tool
+  call as text, so it never ran. This result is incomplete.
+  ```
+
+  (One line in practice, wrapped here.) The log carries a warning
+  naming the subagent session.
 - **Not corrected:** the plugin's own side sessions, aborted or
   failed turns, and `repair-only` mode.
 - The supervisor never runs the parsed call itself: the agent makes
@@ -608,9 +722,28 @@ directive is advisory text plus optional machine rules:
   case-insensitive) to the tool-arg repair scope (Section 4.5) — the
   escape hatch for MCP and plugin tools outside the builtin default.
 
-Directive files live in `.opencode/supervisor/directives/*.md`; the
-markdown body is the advisory text, and a fenced `supervisor` code
-block carries the rules as JSON:
+Which spellings does a glob catch? With a project at
+`/home/dev/proj`:
+
+| Agent writes | `secrets/**` | `/home/dev/proj/secrets/**` |
+| :--- | :--- | :--- |
+| `secrets/token` | Match | No match |
+| `./secrets/token` | Match | No match |
+| `~/secrets/token` | Match | No match |
+| `/home/dev/proj/secrets/token` | Match | Match |
+| `vendor/x/secrets/token` | Match | No match |
+
+The relative glob is the safe default for a `forbidPath`: it catches
+every spelling, plus look-alikes deeper in the tree. Anchor with `/`
+when a deeper match would be wrong, say a `when` rule that should
+fire for your `config/` and not for a vendored one. An anchored
+glob only sees absolute paths, so pair it with the relative one if
+the agent might write `./config/...`.
+
+Directive files live in `.opencode/supervisor/directives/*.md`, and
+at most 25 are read (sorted by filename, one warning for the rest).
+The markdown body is the advisory text, and a fenced `supervisor`
+code block carries the rules as JSON:
 
 ````markdown
 Never read, print, or copy secret material. Secrets live in the
@@ -833,6 +966,12 @@ the task. The global config file holds the grants:
   ship `.opencode/agents/curator.md` or a `dewey-distill` command — so
   a project config file or plugin options cannot grant one; they are
   ignored there with a warning.
+- The flip side of weak keys: your global grant follows the name,
+  not the definition. Open a repository that ships its own
+  `curator` agent or `dewey-distill` command, run it, and it gets
+  your profile's exemptions. A command grant also holds for that
+  command's whole task, subagents included. Keep exemptions to
+  tools you would trust any agent by that name with.
 - Read-only builtins (`read`, `grep`, `glob`) are not exempt unless a
   profile lists them; path-scoped glob reasoning (FR-069) covers most
   bulk reads, and corpus-scale tasks may list them.
@@ -965,6 +1104,53 @@ cp skills/reasoning-auditor/skill.md ~/.config/opencode/skills/reasoning-auditor
   core's prompt cannot be made mode-aware from a plugin. Headless and
   `--auto` runs cannot answer questions, so only file grants apply
   there.
+
+### 9.1 Troubleshooting
+
+Diagnostics go to the OpenCode server log under the
+`opencode-supervisor` service tag, not the TUI.
+
+**The run stopped, and the last message is an `<invoke ...>`
+block.** The model wrote a tool call as text instead of making it
+(Section 4.7). Normally you won't see this. The supervisor adds a
+message to the transcript:
+
+```text
+[supervisor] Your last message wrote a `question` tool call as
+text, so it never ran. Make the actual tool call now; don't repeat
+the text.
+```
+
+and the next turn makes the real call. If the run stopped anyway,
+look for this in the log:
+
+```text
+text tool-call correction bound (2) reached for session ses_...;
+the session stays idle
+```
+
+That means the model did it again after each correction, up to
+`textToolCall.maxPerSession`. The supervisor stops there on purpose
+so a stuck model can't loop forever. Type a message to nudge it
+(that resets the count), or switch models. No correction at all?
+Check that the shape is one the detector knows, that it isn't
+inside a code block, that the tool name is registered, and that the
+plugin isn't in `repair-only` mode.
+
+**My guard settings are ignored after upgrading.** Look for this
+warning near the top of the log:
+
+```text
+legacy 1.x environment variables are set and ignored:
+OPENCODE_AUDITOR_BLOCK_REWARD_HACKING →
+OPENCODE_SUPERVISOR_BLOCK_REWARD_HACKING. ...
+```
+
+2.0 renamed every variable and reads only the new names, so the old
+ones do nothing. Rename them per Section 10.2. The warning lists
+names only, never values. No warning? Then check whether
+`lockGuards: true` in your global config file is stripping a
+guard-disabling value (Section 7.2). That one logs its own warning.
 
 ---
 
