@@ -54,6 +54,7 @@ import {
 } from './src/auditor.ts';
 import { stripNarrative } from './src/stripper.ts';
 import { extractPathTokens } from './src/path-tokens.ts';
+import { injectedArgsForSession, renderInjectedArgs } from './src/plugin-injected.ts';
 import {
   checkProtectedState,
   createGlobBudget,
@@ -2861,7 +2862,15 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           // captured by `chat.message`) scopes drift findings whenever
           // present, and the engineer directives (FR-031) add violation
           // criteria whenever configured.
-          const outcome = await runPeerAudit([stepText], config, invokeModel, state.goal, directivesAdvisory ?? undefined);
+          const outcome = await runPeerAudit(
+            [stepText],
+            config,
+            invokeModel,
+            state.goal,
+            directivesAdvisory ?? undefined,
+            // FR-106: args other plugins injected on this session's calls.
+            renderInjectedArgs(injectedArgsForSession(part.sessionID))
+          );
           // FR-006/FR-063: the step joins the verified trace whenever the
           // outcome records — passed steps and minor deterministic-invariant
           // failures alike (the latter marked `passed: false`, since the
@@ -3638,7 +3647,14 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           // D5: compose the existing audit pipeline over the focus text.
           // Agent-authored reports never enter this prompt (FR-042).
           try {
-            const outcome = await runPeerAudit([stripped], config, invokeModel, state.goal, directivesAdvisory ?? undefined);
+            const outcome = await runPeerAudit(
+              [stripped],
+              config,
+              invokeModel,
+              state.goal,
+              directivesAdvisory ?? undefined,
+              renderInjectedArgs(injectedArgsForSession(context.sessionID))
+            );
             if (outcome.passed) {
               // Passed focus joins the verified trace in stripped form —
               // the same trust class as passed reasoning steps (FR-037).

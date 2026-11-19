@@ -656,6 +656,31 @@ test('hasProtectedSegmentRun matches glob spellings of protected runs', () => {
   assert.ok(!hasProtectedSegmentRun('opencode/app*valsx.json', 'approvals.json'));
 });
 
+test('hasProtectedSegmentRun: a directory-position wildcard does not stand for a protected file (FR-107)', () => {
+  // The live false positive: glob `**/*.md` scoped into a topic
+  // folder was blocked as touching approvals.json, because `**`
+  // glob-matched the file name in a directory position.
+  assert.ok(!hasProtectedSegmentRun('**/*.md', 'approvals.json'));
+  assert.ok(!hasProtectedSegmentRun('src/*/x.ts', 'approvals.json'));
+  assert.ok(!hasProtectedSegmentRun('opencode/*/x/y', 'opencode/supervisor/config.json'));
+  // A wildcard as the LAST segment can still expand onto the file.
+  assert.ok(hasProtectedSegmentRun('**/app*.json', 'approvals.json'));
+  assert.ok(hasProtectedSegmentRun('opencode/supervisor/*', 'approvals.json'));
+  // Exact names match in any position; directory runs keep glob
+  // semantics in directory positions.
+  assert.ok(hasProtectedSegmentRun('**/approvals.json', 'approvals.json'));
+  assert.ok(hasProtectedSegmentRun('opencode/*/config.json', 'opencode/supervisor/config.json'));
+  assert.ok(hasProtectedSegmentRun('opencode/*/directives/a.md', 'opencode/supervisor/directives'));
+});
+
+test('checkProtectedState allows recursive globs outside supervisor state (FR-107)', () => {
+  assert.equal(checkProtectedState('glob', { pattern: '**/*.md', path: 'topics/wirecheck' }, []), null);
+  const command = 'cat src/*/x.ts';
+  assert.equal(checkProtectedState('bash', { command }, extractPolicyPaths({ command })), null);
+  // Still blocked: a glob into the supervisor directory.
+  assert.ok(checkProtectedState('glob', { pattern: '**/*', path: '.opencode/supervisor' }, []) !== null);
+});
+
 test('hasProtectedSegmentRun fails toward blocking on over-long glob segments (review iteration 3)', () => {
   // An over-long glob segment (>4096 chars) cannot be matched
   // within bounds, and in the protected-state context a
