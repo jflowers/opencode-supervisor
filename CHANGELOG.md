@@ -5,6 +5,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.14.0] - 2026-11-19
+
 ### Added
 
 - The auditor is told which tool arguments another plugin filled in
