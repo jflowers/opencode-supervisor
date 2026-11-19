@@ -1152,6 +1152,24 @@ names only, never values. No warning? Then check whether
 `lockGuards: true` in your global config file is stripping a
 guard-disabling value (Section 7.2). That one logs its own warning.
 
+**Hundreds of `supervisor-audit @ ...` sessions, and the session
+froze.** Look for this warning near the top of the log:
+
+```text
+opencode-supervisor is loaded more than once for /path/to/project
+```
+
+The plugin is listed twice, for example as `opencode-agent-supervisor@x.y.z`
+in your global config and as a path to a local checkout in the
+project's `opencode.json`. Remove one entry. Since the next release
+after 2.12.0, two copies no longer audit each other's side sessions.
+Every auditor side session also runs with no tools, gives up after
+180 s, and at most 4 run at once; anything past those limits passes
+unaudited and is logged. Earlier versions could audit each other's
+auditors without limit. Side sessions left behind by an interrupted
+run are titled `supervisor-audit @ ...` or `supervisor-repair @ ...`
+and are safe to delete.
+
 ---
 
 ## 10. Appendix

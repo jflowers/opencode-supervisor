@@ -5,7 +5,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Two copies of the plugin loaded for one project (an npm entry in
+  the global config plus a local path in the project config) no
+  longer audit each other's auditor side sessions. That loop
+  created thousands of stuck `supervisor-audit @ ...` sessions and
+  froze the supervised session. Side-session suppression is now
+  shared by every copy in the process, and any session titled
+  `supervisor-audit @` or `supervisor-repair @` is skipped, whichever
+  copy or version made it (FR-099).
+- Auditor and repair side sessions run with every tool disabled
+  (FR-100).
+- The auditor prompt times out after 180 s; the side session is
+  aborted and deleted and the audit fails open (FR-101).
+- At most 4 auditor side sessions run at once per process; an audit
+  over the cap fails open without creating a session (FR-102).
+
 ### Added
+
+- A warning when a second copy of the plugin starts for a directory
+  another copy already supervises (FR-103).
 
 - README docs for the gaps the docs issues called out (#42, #50,
   #61, #62, #63, #67, #71):

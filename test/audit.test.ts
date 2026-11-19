@@ -4,7 +4,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Hooks, PluginInput } from '@opencode-ai/plugin';
-import plugin, { createInvokeModel, PLUGIN_VERSION, resolveHookConfig, sessionState, traceAwaitState } from '../index.ts';
+import plugin, {
+  createInvokeModel,
+  isSideSessionTitle,
+  PLUGIN_VERSION,
+  registerPluginLoad,
+  resolveHookConfig,
+  sessionState,
+  sharedSupervisorState,
+  traceAwaitState,
+} from '../index.ts';
 import { completedReasoningPart, recordingPluginInput, silentClientSurface, silentPluginInput, withCleanSupervisorEnv } from './mocks.ts';
 import { stripNarrative } from '../src/stripper.ts';
 import {
@@ -1104,7 +1113,12 @@ interface RecordedCreateCall {
 interface RecordedPromptCall {
   path: { id: string };
   query: { directory: string };
-  body: { model: { providerID: string; modelID: string }; variant: string; parts: Array<Record<string, unknown>> };
+  body: {
+    model: { providerID: string; modelID: string };
+    variant: string;
+    parts: Array<Record<string, unknown>>;
+    tools?: Record<string, boolean>;
+  };
 }
 interface RecordedDeleteCall {
   path: { id: string };
@@ -1179,6 +1193,8 @@ test('createInvokeModel drives a dedicated auditor side session and returns its 
   assert.deepEqual(calls.prompt[0].body.model, { providerID: 'mock', modelID: 'auditor-model' });
   assert.equal(calls.prompt[0].body.variant, 'low');
   assert.deepEqual(calls.prompt[0].body.parts, [{ type: 'text', text: 'Audit these steps.' }]);
+  // FR-100: the auditor side session gets no tools.
+  assert.deepEqual(calls.prompt[0].body.tools, { '*': false });
 
   // Review finding #10: the ephemeral side session is deleted after the
   // response text is extracted — no persistent audit sessions accumulate.
@@ -3315,5 +3331,184 @@ test('the corrective instruction loop closes end to end: block, prose re-stateme
     await assert.doesNotReject(() =>
       dispatchToolBefore(hooks, sessionID, 'write', { filePath: 'notes.md', content: 'session summary' })
     );
+  });
+});
+
+// ── Side-session runaway guard (FR-099..FR-103) ───────────────────
+
+/**
+ * A plugin input whose side-session calls are recorded. Prompts park
+ * until the test releases them (`park: true`) or resolve at once with
+ * a passing verdict. Side-session ids are `${prefix}-${n}`.
+ */
+function sideSessionInput(
+  directory: string,
+  prefix: string,
+  park: boolean
+): {
+  input: PluginInput;
+  calls: { create: unknown[]; prompt: unknown[]; abort: unknown[]; delete: unknown[] };
+  release: () => void;
+} {
+  const calls = { create: [] as unknown[], prompt: [] as unknown[], abort: [] as unknown[], delete: [] as unknown[] };
+  const passed = {
+    data: {
+      info: {},
+      parts: [{ type: 'text', text: '{"passed":true,"failedStep":null,"severity":null,"critique":"Verified."}' }],
+    },
+  };
+  const parked: Array<(response: unknown) => void> = [];
+  const input = {
+    client: {
+      session: {
+        create: async (options: unknown) => {
+          calls.create.push(options);
+          return { data: { id: `${prefix}-${calls.create.length}` } };
+        },
+        prompt: (options: unknown) => {
+          calls.prompt.push(options);
+          return park ? new Promise((resolve) => parked.push(resolve)) : Promise.resolve(passed);
+        },
+        promptAsync: async () => ({}),
+        abort: async (options: unknown) => {
+          calls.abort.push(options);
+          return {};
+        },
+        delete: async (options: unknown) => {
+          calls.delete.push(options);
+          return {};
+        },
+      },
+      ...silentClientSurface,
+    },
+    directory,
+  };
+  return {
+    input: input as unknown as PluginInput,
+    calls,
+    release: () => {
+      for (const resolve of parked.splice(0)) {
+        resolve(passed);
+      }
+    },
+  };
+}
+
+test('isSideSessionTitle recognizes audit and repair side-session titles only', () => {
+  assert.equal(isSideSessionTitle('supervisor-audit @ mock/model (low)'), true);
+  assert.equal(isSideSessionTitle('supervisor-repair @ mock/model'), true);
+  assert.equal(isSideSessionTitle('Separate research topic in same repo'), false);
+  assert.equal(isSideSessionTitle('my supervisor-audit @ notes'), false);
+  assert.equal(isSideSessionTitle(undefined), false);
+});
+
+test('registerPluginLoad reports other copies for a directory, not reloads of the same copy', () => {
+  const directory = '/tmp/supervisor-duplicate-load-unit';
+  assert.deepEqual(registerPluginLoad(directory, 'file:///npm/index.ts'), []);
+  assert.deepEqual(registerPluginLoad(directory, 'file:///npm/index.ts'), []);
+  assert.deepEqual(registerPluginLoad(directory, 'file:///checkout/index.ts'), ['file:///npm/index.ts']);
+  assert.deepEqual(registerPluginLoad('/tmp/supervisor-duplicate-load-other', 'file:///checkout/index.ts'), []);
+});
+
+test('a second plugin copy for the same directory logs a duplicate-load warning', async () => {
+  await withCleanSupervisorEnv(async () => {
+    const directory = '/tmp/supervisor-duplicate-load-hook';
+    const copy = (await import('../index.ts?duplicate-load-copy')) as typeof import('../index.ts');
+    const first = recordingPluginInput(directory);
+    await plugin.server(first.input);
+    const second = recordingPluginInput(directory);
+    await copy.default.server(second.input);
+    const warnings = (entries: Array<{ level: string; message: string }>) =>
+      entries.filter((entry) => entry.level === 'warn' && entry.message.includes('loaded more than once'));
+    assert.equal(warnings(first.logEntries).length, 0);
+    assert.equal(warnings(second.logEntries).length, 1);
+  });
+});
+
+test('createInvokeModel aborts, deletes, and rejects when the auditor prompt times out', async () => {
+  const { input, calls } = sideSessionInput('/workdir', 'auditor-timeout', true);
+  const invokeModel = createInvokeModel(input.client, '/workdir', silentPluginLogger, { timeoutMs: 5 });
+  const before = sharedSupervisorState().auditsInFlight;
+  await assert.rejects(() => invokeModel('Audit these steps.', baseAuditConfig), /timed out after 5ms/);
+  // Let the best-effort abort scheduled by the timer settle.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(calls.abort, [{ path: { id: 'auditor-timeout-1' } }]);
+  assert.deepEqual(calls.delete, [{ path: { id: 'auditor-timeout-1' } }]);
+  assert.equal(sharedSupervisorState().auditsInFlight, before);
+  assert.equal(sharedSupervisorState().sideSessionIds.has('auditor-timeout-1'), false);
+});
+
+test('createInvokeModel rejects without creating a side session when the audit cap is reached', async () => {
+  const { input, calls, release } = sideSessionInput('/workdir', 'auditor-cap', true);
+  const shared = sharedSupervisorState();
+  const before = shared.auditsInFlight;
+  const invokeModel = createInvokeModel(input.client, '/workdir', silentPluginLogger, { maxConcurrent: before + 1 });
+  const first = invokeModel('Audit step one.', baseAuditConfig);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(shared.auditsInFlight, before + 1);
+  await assert.rejects(() => invokeModel('Audit step two.', baseAuditConfig), /auditor busy/);
+  assert.equal(calls.create.length, 1);
+  release();
+  await first;
+  assert.equal(shared.auditsInFlight, before);
+});
+
+test('a session titled as a side session is never audited, whichever copy created it', async () => {
+  await withCleanSupervisorEnv(async () => {
+    const { input, calls } = sideSessionInput('/tmp/supervisor-title-marker', 'title-audit', false);
+    const hooks = await plugin.server(input);
+    // Positive control: an ordinary session is audited.
+    await dispatchPart(hooks, completedReasoningPart({ sessionID: 'ordinary-session' }));
+    assert.equal(calls.create.length, 1);
+
+    await hooks.event!({
+      event: {
+        type: 'session.created',
+        properties: { info: { id: 'foreign-audit', title: 'supervisor-audit @ other/model' } },
+      },
+    } as never);
+    await dispatchPart(hooks, completedReasoningPart({ sessionID: 'foreign-audit', id: 'p2', messageID: 'm2' }));
+    assert.equal(calls.create.length, 1);
+    assert.equal(sessionState.peek('foreign-audit'), undefined);
+
+    await hooks.event!({
+      event: { type: 'session.deleted', properties: { info: { id: 'foreign-audit' } } },
+    } as never);
+    assert.equal(sharedSupervisorState().sideSessionIds.has('foreign-audit'), false);
+  });
+});
+
+test('two copies of the plugin never audit each other\'s side sessions', async () => {
+  await withCleanSupervisorEnv(async () => {
+    // Two module instances, as with an npm entry in the global config
+    // plus a path entry in the project config.
+    const copy = (await import('../index.ts?second-copy')) as typeof import('../index.ts');
+    assert.notEqual(copy.default, plugin);
+
+    const a = sideSessionInput('/tmp/supervisor-two-copies', 'copy-a-side', true);
+    const b = sideSessionInput('/tmp/supervisor-two-copies', 'copy-b-side', false);
+    const hooksA = await plugin.server(a.input);
+    const hooksB = await copy.default.server(b.input);
+
+    // Copy A audits the supervised session; its side session is live.
+    const auditRun = dispatchPart(hooksA, completedReasoningPart({ sessionID: 'supervised-two-copies' }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(a.calls.create.length, 1);
+
+    // Copy B sees copy A's auditor reasoning and the audit prompt.
+    await dispatchPart(hooksB, completedReasoningPart({ sessionID: 'copy-a-side-1', id: 'side-part', messageID: 'side-msg' }));
+    await hooksB['chat.message']!(
+      { sessionID: 'copy-a-side-1' } as never,
+      { message: { id: 'side-user', role: 'user' }, parts: [{ type: 'text', text: 'audit prompt' }] } as never
+    );
+    assert.equal(b.calls.create.length, 0);
+
+    // Positive control: copy B still audits ordinary sessions.
+    await dispatchPart(hooksB, completedReasoningPart({ sessionID: 'other-supervised', id: 'p3', messageID: 'm3' }));
+    assert.equal(b.calls.create.length, 1);
+
+    a.release();
+    await auditRun;
+    assert.equal(a.calls.delete.length, 1);
   });
 });

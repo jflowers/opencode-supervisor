@@ -758,6 +758,90 @@ export const sessionState = {
   },
 };
 
+/** Title prefixes that mark a session as supervisor side-session machinery (FR-099). */
+export const SIDE_SESSION_TITLE_PREFIXES: readonly string[] = ['supervisor-audit @', 'supervisor-repair @'];
+
+/**
+ * Upper bound on one auditor prompt (FR-101). A stuck auditor model
+ * used to hold its side session (and every tool call waiting on the
+ * audit's trace coverage) open forever; past this bound the side
+ * session is aborted and deleted and the audit fails open (FR-005).
+ */
+export const AUDIT_TIMEOUT_MS = 180_000;
+
+/** Process-wide cap on in-flight auditor side sessions (FR-102). */
+export const MAX_CONCURRENT_AUDITS = 4;
+
+/**
+ * Prompt-body tool map that disables every tool in a side session
+ * (FR-100). OpenCode turns each entry into a session permission rule
+ * with pattern `*`, and a `*`/deny rule hides the tools it matches —
+ * the audit and repair prompts are self-contained, so the side
+ * session needs none, and a tool-using auditor only multiplies the
+ * reasoning parts a duplicate plugin copy would audit.
+ */
+const SIDE_SESSION_TOOLS: Record<string, boolean> = { '*': false };
+
+/** Process-wide supervisor state shared by every copy of the plugin (FR-099, FR-102, FR-103). */
+export interface SharedSupervisorState {
+  /** Live side-session IDs (see `auditorSessionIds`). */
+  sideSessionIds: Set<string>;
+  /** Auditor side sessions currently in flight (FR-102). */
+  auditsInFlight: number;
+  /** Module URLs of the plugin copies started per directory (FR-103). */
+  loadsByDirectory: Map<string, Set<string>>;
+}
+
+const SHARED_STATE_KEY = Symbol.for('opencode-agent-supervisor.shared-state');
+
+/**
+ * The process-wide supervisor state, created on first use. It lives
+ * on `globalThis` under a registry symbol so separate module copies
+ * of the plugin (npm and path entries, or two versions) share one
+ * instance. Missing fields are filled in, so a copy of a later
+ * version that adds fields can still use a record an earlier copy
+ * created.
+ *
+ * @returns The shared state record.
+ */
+export function sharedSupervisorState(): SharedSupervisorState {
+  const store = globalThis as unknown as Record<symbol, Partial<SharedSupervisorState> | undefined>;
+  const state = store[SHARED_STATE_KEY] ?? {};
+  state.sideSessionIds ??= new Set<string>();
+  state.auditsInFlight ??= 0;
+  state.loadsByDirectory ??= new Map<string, Set<string>>();
+  store[SHARED_STATE_KEY] = state;
+  return state as SharedSupervisorState;
+}
+
+/**
+ * Whether a session title marks a supervisor side session (FR-099).
+ *
+ * @param title The session title from a session event.
+ * @returns True when the title starts with a side-session marker.
+ */
+export function isSideSessionTitle(title: unknown): boolean {
+  return typeof title === 'string' && SIDE_SESSION_TITLE_PREFIXES.some((prefix) => title.startsWith(prefix));
+}
+
+/**
+ * Records that the plugin copy at `moduleUrl` started for
+ * `directory` (FR-103).
+ *
+ * @param directory The plugin input's project directory.
+ * @param moduleUrl The starting copy's `import.meta.url`.
+ * @returns The module URLs of OTHER copies already started for the
+ *   directory; empty for a first load or a reload of the same copy.
+ */
+export function registerPluginLoad(directory: string, moduleUrl: string): string[] {
+  const loads = sharedSupervisorState().loadsByDirectory;
+  const urls = loads.get(directory) ?? new Set<string>();
+  const others = [...urls].filter((url) => url !== moduleUrl);
+  urls.add(moduleUrl);
+  loads.set(directory, urls);
+  return others;
+}
+
 /**
  * Live auditor side-session IDs — self-suppression for the plugin's
  * own machinery (review iteration 2, HIGH finding). The plugin host
@@ -774,8 +858,17 @@ export const sessionState = {
  * `createInvokeModel` adds an ID the moment `create` resolves —
  * before prompting — and discards it when the side session is
  * cleaned up, so the set tracks exactly the live side sessions.
+ *
+ * FR-099: the set is process-wide (see `sharedSupervisorState`), not
+ * module-scoped. Two copies of the plugin loaded for one directory
+ * (an npm entry in the global config plus a path entry in the
+ * project config) used to hold separate sets, so each audited the
+ * other's side sessions — audits of audits, thousands of stuck side
+ * sessions. The `event` hook also registers any session whose title
+ * carries a side-session marker, which covers copies of older
+ * versions that never join the shared set.
  */
-const auditorSessionIds = new Set<string>();
+const auditorSessionIds = sharedSupervisorState().sideSessionIds;
 
 /**
  * Monotonic sequence for memo message ids (FR-016): the messages-
@@ -1010,12 +1103,20 @@ function extractResponseText(parts: readonly SessionPromptPart[] | undefined): s
  * @param logger The plugin logger (server log, FR-052).
  * @returns The InvokeModel function driving the auditor side session.
  */
-export function createInvokeModel(client: PluginInput['client'], directory: string, logger?: PluginLogger): InvokeModel {
+export function createInvokeModel(
+  client: PluginInput['client'],
+  directory: string,
+  logger?: PluginLogger,
+  limits?: { timeoutMs?: number; maxConcurrent?: number }
+): InvokeModel {
   // Review round 2 (additive signature): the logger is optional so
   // 2-arg callers from 2.4.0 keep working — without one, delete
   // failures fall back to the shared silent logger (review round 5)
   // rather than throwing.
   const log = logger ?? silentPluginLogger;
+  const timeoutMs = limits?.timeoutMs ?? AUDIT_TIMEOUT_MS;
+  const maxConcurrent = limits?.maxConcurrent ?? MAX_CONCURRENT_AUDITS;
+  const shared = sharedSupervisorState();
   return async (prompt: string, config: AuditConfig): Promise<string> => {
     if (config.auditorModel === undefined) {
       throw new Error('no auditor model configured');
@@ -1024,6 +1125,24 @@ export function createInvokeModel(client: PluginInput['client'], directory: stri
     if (identity === null) {
       throw new Error(`auditor model '${config.auditorModel}' is not a <provider>/<model-id> slug`);
     }
+    // FR-102: over the process-wide cap, reject BEFORE creating a side
+    // session — runPeerAudit fails open (FR-005) and nothing leaks.
+    if (shared.auditsInFlight >= maxConcurrent) {
+      throw new Error(`auditor busy: ${shared.auditsInFlight} audits already in flight (cap ${maxConcurrent})`);
+    }
+    shared.auditsInFlight += 1;
+    try {
+      return await runAuditorSideSession(prompt, config, identity);
+    } finally {
+      shared.auditsInFlight -= 1;
+    }
+  };
+
+  async function runAuditorSideSession(
+    prompt: string,
+    config: AuditConfig,
+    identity: { providerID: string; modelID: string }
+  ): Promise<string> {
     const created = await client.session.create({
       body: {
         title: `supervisor-audit @ ${config.auditorModel}${config.auditorVariant !== undefined ? ` (${config.auditorVariant})` : ''}`,
@@ -1052,19 +1171,41 @@ export function createInvokeModel(client: PluginInput['client'], directory: stri
         log.error(`auditor side session delete failed open: ${errorText(error)}`);
       }
     };
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const body: PromptBodyWithVariant = {
         model: { providerID: identity.providerID, modelID: identity.modelID },
         parts: [{ type: 'text', text: prompt }],
+        // FR-100: the audit prompt is self-contained — no tools.
+        tools: SIDE_SESSION_TOOLS,
       };
       if (config.auditorVariant !== undefined) {
         body.variant = config.auditorVariant;
       }
-      const prompted = await client.session.prompt({
+      const promptCall = client.session.prompt({
         path: { id: auditorSessionID },
         query: { directory },
         body,
       });
+      // FR-101: bound the prompt, raced the same way the repair
+      // invoker is. A late rejection of the losing prompt promise
+      // must not surface as an unhandled rejection.
+      promptCall.catch(() => {});
+      const boundedMs = Math.max(1, timeoutMs);
+      const prompted = await Promise.race([
+        promptCall,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            // Stop the server-side generation before the delete below;
+            // best effort, never masks the timeout error.
+            void Promise.resolve()
+              .then(() => client.session.abort({ path: { id: auditorSessionID } }))
+              .catch((error: unknown) => log.error(`auditor side session abort failed open: ${errorText(error)}`));
+            reject(new Error(`auditor side session timed out after ${boundedMs}ms`));
+          }, boundedMs);
+          timer.unref?.();
+        }),
+      ]);
       if (prompted.data === undefined) {
         throw new Error(responseFailure('auditor side session prompt failed', prompted));
       }
@@ -1091,12 +1232,15 @@ export function createInvokeModel(client: PluginInput['client'], directory: stri
       await deleteSideSession();
       throw error;
     } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
       // Discard the self-suppression registration with the session
       // itself: once deleted, the side session no longer exists, so
       // no further events can carry this ID.
       auditorSessionIds.delete(auditorSessionID);
     }
-  };
+  }
 }
 
 /**
@@ -1158,6 +1302,8 @@ export function createRepairInvoker(
         body: {
           model: { providerID: identity.providerID, modelID: identity.modelID },
           parts: [{ type: 'text', text: prompt }],
+          // FR-100: the repair prompt is self-contained — no tools.
+          tools: SIDE_SESSION_TOOLS,
         },
       });
       // A late rejection of the losing prompt promise must not surface as
@@ -1663,6 +1809,15 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
   // instead. Fire-and-forget (FR-053): a listener that is not up yet at
   // bootstrap absorbs the loss.
   const logger = createPluginLogger(input.client);
+  // FR-103: two copies of the plugin for one directory (say the npm
+  // package in the global config and a local checkout in the project
+  // config) each run every hook — duplicate audits and guards. Say so.
+  const otherCopies = registerPluginLoad(input.directory, import.meta.url);
+  if (otherCopies.length > 0) {
+    logger.warn(
+      `opencode-supervisor is loaded more than once for ${input.directory} (this copy: ${import.meta.url}; already running: ${otherCopies.join(', ')}). Remove one entry from the "plugin" arrays in your global and project opencode config.`
+    );
+  }
   // Engineer console (FR-026..FR-032): directives are static policy
   // loaded once per plugin start — not per-session state. Files come
   // from `.opencode/supervisor/directives/*.md` in the project
@@ -2608,9 +2763,24 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         // profiles reach the subagent sessions a task starts.
         if (event.type === 'session.created' || event.type === 'session.updated') {
           const info = event.properties.info;
+          // FR-099: a side session made by ANY copy of the plugin (any
+          // version) is suppressed from its first event on — the title
+          // is the one marker every copy can see.
+          if (typeof info?.id === 'string' && isSideSessionTitle(info.title)) {
+            auditorSessionIds.add(info.id);
+            return;
+          }
           if (typeof info?.id === 'string' && !isAuditorSessionId(info.id)) {
             sessionState.get(info.id).parentID =
               typeof info.parentID === 'string' && info.parentID !== '' ? info.parentID : null;
+          }
+          return;
+        }
+        // FR-099: a deleted session emits no further events.
+        if (event.type === 'session.deleted') {
+          const info = event.properties.info;
+          if (typeof info?.id === 'string') {
+            auditorSessionIds.delete(info.id);
           }
           return;
         }
