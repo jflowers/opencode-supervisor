@@ -1,0 +1,8 @@
+schema: spec-driven
+created: 2026-11-18
+goal: Stop plugin side sessions from being supervised as normal sessions, and bound every auditor side session in tools, time, and count
+affected_areas:
+  - index.ts
+  - test/audit.test.ts
+  - README.md
+  - CHANGELOG.md
