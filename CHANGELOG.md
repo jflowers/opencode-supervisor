@@ -5,6 +5,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.13.0] - 2026-11-19
+
 ### Fixed
 
 - Two copies of the plugin loaded for one project (an npm entry in

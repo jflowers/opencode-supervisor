@@ -77,7 +77,7 @@ Requires OpenCode **1.19.0** or later.
 ### 3.1 Install for yourself
 
 ```bash
-opencode plugin opencode-agent-supervisor@2.12.0 --global
+opencode plugin opencode-agent-supervisor@2.13.0 --global
 ```
 
 OpenCode downloads the package and adds it to the `plugin` array of
@@ -93,7 +93,7 @@ the repository runs the same supervisor version:
 
 ```json
 {
-  "plugin": ["opencode-agent-supervisor@2.12.0"]
+  "plugin": ["opencode-agent-supervisor@2.13.0"]
 }
 ```
 
@@ -1211,8 +1211,8 @@ opencode-supervisor is loaded more than once for /path/to/project
 
 The plugin is listed twice, for example as `opencode-agent-supervisor@x.y.z`
 in your global config and as a path to a local checkout in the
-project's `opencode.json`. Remove one entry. Since the next release
-after 2.12.0, two copies no longer audit each other's side sessions.
+project's `opencode.json`. Remove one entry. Since 2.13.0, two
+copies no longer audit each other's side sessions.
 Every auditor side session also runs with no tools, gives up after
 180 s, and at most 4 run at once; anything past those limits passes
 unaudited and is logged. Earlier versions could audit each other's
