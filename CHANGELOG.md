@@ -5,6 +5,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- The auditor is told which tool arguments another plugin filled in
+  (for example the research harness's `topic:<slug>` tag, Dewey
+  `tag`/`source_id`, or a default `grep`/`glob` path), so it no longer
+  flags them as the agent's deviations. Plugins publish them per
+  callID on their shared state; README 4.8 documents the contract
+  (FR-106).
+
+### Fixed
+
+- The protected-state check no longer blocks paths with a wildcard
+  directory segment, such as `glob` with `**/*.md` or `cat src/*/x.ts`,
+  as touching `approvals.json`. A wildcard now stands for a protected
+  file name only as the path's last segment (FR-107).
+
 ## [2.13.0] - 2026-11-19
 
 ### Fixed

@@ -132,6 +132,14 @@ Respond strictly in JSON:
 }`;
 
 /**
+ * Header for the plugin-injected arguments section of the audit prompt
+ * (FR-106). Only rendered when a producer published records for the
+ * session, so prompts without them are unchanged.
+ */
+export const PLUGIN_INJECTED_ARGS_NOTE = `Plugin-injected tool arguments (another plugin filled these in on the agent's recent tool calls; the agent did not write them):
+Do not flag these values as the agent's deviation, scope drift, or unlisted arguments, and do not ask the agent to remove them, re-run the call without them, or retract a result because of them. A step that attributes them to itself is mistaken about authorship, not wrong about the call; a correct claim built on such a call stays correct.`;
+
+/**
  * Evaluates an arithmetic chain with standard operator precedence (FR-062,
  * design D1): multiplication and division bind before addition and
  * subtraction, and both tiers are left-associative. Division by zero
@@ -331,6 +339,8 @@ function normalizeVerdict(parsed: unknown): PeerAuditOutcome {
  * @param goal Session goal (first user message) for scope-drift findings.
  * @param directivesText Rendered engineer directives (FR-031) appended as
  *   violation criteria; absent preserves the 2.1.0 prompt exactly.
+ * @param injectedArgsText Rendered plugin-injected tool arguments (FR-106)
+ *   for the session's recent calls; absent leaves the prompt unchanged.
  * @returns The structured audit verdict, with severity on failure.
  */
 export async function runPeerAudit(
@@ -338,7 +348,8 @@ export async function runPeerAudit(
   config: AuditConfig,
   invokeModel: InvokeModel,
   goal?: string,
-  directivesText?: string
+  directivesText?: string,
+  injectedArgsText?: string
 ): Promise<PeerAuditOutcome> {
   if (steps.length === 0) {
     return { passed: true, critique: 'No formal steps to audit.' };
@@ -369,8 +380,14 @@ export async function runPeerAudit(
   const directivesSection = trimmedDirectives
     ? `Engineer directives (flag steps that violate them):\n${trimmedDirectives}\n\n`
     : '';
+  // FR-106: arguments another plugin filled in on the agent's recent
+  // tool calls. OpenCode records the call input after every plugin hook
+  // ran, so the agent sees these values as its own and may reason about
+  // them as if it chose them; they are not its deviations.
+  const trimmedInjected = injectedArgsText?.trim();
+  const injectedSection = trimmedInjected ? `${PLUGIN_INJECTED_ARGS_NOTE}\n${trimmedInjected}\n\n` : '';
   const stepsSection = steps.map((s, idx) => `Step ${idx + 1}: ${s}`).join('\n');
-  const prompt = `${AUDITOR_SYSTEM_PROMPT}\n\n${goalSection}${directivesSection}Reasoning steps to audit:\n${stepsSection}`;
+  const prompt = `${AUDITOR_SYSTEM_PROMPT}\n\n${goalSection}${directivesSection}${injectedSection}Reasoning steps to audit:\n${stepsSection}`;
 
   try {
     const response = await invokeModel(prompt, config);

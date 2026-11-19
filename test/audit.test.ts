@@ -1467,6 +1467,34 @@ test('event hook audits a completed reasoning part exactly once and records the 
   });
 });
 
+test('event hook tells the auditor which args another plugin injected (FR-106)', async () => {
+  await withCleanSupervisorEnv(async () => {
+    const key = Symbol.for('opencode-research-harness.shared-state');
+    const store = globalThis as unknown as Record<symbol, unknown>;
+    const previous = store[key];
+    store[key] = {
+      injectedArgs: new Map([
+        ['call-a', { sessionID: 'audit-session-injected', tool: 'note_save', args: { tags: ['topic:wirecheck'] } }],
+        ['call-b', { sessionID: 'someone-else', tool: 'grep', args: { path: '/elsewhere' } }],
+      ]),
+    };
+    try {
+      const { input, calls } = auditHarness([
+        '{"passed":true,"failedStep":null,"severity":null,"critique":"All steps verified."}',
+      ]);
+      const hooks = await plugin.server(input);
+      await dispatchPart(hooks, completedReasoningPart({ sessionID: 'audit-session-injected' }));
+      const promptText = calls.prompt[0].body.parts[0].text;
+      assert.ok(promptText.includes('Plugin-injected tool arguments'), promptText);
+      assert.ok(promptText.includes('- note_save (call call-a, by opencode-research-harness): tags=["topic:wirecheck"]'));
+      assert.ok(!promptText.includes('/elsewhere'));
+    } finally {
+      if (previous === undefined) delete store[key];
+      else store[key] = previous;
+    }
+  });
+});
+
 test('event hook records only passed steps in the verified trace', async () => {
   await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness([

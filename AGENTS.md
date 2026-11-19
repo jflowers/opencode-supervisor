@@ -19,7 +19,7 @@ bun install
 bun test
 
 # Test (Node 22+)
-node --test test/audit.test.ts test/memo.test.ts test/reminders.test.ts test/directives.test.ts test/console.test.ts test/gates.test.ts test/plugin-log.test.ts test/config-file.test.ts test/arg-repair.test.ts test/guard-profiles.test.ts test/external-access.test.ts test/text-tool-call.test.ts
+node --test test/audit.test.ts test/memo.test.ts test/reminders.test.ts test/directives.test.ts test/console.test.ts test/gates.test.ts test/plugin-log.test.ts test/config-file.test.ts test/arg-repair.test.ts test/guard-profiles.test.ts test/external-access.test.ts test/text-tool-call.test.ts test/plugin-injected.test.ts
 
 # Typecheck (plugin source; tests are not yet type-clean)
 bun run typecheck
@@ -68,6 +68,7 @@ opencode-supervisor/
 │   ├── tool-guard.ts      # Tool intent verification, engineer-directive enforcement, reward-hacking blocks
 │   ├── guard-profiles.ts  # Task-scoped trace-check exemption profiles (command/agent match, ancestor inheritance; global file only, narrowing only) and the guard lock
 │   ├── text-tool-call.ts  # Text tool-call recovery: code masking, shape detection gated on registered tool ids, last-turn assessment, correction text, task-result rewrite
+│   ├── plugin-injected.ts # Plugin-injected tool args: reads other plugins' per-call injected-args records and renders the auditor-prompt section (FR-106)
 │   ├── external-access.ts # External-access supervision: lexical external-path detection, access classes, grants parse/coverage, gate decision, request/question helpers, memo section
 │   ├── plugin-log.ts      # Plugin logger: /log routing, fire-and-forget delivery, warn/error dedupe
 │   └── config-file.ts     # Supervisor config-file validation (project + global JSON tiers)
@@ -84,7 +85,8 @@ opencode-supervisor/
 │   ├── arg-repair.test.ts # Validator, deterministic repairs, repair-model tier, and hook-layer repair tests (node:test, Bun and Node)
 │   ├── guard-profiles.test.ts # Profile validation, matching, inheritance, guard lock, and hook-layer scoping tests (node:test, Bun and Node)
 │   ├── external-access.test.ts # External-access detection, grants, requests, question minting, memo, config/lock, and hook-layer gate tests (node:test, Bun and Node)
-│   └── text-tool-call.test.ts # Text tool-call shapes, code masking, last-turn assessment, config, and hook-layer idle-steer tests (node:test, Bun and Node)
+│   ├── text-tool-call.test.ts # Text tool-call shapes, code masking, last-turn assessment, config, and hook-layer idle-steer tests (node:test, Bun and Node)
+│   └── plugin-injected.test.ts # Injected-args reader, rendering, and auditor-prompt section tests (node:test, Bun and Node)
 ├── skills/
 │   └── reasoning-auditor/ # Standalone skill alternative (no middleware required)
 ├── openspec/              # OpenSpec change management (changes/, specs/, schemas/)

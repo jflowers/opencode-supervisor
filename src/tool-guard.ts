@@ -830,17 +830,37 @@ export const normalizePathToken = (token: string): string => {
  * the shell expands `su*ervisor` and `app*vals.json` onto the
  * protected path at execution time, so exact equality alone was a
  * bypass.
+ *
+ * FR-107: when `run` names a file (`approvals.json`, `config.json`,
+ * `external-access.json`), a glob segment stands in for the file name
+ * only as the path's LAST segment. A wildcard in a directory position
+ * expands to directories, not onto the file, so the glob tool's
+ * `**` + `/*.md` or `src/*` + `/x.ts` no longer read as touching the
+ * approvals file. Exact equality still matches in any position, and
+ * directory runs keep glob semantics in every position.
  */
 export const hasProtectedSegmentRun = (normalized: string, run: string): boolean => {
   const needle = run.split('/');
   const segments = normalized.split('/');
+  const fileRun = isFileNameSegment(needle[needle.length - 1] ?? '');
   for (let i = 0; i + needle.length <= segments.length; i += 1) {
-    if (needle.every((needleSegment, j) => segmentMatches(segments[i + j], needleSegment))) {
+    const runEnd = i + needle.length - 1;
+    const runMatches = needle.every((needleSegment, j) => {
+      const segment = segments[i + j];
+      if (fileRun && i + j === runEnd && runEnd !== segments.length - 1) {
+        return segment === needleSegment;
+      }
+      return segmentMatches(segment, needleSegment);
+    });
+    if (runMatches) {
       return true;
     }
   }
   return false;
 };
+
+/** True when a protected-run segment names a file (has an extension), not a directory (FR-107). */
+const isFileNameSegment = (segment: string): boolean => /\.[a-z0-9]+$/.test(segment);
 
 /**
  * Compares one normalized path segment against one needle segment
