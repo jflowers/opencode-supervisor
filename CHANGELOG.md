@@ -22,8 +22,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - At most 4 auditor side sessions run at once per process; an audit
   over the cap fails open without creating a session (FR-102).
 
+- Tool-arg repair keeps argument keys it had no reason to change.
+  A plugin whose `tool.execute.before` hook ran first and added keys
+  (for example `source_id`, `tags`, `tag`) no longer loses them when
+  the supervisor rebuilds malformed arguments (FR-104).
+
 ### Added
 
+- The side-session registry,
+  `globalThis[Symbol.for('opencode-agent-supervisor.shared-state')].sideSessionIds`,
+  is a documented cross-plugin contract: other plugins can use it to
+  skip supervisor audit and repair sessions (README 4.8, FR-105).
 - A warning when a second copy of the plugin starts for a directory
   another copy already supervises (FR-103).
 

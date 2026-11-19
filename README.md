@@ -422,7 +422,13 @@ The pass runs first inside `tool.execute.before`:
    call is declared unrepairable.
 4. **Apply.** Repaired arguments are re-validated against the schema
    and merged in place, so the guard, the recorded tool-part input,
-   and execution all see one object.
+   and execution all see one object. Keys the repair had no reason to
+   change keep their emitted values (FR-104): another plugin's
+   `tool.execute.before` hook may have added arguments such as
+   `source_id` or `tags` before this one ran, and a repair that
+   rebuilds the object would otherwise drop them. Only keys the
+   validator flagged, or keys the repair renamed, are the repair's to
+   change, and a kept key never makes the repaired arguments invalid.
 
 The pass never throws — every failure fails open to OpenCode's normal
 schema error. The scope defaults to the builtin tool ids
@@ -638,6 +644,50 @@ never ran. Make the actual tool call now; don't repeat the text."*
 
 Turn it off with `{ "textToolCall": { "enabled": false } }` or
 `OPENCODE_SUPERVISOR_TEXT_TOOL_CALL=false`.
+
+### 4.8 Working Alongside Other Plugins
+
+The supervisor's audit and repair side sessions are ordinary OpenCode
+sessions, so every plugin loaded for the project sees their events.
+A plugin that tracks or steers sessions should skip them. The
+supervisor publishes their ids in a process-wide registry, and this
+is a stable contract (FR-105):
+
+```ts
+type SupervisorSharedState = { sideSessionIds?: Set<string> };
+
+function isSupervisorSideSession(sessionID: string): boolean {
+  const state = (globalThis as Record<symbol, SupervisorSharedState | undefined>)[
+    Symbol.for('opencode-agent-supervisor.shared-state')
+  ];
+  return state?.sideSessionIds?.has(sessionID) === true;
+}
+```
+
+- **Key and shape.** `globalThis[Symbol.for('opencode-agent-supervisor.shared-state')]`
+  is an object with a `sideSessionIds: Set<string>` field. Every copy
+  of the supervisor in the process shares it (FR-099). Treat it as
+  read-only, and treat a missing record as "no supervisor loaded".
+  Other fields on the record are internal.
+- **Lifetime.** An id is added before the side session is prompted,
+  so it is present before any message, part, `chat.message`, or tool
+  event for that session. It is removed when the side session is
+  deleted.
+- **`session.created`.** OpenCode publishes `session.created` while
+  the create call is still in flight, before the supervisor knows the
+  id. The supervisor's `event` hook registers the session from its
+  title (`supervisor-audit @` / `supervisor-repair @`) synchronously,
+  before its first `await`, so a plugin whose `event` hook runs after
+  the supervisor's already sees the id. Global plugins load before
+  project plugins, which gives that order when the supervisor is
+  global. A plugin that may run first should check the registry again
+  when it acts on the session, or fall back to the title prefixes.
+- **Supervisor builds without the registry** (2.12.0 and earlier):
+  fall back to the title prefixes.
+
+The supervisor's tool-arg repair keeps argument keys other plugins
+add (Section 4.5), so plugin order in `tool.execute.before` does not
+matter for injected keys.
 
 ## 5. The Agent Console
 

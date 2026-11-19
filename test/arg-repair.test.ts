@@ -24,6 +24,7 @@ import {
   deterministicRepair,
   mergeArgsInPlace,
   parseRepairResponse,
+  preserveUntouchedKeys,
   repairToolArgs,
   validateJsonSchemaSubset,
   type RepairInvoker,
@@ -487,6 +488,70 @@ test('repairToolArgs reports no repair model when the invoker is null', async ()
   assert.match(outcome.reason ?? '', /no repair model configured/);
 });
 
+// ── Pure module: preserveUntouchedKeys (FR-104) ──────────────────────────
+
+/** Keys a research-harness plugin injects ahead of the supervisor's repair. */
+const INJECTED_KEYS = { source_id: 'src-42', tags: ['topic:auth'], tag: 'topic:auth' };
+
+test('repairToolArgs keeps injected keys through a deterministic repair', async () => {
+  const outcome = await repairToolArgs(
+    { questions: JSON.stringify(VALID_QUESTIONS), ...INJECTED_KEYS },
+    QUESTION_SCHEMA,
+    null,
+    REPAIR_CONTEXT
+  );
+  assert.equal(outcome.method, 'deterministic');
+  assert.deepEqual(outcome.args, { questions: VALID_QUESTIONS, ...INJECTED_KEYS });
+});
+
+test('repairToolArgs keeps injected keys the repair model dropped or rewrote', async () => {
+  const outcome = await repairToolArgs(
+    { questions: null, ...INJECTED_KEYS },
+    QUESTION_SCHEMA,
+    async () => JSON.stringify({ args: { questions: VALID_QUESTIONS, tag: 'rewritten' } }),
+    REPAIR_CONTEXT
+  );
+  assert.equal(outcome.method, 'model');
+  assert.deepEqual(outcome.args, { questions: VALID_QUESTIONS, ...INJECTED_KEYS });
+});
+
+test('preserveUntouchedKeys leaves flagged keys to the repair', () => {
+  const schema = { type: 'object', properties: { tags: { type: 'array' } } };
+  const emitted = { tags: 'topic:auth', source_id: 'src-42' };
+  const issues = validateJsonSchemaSubset(emitted, schema);
+  assert.deepEqual(preserveUntouchedKeys(emitted, { tags: ['topic:auth'] }, issues, schema), {
+    tags: ['topic:auth'],
+    source_id: 'src-42',
+  });
+});
+
+test('preserveUntouchedKeys does not restore a key the repair renamed', () => {
+  const schema = {
+    type: 'object',
+    properties: { content: { type: 'string' } },
+    required: ['content'],
+  };
+  const emitted = { contents: 'hello', source_id: 'src-42' };
+  const issues = validateJsonSchemaSubset(emitted, schema);
+  assert.deepEqual(preserveUntouchedKeys(emitted, { content: 'hello' }, issues, schema), {
+    content: 'hello',
+    source_id: 'src-42',
+  });
+});
+
+test('preserveUntouchedKeys never makes a valid repair invalid', () => {
+  // A root anyOf failure is reported at '$', so no key is flagged; each
+  // emitted value is restored only if the result still validates.
+  const schema = {
+    type: 'object',
+    anyOf: [{ properties: { a: { type: 'string' }, b: { type: 'number' } }, required: ['a'] }],
+  };
+  const emitted = { a: 1, b: 'x', source_id: 'src-42' };
+  const issues = validateJsonSchemaSubset(emitted, schema);
+  assert.deepEqual(issues.map((issue) => issue.path), ['$']);
+  assert.deepEqual(preserveUntouchedKeys(emitted, { a: '1' }, issues, schema), { a: '1', source_id: 'src-42' });
+});
+
 // ── Pure module: mergeArgsInPlace ─────────────────────────────────────────
 
 test('mergeArgsInPlace replaces keys on the same object reference', () => {
@@ -624,6 +689,24 @@ test('the repair pass fixes stringified arrays deterministically without a model
 
     assert.deepEqual(args, { questions: VALID_QUESTIONS });
     assert.equal(promptTexts.length, 0);
+  });
+});
+
+test('the repair pass keeps keys another plugin injected before it (FR-104)', async () => {
+  await withCleanSupervisorEnv(async () => {
+    const { input, promptTexts } = repairPluginInput();
+    const hooks = await plugin.server(input, repairOnlyOptions());
+    await dispatchChatMessage(hooks, 'repair-inject-1', { providerID: 'enmaas', modelID: 'glm-5-3' });
+    // A research-harness hook ran first and scoped the call.
+    const det: Record<string, unknown> = { questions: JSON.stringify(VALID_QUESTIONS), source_id: 'src-42', tags: ['t'] };
+    const model: Record<string, unknown> = { questions: null, source_id: 'src-42', tag: 't' };
+
+    await dispatchToolBefore(hooks, 'repair-inject-1', 'question', det, 'call-det');
+    await dispatchToolBefore(hooks, 'repair-inject-1', 'question', model, 'call-model');
+
+    assert.deepEqual(det, { questions: VALID_QUESTIONS, source_id: 'src-42', tags: ['t'] });
+    assert.deepEqual(model, { questions: VALID_QUESTIONS, source_id: 'src-42', tag: 't' });
+    assert.equal(promptTexts.length, 1);
   });
 });
 
