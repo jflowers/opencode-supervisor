@@ -6,6 +6,7 @@ import path from 'node:path';
 import type { Hooks, PluginInput } from '@opencode-ai/plugin';
 import plugin, {
   createInvokeModel,
+  createRepairInvoker,
   isSideSessionTitle,
   PLUGIN_VERSION,
   registerPluginLoad,
@@ -3510,5 +3511,94 @@ test('two copies of the plugin never audit each other\'s side sessions', async (
     a.release();
     await auditRun;
     assert.equal(a.calls.delete.length, 1);
+  });
+});
+
+// ── Cross-plugin side-session registry contract (FR-105) ──────────
+
+/**
+ * What another plugin sees: the raw registry under the documented
+ * global symbol, read WITHOUT importing this package.
+ */
+function foreignRegistry(): Set<string> | undefined {
+  const store = globalThis as unknown as Record<symbol, { sideSessionIds?: Set<string> } | undefined>;
+  return store[Symbol.for('opencode-agent-supervisor.shared-state')]?.sideSessionIds;
+}
+
+test('the side-session registry is reachable under the documented global symbol', () => {
+  const registry = foreignRegistry();
+  assert.ok(registry instanceof Set);
+  assert.equal(registry, sharedSupervisorState().sideSessionIds);
+});
+
+/**
+ * A client that behaves like OpenCode 1.19: `session.create` publishes
+ * `session.created` to every plugin's `event` hook (in plugin order,
+ * not awaited) BEFORE the create response returns, and the first
+ * message event follows the prompt. `observe` records, per event,
+ * whether a later plugin found the id in the registry.
+ */
+function dispatchingClient(eventHooks: Array<(input: { event: unknown }) => unknown>, idPrefix: string) {
+  const seen: Array<{ event: string; registered: boolean }> = [];
+  let created = 0;
+  const publish = (type: string, info: Record<string, unknown>): void => {
+    for (const hook of eventHooks) {
+      void hook({ event: { type, properties: { info } } });
+    }
+  };
+  const client = {
+    session: {
+      create: async (options: { body: { title: string } }) => {
+        created += 1;
+        const id = `${idPrefix}-${created}`;
+        publish('session.created', { id, title: options.body.title });
+        return { data: { id } };
+      },
+      prompt: async (options: { path: { id: string } }) => {
+        publish('message.updated', { id: options.path.id, sessionID: options.path.id });
+        return {
+          data: {
+            info: {},
+            parts: [{ type: 'text', text: '{"passed":true,"failedStep":null,"severity":null,"critique":"ok"}' }],
+          },
+        };
+      },
+      abort: async () => ({}),
+      delete: async () => ({}),
+    },
+    ...silentClientSurface,
+  };
+  const otherPlugin = ({ event }: { event: unknown }): void => {
+    const { type, properties } = event as { type: string; properties: { info: { id: string; sessionID?: string } } };
+    const id = properties.info.sessionID ?? properties.info.id;
+    seen.push({ event: type, registered: foreignRegistry()?.has(id) === true });
+  };
+  return { client: client as unknown as PluginInput['client'], seen, otherPlugin };
+}
+
+test('a side session is registered before its first event reaches a later plugin', async () => {
+  await withCleanSupervisorEnv(async () => {
+    const supervisorHooks = await plugin.server(silentPluginInput('/tmp/supervisor-registry-contract'));
+    const hooks: Array<(input: { event: unknown }) => unknown> = [];
+    const audit = dispatchingClient(hooks, 'contract-audit');
+    const repair = dispatchingClient(hooks, 'contract-repair');
+    // Supervisor first (global plugins load before project plugins),
+    // then the consuming plugin.
+    hooks.push(supervisorHooks.event as never, audit.otherPlugin, repair.otherPlugin);
+
+    await createInvokeModel(audit.client, '/workdir', silentPluginLogger)('Audit these steps.', baseAuditConfig);
+    await createRepairInvoker(repair.client, '/workdir', silentPluginLogger)('Repair these args.', 'mock/repair', 5000);
+
+    for (const observer of [audit, repair]) {
+      const events = observer.seen.map((entry) => entry.event);
+      assert.ok(events.includes('session.created'));
+      assert.ok(events.includes('message.updated'));
+      for (const entry of observer.seen) {
+        assert.equal(entry.registered, true, `${entry.event} reached the later plugin before registration`);
+      }
+    }
+    // Deleted side sessions leave the registry.
+    assert.equal(foreignRegistry()?.has('contract-audit-1'), false);
+    assert.equal(foreignRegistry()?.has('contract-repair-1'), false);
   });
 });

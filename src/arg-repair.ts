@@ -842,7 +842,11 @@ export const repairToolArgs = async (
   }
   const deterministic = deterministicRepair(args, root);
   if (deterministic !== null) {
-    return { status: 'repaired', args: deterministic.args, method: 'deterministic' };
+    return {
+      status: 'repaired',
+      args: preserveUntouchedKeys(args, deterministic.args, issues, root),
+      method: 'deterministic',
+    };
   }
   if (invokeModel === null) {
     return { status: 'error', reason: 'no repair model configured' };
@@ -882,7 +886,71 @@ export const repairToolArgs = async (
       reason: `repaired arguments still invalid: ${recheck[0]?.path}: ${recheck[0]?.message}`,
     };
   }
-  return { status: 'repaired', args: parsed.args, method: 'model' };
+  return { status: 'repaired', args: preserveUntouchedKeys(args, parsed.args, issues, root), method: 'model' };
+};
+
+/**
+ * Whether an issue path points at or into top-level argument `key`
+ * ('$.tags', '$.tags[0]', '$.tags.x'). Matching against the known key
+ * keeps keys that contain dots unambiguous.
+ */
+const issueTouchesKey = (path: string, key: string): boolean => {
+  const prefix = `$.${key}`;
+  return path === prefix || path.startsWith(`${prefix}.`) || path.startsWith(`${prefix}[`);
+};
+
+/**
+ * Keep the emitted keys a repair had no reason to change (FR-104). A
+ * repair rebuilds the whole args object, so a key another plugin's
+ * `tool.execute.before` hook added (a research harness's `source_id`,
+ * `tags`, `tag`) would otherwise vanish when that plugin runs first. A
+ * key the validator did not flag was valid as emitted, so its emitted
+ * value wins — whether the repair dropped it or rewrote it. A flagged key
+ * is the repair's to change. A dropped key whose value the repair moved
+ * to a key it introduced is a rename and stays dropped. Each restored key
+ * is kept only while the result still validates, so preservation never
+ * turns a valid repair back into an invalid one.
+ *
+ * @param emitted The emitted (invalid) arguments the repair started from.
+ * @param repaired The repaired arguments (already valid).
+ * @param issues Validation issues for the emitted arguments.
+ * @param root The tool's JSON schema.
+ * @returns The repaired arguments with untouched emitted keys restored.
+ */
+export const preserveUntouchedKeys = (
+  emitted: unknown,
+  repaired: unknown,
+  issues: SchemaIssue[],
+  root: JsonSchema
+): unknown => {
+  if (!isPlainObject(emitted) || !isPlainObject(repaired)) {
+    return repaired;
+  }
+  // The validator stops at MAX_ISSUES; past that, some invalid keys may
+  // be unflagged, and the per-key validity check below still guards them.
+  const flagged = new Set(
+    [...Object.keys(emitted), ...Object.keys(repaired)].filter((key) =>
+      issues.some((issue) => issueTouchesKey(issue.path, key))
+    )
+  );
+  const introduced = Object.keys(repaired).filter((key) => !Object.hasOwn(emitted, key) || flagged.has(key));
+  const result: Record<string, unknown> = { ...repaired };
+  for (const [key, value] of Object.entries(emitted)) {
+    if (flagged.has(key)) {
+      continue;
+    }
+    if (Object.hasOwn(repaired, key) && jsonEquals(repaired[key], value)) {
+      continue;
+    }
+    if (!Object.hasOwn(repaired, key) && introduced.some((other) => jsonEquals(repaired[other], value))) {
+      continue; // renamed or moved by the repair
+    }
+    const candidate: Record<string, unknown> = { ...result, [key]: value };
+    if (validateJsonSchemaSubset(candidate, root).length === 0) {
+      result[key] = value;
+    }
+  }
+  return result;
 };
 
 /**
