@@ -838,8 +838,16 @@ export const normalizePathToken = (token: string): string => {
  * `**` + `/*.md` or `src/*` + `/x.ts` no longer read as touching the
  * approvals file. Exact equality still matches in any position, and
  * directory runs keep glob semantics in every position.
+ *
+ * FR-108: `home` names the directory a file run lives in, for a run
+ * that does not carry it (`approvals.json` lives in
+ * `opencode/supervisor`). With `home` set, a glob last segment stands
+ * for the file only when the segments before it can name that
+ * directory (`precedingCanNameHome`), so prose like `opsx/*` in a
+ * free-text argument no longer reads as the approvals file. An exact
+ * file-name match ignores `home`.
  */
-export const hasProtectedSegmentRun = (normalized: string, run: string): boolean => {
+export const hasProtectedSegmentRun = (normalized: string, run: string, home?: string): boolean => {
   const needle = run.split('/');
   const segments = normalized.split('/');
   const fileRun = isFileNameSegment(needle[needle.length - 1] ?? '');
@@ -852,11 +860,38 @@ export const hasProtectedSegmentRun = (normalized: string, run: string): boolean
       }
       return segmentMatches(segment, needleSegment);
     });
-    if (runMatches) {
+    if (!runMatches) {
+      continue;
+    }
+    const globFileName = fileRun && segments[runEnd] !== needle[needle.length - 1];
+    if (home === undefined || !globFileName || precedingCanNameHome(segments.slice(0, i), home.split('/'))) {
       return true;
     }
   }
   return false;
+};
+
+/**
+ * FR-108: true when the path segments before a glob file name can
+ * name the protected file's home directory: none (a bare glob,
+ * relative to wherever it runs), a suffix of `home` (a relative path
+ * from inside it, e.g. `supervisor/*`), a path ending in `home`, or a
+ * path holding a `**` segment (which spans any directories). Each
+ * comparison uses glob semantics, so `su*ervisor` still names home.
+ */
+const precedingCanNameHome = (preceding: string[], home: string[]): boolean => {
+  if (preceding.includes('**')) {
+    return true;
+  }
+  const tailMatches = (length: number): boolean => {
+    const pathTail = preceding.slice(preceding.length - length);
+    const homeTail = home.slice(home.length - length);
+    return pathTail.every((segment, k) => segmentMatches(segment, homeTail[k]));
+  };
+  if (preceding.length <= home.length) {
+    return tailMatches(preceding.length);
+  }
+  return tailMatches(home.length);
 };
 
 /** True when a protected-run segment names a file (has an extension), not a directory (FR-107). */
@@ -888,31 +923,174 @@ const segmentMatches = (segment: string, needleSegment: string): boolean => {
 };
 
 /**
+ * OpenCode builtin tool names (FR-110). Builtins keep the full path
+ * token scan in every non-content argument: `apply_patch` names its
+ * targets inside multi-line patch text, so prose is not a safe
+ * signal there. Every other name is a custom, plugin, or MCP tool.
+ */
+const OPENCODE_BUILTIN_TOOLS = [
+  'bash',
+  'read',
+  'write',
+  'edit',
+  'multiedit',
+  'patch',
+  'apply_patch',
+  'glob',
+  'grep',
+  'list',
+  'lsp',
+  'webfetch',
+  'websearch',
+  'codesearch',
+  'task',
+  'todowrite',
+  'todoread',
+  'question',
+  'skill',
+  'batch',
+];
+
+/**
+ * Shell-style argument keys (FR-110): a custom or MCP tool that runs
+ * a command takes it under one of these, so whitespace there is
+ * command syntax, not prose, and the value keeps the token scan.
+ */
+const SHELL_ARG_KEYS = ['command', 'cmd', 'commands', 'script', 'shell', 'code', 'args', 'argv', 'exec'];
+
+/** One argument's normalized path candidates for the protected-state path lens. */
+interface ProtectedLensEntry {
+  /** Argument key, or null for bash (attributed to the whole call). */
+  key: string | null;
+  normalized: string[];
+}
+
+/**
+ * Builds the protected-state path lens per argument (FR-061, FR-110).
+ * Bash: one entry from the caller's tokens, every token operational.
+ * Other tools: one entry per non-content string argument. For a tool
+ * that is not a builtin, a value holding whitespace under a non-shell
+ * key is prose and is checked as one whole path rather than split
+ * into tokens, so a sentence that mentions supervisor state is not a
+ * touch, while a whole-value path with spaces in it (`my dir/../../
+ * .opencode/supervisor/approvals.json`) still normalizes onto it.
+ */
+const buildProtectedLens = (
+  toolName: string,
+  args: Record<string, unknown> | undefined,
+  argPaths: string[]
+): ProtectedLensEntry[] => {
+  if (toolName === 'bash') {
+    return [{ key: null, normalized: argPaths.map(normalizePathToken) }];
+  }
+  const builtin = OPENCODE_BUILTIN_TOOLS.includes(toolName);
+  const entries: ProtectedLensEntry[] = [];
+  for (const [key, value] of Object.entries(args ?? {})) {
+    if (CONTENT_ARG_KEYS.includes(key) || typeof value !== 'string') {
+      continue;
+    }
+    const trimmed = value.trim();
+    const prose = !builtin && !SHELL_ARG_KEYS.includes(key) && /\s/.test(trimmed);
+    const paths = prose ? [trimmed] : extractPolicyPaths({ [key]: value });
+    entries.push({ key, normalized: paths.map(normalizePathToken) });
+  }
+  return entries;
+};
+
+/** One protected object: its name for the reason, and its two lenses. */
+interface ProtectedObject {
+  /** The object in words; never a path (FR-109). */
+  name: string;
+  /** What depends on it. */
+  why: string;
+  path: (normalized: string) => boolean;
+  raw: (commandLower: string) => boolean;
+}
+
+/**
+ * The protected objects in check order (FR-061, FR-083, FR-108).
+ * Raw lenses: token-boundary matching for file names (review round
+ * 4: `stale-approvals.json` names a different file); none for the
+ * directory backstop, where the bare word `supervisor` is too common
+ * in command prose (documented residual in FR-061).
+ */
+const PROTECTED_OBJECTS: readonly ProtectedObject[] = [
+  {
+    name: 'the approvals file',
+    why: 'engineer approval gates depend on it',
+    path: (p) => hasProtectedSegmentRun(p, 'approvals.json', 'opencode/supervisor'),
+    raw: (c) => /(?:^|[^a-z0-9_.-])approvals\.json/.test(c),
+  },
+  {
+    name: 'the supervisor config file',
+    why: 'tool-guard toggles and the auditor model depend on it',
+    path: (p) => hasProtectedSegmentRun(p, 'opencode/supervisor/config.json'),
+    raw: (c) => c.includes('supervisor') && c.includes('config.json'),
+  },
+  {
+    name: 'the supervisor directives',
+    why: 'enforcement rules and gates depend on them',
+    path: (p) => hasProtectedSegmentRun(p, 'opencode/supervisor/directives'),
+    raw: (c) => c.includes('supervisor') && c.includes('directives'),
+  },
+  {
+    name: 'the external-access grants file',
+    why: 'external-access grants depend on it',
+    path: (p) => hasProtectedSegmentRun(p, 'opencode/supervisor/external-access.json'),
+    raw: (c) => /(?:^|[^a-z0-9_.-])external-access\.json/.test(c),
+  },
+  {
+    name: 'the supervisor state directory',
+    why: 'engineer directives, gates, and configuration depend on it',
+    path: (p) => hasProtectedSegmentRun(p, 'opencode/supervisor'),
+    raw: () => false,
+  },
+];
+
+/**
+ * Renders a protected-state block reason (FR-109). The reason is the
+ * agent's corrective signal, so it says where the protected state
+ * was named, that no approval unblocks the call, and how to retry.
+ * It never prints a supervisor path: the agent echoed a printed
+ * path into its retries and was blocked again in a loop.
+ */
+export const protectedStateReason = (name: string, why: string, key: string | null): string => {
+  const where = key === null ? "this call's arguments name it" : `the '${key}' argument names it`;
+  return (
+    `${name} is engineer-authored state (${why}), and ${where}. ` +
+    'No approval or approvals entry can unblock this call, and the engineer has nothing to add for it. ' +
+    'Remove that path from the arguments and retry; to mention it in text, describe it in words without the path. ' +
+    'Only if the task itself needs that state changed, ask the engineer in chat.'
+  );
+};
+
+/**
  * Protected-state check (FR-061): returns the block reason when
  * the tool call touches engineer-authored supervisor state — the
  * approvals file, either supervisor config file, the directives
- * directory, or the supervisor state directory containing them —
- * and null when the call is allowed. Two lenses pair so evasion
- * spellings cannot slip past either. The path lens matches
- * lexically normalized tokens (traversal collapses, leading dots
- * fold away) and glob-bearing segments by glob semantics (review
- * round 5); for non-bash tools it scans every argument key
- * except the content keys above, so write/edit content is data,
- * never a touch, while custom key names stay covered. The raw
- * lens scans only bash command strings, capped at 64 KiB before
- * any transform — a command is an executable operation, so
- * mentions there are actionable, and the cap bounds allocation;
- * it catches slash-free spellings (`cd .opencode/supervisor &&
- * cat config.json`) the path extractor cannot tokenize (each bash
- * call is a fresh process, so a cd cannot persist across calls).
- * Block reasons name the protected object for the engineer, never
- * the spelling the agent used.
+ * directory, the external-access grants file, or the supervisor
+ * state directory containing them — and null when the call is
+ * allowed. Two lenses pair so evasion spellings cannot slip past
+ * either. The path lens (`buildProtectedLens`) matches lexically
+ * normalized tokens (traversal collapses, leading dots fold away)
+ * and glob-bearing segments by glob semantics (review round 5); for
+ * non-bash tools it reads every argument key except the content
+ * keys above, so write/edit content is data, never a touch, while
+ * custom key names stay covered; prose values of custom tools are
+ * checked whole (FR-110). The raw lens scans only bash command
+ * strings, capped at 64 KiB before any transform — a command is an
+ * executable operation, so mentions there are actionable, and the
+ * cap bounds allocation; it catches slash-free spellings (`cd
+ * .opencode/supervisor && cat config.json`) the path extractor
+ * cannot tokenize (each bash call is a fresh process, so a cd
+ * cannot persist across calls). Block reasons name the protected
+ * object and the argument, never a path (FR-109).
  *
  * @param toolName The tool being invoked.
  * @param args The tool call arguments.
  * @param argPaths Policy paths extracted from the full arguments;
  *   used as-is for bash (every token is operational) and ignored
- *   for other tools, which are re-filtered here minus content keys.
+ *   for other tools, which are re-read here per argument key.
  * @returns The block reason, or null when the call is allowed.
  */
 export const checkProtectedState = (
@@ -920,56 +1098,20 @@ export const checkProtectedState = (
   args: Record<string, unknown> | undefined,
   argPaths: string[]
 ): string | null => {
-  // Path lens: bash arguments are operational in full; other
-  // tools carry their operation in path-like keys while content
-  // keys hold data.
-  const guardArgPaths =
-    toolName === 'bash'
-      ? argPaths
-      : extractPolicyPaths(
-          Object.fromEntries(Object.entries(args ?? {}).filter(([key]) => !CONTENT_ARG_KEYS.includes(key)))
-        );
-  const normalizedArgPaths = guardArgPaths.map(normalizePathToken);
+  const lens = buildProtectedLens(toolName, args, argPaths);
   // Raw lens: the bash command string only, capped before
   // lowercasing so the scan cannot multiply a huge payload.
   const command = args?.command;
   const rawCommandLower =
     toolName === 'bash' && typeof command === 'string' ? command.slice(0, 65536).toLowerCase() : '';
-  if (
-    normalizedArgPaths.some((p) => hasProtectedSegmentRun(p, 'approvals.json')) ||
-    // Review round 4: token-boundary matching — 'stale-approvals.json'
-    // contains the substring but names a different file.
-    /(?:^|[^a-z0-9_.-])approvals\.json/.test(rawCommandLower)
-  ) {
-    return 'the approvals file is engineer-authored state; the supervised agent may not touch it (engineer approval gates depend on it). Ask the engineer to update .opencode/supervisor/approvals.json.';
-  }
-  if (
-    normalizedArgPaths.some((p) => hasProtectedSegmentRun(p, 'opencode/supervisor/config.json')) ||
-    (rawCommandLower.includes('supervisor') && rawCommandLower.includes('config.json'))
-  ) {
-    return 'the supervisor config file is engineer-authored state; the supervised agent may not touch it (tool-guard toggles and the auditor model depend on it). Ask the engineer to edit the supervisor config.json directly.';
-  }
-  if (
-    normalizedArgPaths.some((p) => hasProtectedSegmentRun(p, 'opencode/supervisor/directives')) ||
-    (rawCommandLower.includes('supervisor') && rawCommandLower.includes('directives'))
-  ) {
-    return 'the supervisor directives are engineer-authored state; the supervised agent may not touch them (enforcement rules and gates depend on them). Ask the engineer to edit the directives directory directly.';
-  }
-  // FR-083: the external-access grants file — named explicitly so the
-  // reason says which file, and so a slash-free bash spelling
-  // (`cd .opencode/supervisor && cat external-access.json`) is caught.
-  if (
-    normalizedArgPaths.some((p) => hasProtectedSegmentRun(p, 'opencode/supervisor/external-access.json')) ||
-    /(?:^|[^a-z0-9_.-])external-access\.json/.test(rawCommandLower)
-  ) {
-    return 'the external-access grants file is engineer-authored state; the supervised agent may not touch it (external-access grants depend on it). Ask the engineer to edit .opencode/supervisor/external-access.json.';
-  }
-  // Directory backstop (path lens only): an ancestor spelling
-  // (`rm -rf .opencode/supervisor`) normalizes onto the run
-  // itself. No raw pairing — the bare word 'supervisor' is too
-  // common in command prose (documented residual in FR-061).
-  if (normalizedArgPaths.some((p) => hasProtectedSegmentRun(p, 'opencode/supervisor'))) {
-    return 'the supervisor state directory is engineer-authored state; the supervised agent may not touch it (engineer directives, gates, and configuration depend on it). Ask the engineer to edit the .opencode/supervisor directory directly.';
+  for (const object of PROTECTED_OBJECTS) {
+    const hit = lens.find((entry) => entry.normalized.some(object.path));
+    if (hit !== undefined) {
+      return protectedStateReason(object.name, object.why, hit.key);
+    }
+    if (rawCommandLower !== '' && object.raw(rawCommandLower)) {
+      return protectedStateReason(object.name, object.why, null);
+    }
   }
   return null;
 };

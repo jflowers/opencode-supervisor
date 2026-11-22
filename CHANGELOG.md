@@ -5,6 +5,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A glob in a tool argument no longer counts as touching
+  `approvals.json` unless the folders before it could be the
+  `.opencode/supervisor` folder. Prose such as `opsx/*` in a
+  free-text argument (seen in `dispatch_review_runs`'s
+  `review_context`) had blocked the call. `supervisor/*`, `**/*.json`,
+  and a bare `*` still block (FR-108).
+- A protected-state block no longer tells the agent to ask for an
+  `approvals.json` entry. Agents read that as a missing approval,
+  asked the engineer for one (no approval can unblock this block),
+  and wrote the path into their retry, which was blocked again. The
+  reason now names the argument that held the protected path, says
+  no approval unblocks the call, and tells the agent to remove the
+  path and retry. It prints no supervisor path (FR-109).
+- Custom and MCP tools are no longer blocked for mentioning
+  supervisor state in prose. A string argument with whitespace, such
+  as `checkpoint`'s `data` or `dispatch_review_runs`'s
+  `review_context`, is checked as one whole path instead of being
+  split into path tokens. Shell-style keys (`command`, `cmd`,
+  `script`, `args`, ...), values without whitespace, bash, and the
+  builtin tools keep the full check (FR-110).
+
 ## [2.14.0] - 2026-11-19
 
 ### Added
