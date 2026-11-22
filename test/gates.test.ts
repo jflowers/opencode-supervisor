@@ -23,7 +23,12 @@ import {
   type ApprovalRecord,
 } from '../src/gates.ts';
 import { extractPolicyPaths, type Directive } from '../src/directives.ts';
-import { checkProtectedState, hasProtectedSegmentRun, normalizePathToken } from '../src/tool-guard.ts';
+import {
+  checkProtectedState,
+  hasProtectedSegmentRun,
+  normalizePathToken,
+  protectedStateReason,
+} from '../src/tool-guard.ts';
 
 // ── Helpers (each test file is self-contained) ──
 
@@ -681,6 +686,108 @@ test('checkProtectedState allows recursive globs outside supervisor state (FR-10
   assert.ok(checkProtectedState('glob', { pattern: '**/*', path: '.opencode/supervisor' }, []) !== null);
 });
 
+test('hasProtectedSegmentRun: a glob file name needs a path that can name its home (FR-108)', () => {
+  const home = 'opencode/supervisor';
+  // The live false positive: prose `opsx/*` read as the approvals file.
+  assert.ok(!hasProtectedSegmentRun('opsx/*', 'approvals.json', home));
+  assert.ok(!hasProtectedSegmentRun('docs/*.json', 'approvals.json', home));
+  assert.ok(!hasProtectedSegmentRun('src/supervisor/x/*', 'approvals.json', home));
+  assert.ok(!hasProtectedSegmentRun('users/me/proj/*', 'approvals.json', home));
+  // Paths that can reach the supervisor directory still match.
+  assert.ok(hasProtectedSegmentRun('*', 'approvals.json', home));
+  assert.ok(hasProtectedSegmentRun('supervisor/*', 'approvals.json', home));
+  assert.ok(hasProtectedSegmentRun('opencode/supervisor/*', 'approvals.json', home));
+  assert.ok(hasProtectedSegmentRun('users/me/proj/opencode/supervisor/*.json', 'approvals.json', home));
+  assert.ok(hasProtectedSegmentRun('opencode/su*ervisor/app*vals.json', 'approvals.json', home));
+  assert.ok(hasProtectedSegmentRun('**/app*.json', 'approvals.json', home));
+  assert.ok(hasProtectedSegmentRun('proj/**/*', 'approvals.json', home));
+  // An exact file name ignores home; without home, FR-107 behavior holds.
+  assert.ok(hasProtectedSegmentRun('docs/approvals.json', 'approvals.json', home));
+  assert.ok(hasProtectedSegmentRun('opsx/*', 'approvals.json'));
+});
+
+test('protectedStateReason names the argument and the object, never a path (FR-109)', () => {
+  const keyed = protectedStateReason('the approvals file', 'engineer approval gates depend on it', 'data');
+  assert.ok(keyed.startsWith('the approvals file is engineer-authored state'), keyed);
+  assert.ok(keyed.includes("the 'data' argument names it"), keyed);
+  assert.ok(keyed.includes('No approval or approvals entry can unblock this call'), keyed);
+  assert.ok(keyed.includes('Remove that path from the arguments and retry'), keyed);
+  assert.ok(!keyed.includes('.opencode') && !keyed.includes('approvals.json'), keyed);
+  const bash = protectedStateReason('the supervisor state directory', 'gates depend on it', null);
+  assert.ok(bash.includes("this call's arguments name it"), bash);
+});
+
+test('checkProtectedState reasons carry no supervisor path for any object (FR-109)', () => {
+  const calls: Array<[string, Record<string, unknown>]> = [
+    ['read', { filePath: '.opencode/supervisor/approvals.json' }],
+    ['read', { filePath: '.opencode/supervisor/config.json' }],
+    ['read', { filePath: '.opencode/supervisor/directives/a.md' }],
+    ['read', { filePath: '.opencode/supervisor/external-access.json' }],
+    ['list', { path: '.opencode/supervisor' }],
+  ];
+  for (const [tool, args] of calls) {
+    const reason = checkProtectedState(tool, args, []);
+    assert.ok(reason !== null, JSON.stringify(args));
+    assert.ok(!/\.opencode|approvals\.json|config\.json|external-access\.json/.test(reason!), reason!);
+  }
+  assert.ok(checkProtectedState('read', { filePath: '.opencode/supervisor/x' }, [])!.includes("the 'filePath' argument"));
+});
+
+test('checkProtectedState: prose in a custom tool argument is not a touch (FR-110)', () => {
+  // The live checkpoint call blocked on 2.14.0 (2026-11-22).
+  const data = JSON.stringify({
+    attempt: 1,
+    result: 'WAIVED',
+    waiver_authority:
+      "Directing engineer instruction: 'ignore them and complete the original command'. " +
+      'Formal .opencode/supervisor/approvals.json entry absent (agent blocked from the file by supervisor).',
+  });
+  assert.equal(checkProtectedState('checkpoint', { command: 'uf.address-feedback', data }, []), null);
+  assert.equal(
+    checkProtectedState('mcp-note', { text: 'Read .opencode/supervisor/config.json and the directives dir.' }, []),
+    null
+  );
+});
+
+test('checkProtectedState: whole-value paths and shell keys of custom tools still block (FR-110)', () => {
+  // A path with spaces in it is checked whole, so traversal still lands.
+  assert.ok(
+    checkProtectedState('mcp-file-read', { target: 'my dir/../../.opencode/supervisor/approvals.json' }, []) !== null
+  );
+  // A space-free value keeps the token scan.
+  assert.ok(checkProtectedState('mcp-file-read', { target: '.opencode/supervisor/approvals.json' }, []) !== null);
+  // Shell-style keys keep the token scan even with whitespace.
+  for (const key of ['command', 'cmd', 'script', 'args']) {
+    const reason = checkProtectedState('mcp-shell', { [key]: 'cat .opencode/supervisor/approvals.json' }, []);
+    assert.ok(reason !== null, key);
+    assert.ok(reason!.includes(`the '${key}' argument names it`), reason!);
+  }
+});
+
+test('checkProtectedState: builtins keep the token scan for prose values (FR-110)', () => {
+  const patchText = '*** Begin Patch\n*** Update File: .opencode/supervisor/approvals.json\n@@\n-[]\n+[]\n*** End Patch';
+  assert.ok(checkProtectedState('apply_patch', { patchText }, []) !== null);
+  assert.ok(checkProtectedState('grep', { pattern: 'x', path: 'a b/.opencode/supervisor' }, []) !== null);
+  // Builtin content keys stay data, as before.
+  assert.equal(checkProtectedState('write', { filePath: 'notes.md', content: 'see .opencode/supervisor/approvals.json' }, []), null);
+});
+
+test('checkProtectedState allows prose globs in free-text arguments (FR-108)', () => {
+  // The live dispatch_review_runs call that was blocked on 2.14.0.
+  const args = {
+    command: 'address-feedback',
+    diff_path: '/var/folders/66/x/T/opencode/pr-9728-diff.patch',
+    review_context:
+      '- Spec artifacts: none for branch feat/9597 (no speckit/NNN-* or opsx/* match).\n' +
+      '- Convention packs: .opencode/uf/packs/ contains no pack files.',
+  };
+  assert.equal(checkProtectedState('dispatch_review_runs', args, []), null);
+  // Still blocked: a glob that can reach the approvals file.
+  assert.ok(checkProtectedState('read', { path: '.opencode/supervisor/app*.json' }, []) !== null);
+  const command = 'cd .opencode && cat supervisor/*.json';
+  assert.ok(checkProtectedState('bash', { command }, extractPolicyPaths({ command })) !== null);
+});
+
 test('hasProtectedSegmentRun fails toward blocking on over-long glob segments (review iteration 3)', () => {
   // An over-long glob segment (>4096 chars) cannot be matched
   // within bounds, and in the protected-state context a
@@ -769,7 +876,7 @@ test('the agent cannot touch the approvals file', async () => {
         (error: unknown) => {
           const message = error instanceof Error ? error.message : String(error);
           assert.ok(message.includes('engineer-authored state'), message);
-          assert.ok(message.includes('approvals.json'), message);
+          assert.ok(message.includes('approvals file') && !message.includes('.opencode/supervisor'), message);
           return true;
         }
       );
@@ -936,7 +1043,7 @@ test('custom tool keys cannot touch the approvals file (FR-061)', async () => {
         (error: unknown) => {
           const message = error instanceof Error ? error.message : String(error);
           assert.ok(message.includes('engineer-authored state'), message);
-          assert.ok(message.includes('approvals.json'), message);
+          assert.ok(message.includes("the 'target' argument names it"), message);
           return true;
         }
       );
@@ -983,7 +1090,7 @@ test('bash glob spellings cannot touch protected state (FR-061)', async () => {
         (error: unknown) => {
           const message = error instanceof Error ? error.message : String(error);
           assert.ok(message.includes('engineer-authored state'), message);
-          assert.ok(message.includes('approvals.json'), message);
+          assert.ok(message.includes('approvals file'), message);
           return true;
         }
       );
