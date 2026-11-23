@@ -5,7 +5,10 @@ name: Publish
 # The pipeline is jflowers/ship's shared npm-release.yml: org-infra's
 # preflight (semver, tag uniqueness, CI on HEAD, unreleased commits) creates
 # the tag, then the tag is checked out, package.json's version must equal
-# it, the checks below run, and the package is published with provenance.
+# it, the checks below run, the package is published with provenance (a
+# personal-account package isn't staged), and the GitHub release is created
+# with generated notes. A version already on npm is skipped, so a re-run is
+# safe.
 #
 # Auth: npm trusted publishing (OIDC), no token. npm checks the calling
 # workflow, so npmjs.com trusts this repository and this file (publish.yml),
@@ -28,7 +31,7 @@ concurrency:
 jobs:
   release:
     name: Release
-    uses: jflowers/ship/.github/workflows/npm-release.yml@bf09d24bd206ce8f9f1f44ea1479afa5ca11532d # v0.3.0
+    uses: jflowers/ship/.github/workflows/npm-release.yml@79b475c2892604eaa941f43322b8948626e43ab8 # v0.4.0
     with:
       tag: ${{ inputs.tag }}
       ci_checks: '["check"]'
