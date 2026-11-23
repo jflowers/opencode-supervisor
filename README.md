@@ -149,12 +149,16 @@ A release takes three steps:
    Unreleased entries under the new version, and update the version in
    the install commands above.
 2. Merge it.
-3. Push the tag from `main`: `git tag v<version> && git push origin v<version>`.
+3. Run the Publish workflow from `main` with the tag: Actions → Publish →
+   Run workflow, or `gh workflow run publish.yml -f tag=v<version>`.
+   Don't push the tag yourself; the workflow creates it.
 
-The tag starts the Publish workflow (`.github/workflows/publish.yml`).
-It checks that the tag matches `package.json`, skips a version already
-on npm, runs the typecheck, both test suites and the package check,
-then publishes with provenance. It authenticates through npm trusted
+The Publish workflow (`.github/workflows/publish.yml`) calls the shared
+npm pipeline in [`jflowers/ship`](https://github.com/jflowers/ship). It
+checks the tag (semver, new, CI green on `main`, unreleased commits) and
+creates it, checks that `package.json`'s version matches and isn't on npm
+yet, runs the typecheck, both test suites and the package check, then
+publishes with provenance. It authenticates through npm trusted
 publishing, so no npm token exists. A new version can take a couple of
 minutes to appear on the registry; an install in that window fails
 with "No matching version found" and works on retry.
@@ -186,9 +190,9 @@ Then, in the package's **Settings** on npmjs.com:
 
 The new trusted publisher shows **Pending validation** until the
 workflow publishes once, and npm sets a deadline of about two days for
-that. The hand-published version doesn't count (the workflow skips it),
-so release the next patch version through the three steps above right
-away.
+that. The hand-published version doesn't count (the workflow refuses a
+version already on npm), so release the next patch version through the
+three steps above right away.
 
 ---
 

@@ -38,12 +38,21 @@ opencode plugin "$(pwd)"
   `version` in `package.json` and `PLUGIN_VERSION` in `index.ts` (a test
   keeps them in lockstep), move the CHANGELOG's Unreleased entries under the
   new version, and update the pinned version in the README's install
-  commands. After it merges, push tag `v<version>` from `main`;
-  `.github/workflows/publish.yml` publishes to npm. It authenticates through
-  npm trusted publishing (OIDC: the package settings on npmjs.com trust
-  `jflowers/opencode-supervisor` + `publish.yml`), so no npm token exists.
-  Renaming `publish.yml` breaks publishing until the trusted publisher is
-  updated to match.
+  commands. After it merges, run `.github/workflows/publish.yml` from
+  `main` with the tag (`gh workflow run publish.yml -f tag=v<version>`); it
+  creates the tag and publishes to npm. Don't push the tag yourself. It
+  authenticates through npm trusted publishing (OIDC: the package settings
+  on npmjs.com trust `jflowers/opencode-supervisor` + `publish.yml`), so no
+  npm token exists. Renaming `publish.yml` breaks publishing until the
+  trusted publisher is updated to match.
+- `publish.yml` only calls the shared pipeline in
+  [`jflowers/ship`](https://github.com/jflowers/ship)
+  (`.github/workflows/npm-release.yml`), pinned by commit SHA: org-infra's
+  preflight creates the tag, then ship checks `package.json` against it,
+  installs, runs the checks listed in `publish.yml` and publishes with
+  provenance. Releasing through ship is deliberate; fix the pipeline there
+  and bump the pin, rather than moving it back into this repo. Keep the
+  `checks` in `publish.yml` in step with `ci.yml`.
 - CI (`.github/workflows/ci.yml`) runs the typecheck, both test runners,
   and the package check on pull requests and pushes to `main`.
 - No lint step is configured; match existing code style.
