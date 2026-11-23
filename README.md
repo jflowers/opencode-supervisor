@@ -156,9 +156,10 @@ A release takes three steps:
 The Publish workflow (`.github/workflows/publish.yml`) calls the shared
 npm pipeline in [`jflowers/ship`](https://github.com/jflowers/ship). It
 checks the tag (semver, new, CI green on `main`, unreleased commits) and
-creates it, checks that `package.json`'s version matches and isn't on npm
-yet, runs the typecheck, both test suites and the package check, then
-publishes with provenance. It authenticates through npm trusted
+creates it, checks that `package.json`'s version matches, runs the
+typecheck, both test suites and the package check, publishes with
+provenance, and creates the GitHub release with generated notes. A version
+already on npm is skipped, so re-running a release is safe. It authenticates through npm trusted
 publishing, so no npm token exists. A new version can take a couple of
 minutes to appear on the registry; an install in that window fails
 with "No matching version found" and works on retry.
@@ -190,7 +191,7 @@ Then, in the package's **Settings** on npmjs.com:
 
 The new trusted publisher shows **Pending validation** until the
 workflow publishes once, and npm sets a deadline of about two days for
-that. The hand-published version doesn't count (the workflow refuses a
+that. The hand-published version doesn't count (the workflow skips a
 version already on npm), so release the next patch version through the
 three steps above right away.
 

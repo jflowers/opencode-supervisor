@@ -40,7 +40,8 @@ opencode plugin "$(pwd)"
   new version, and update the pinned version in the README's install
   commands. After it merges, run `.github/workflows/publish.yml` from
   `main` with the tag (`gh workflow run publish.yml -f tag=v<version>`); it
-  creates the tag and publishes to npm. Don't push the tag yourself. It
+  creates the tag, publishes to npm and creates the GitHub release. Don't
+  push the tag yourself. It
   authenticates through npm trusted publishing (OIDC: the package settings
   on npmjs.com trust `jflowers/opencode-supervisor` + `publish.yml`), so no
   npm token exists. Renaming `publish.yml` breaks publishing until the
@@ -49,8 +50,8 @@ opencode plugin "$(pwd)"
   [`jflowers/ship`](https://github.com/jflowers/ship)
   (`.github/workflows/npm-release.yml`), pinned by commit SHA: org-infra's
   preflight creates the tag, then ship checks `package.json` against it,
-  installs, runs the checks listed in `publish.yml` and publishes with
-  provenance. Releasing through ship is deliberate; fix the pipeline there
+  installs, runs the checks listed in `publish.yml`, publishes with
+  provenance and creates the GitHub release. Releasing through ship is deliberate; fix the pipeline there
   and bump the pin, rather than moving it back into this repo. Keep the
   `checks` in `publish.yml` in step with `ci.yml`.
 - CI (`.github/workflows/ci.yml`) runs the typecheck, both test runners,
