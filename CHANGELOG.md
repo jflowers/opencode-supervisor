@@ -7,6 +7,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The auditor no longer calls a step's claim hallucinated when the
+  evidence is a later line of an earlier tool's output, or the
+  result of the call the step makes. In a `/debug` run, a step that
+  cited `debug_experiment_end`'s last line ("Reset verified ... r3,
+  fingerprint matches") and then called `debug_conclude` got a
+  finding after `debug_conclude` had already returned FIXED with
+  its proof (#91). The progress list showed only the first 80
+  characters of each output, and the audit judged the step before
+  its call ran. Recent calls now show the start and end of their
+  output, the auditor is told outputs are excerpts, and a failed
+  minor peer finding is checked once more with the calls that
+  completed while the audit ran. A passing re-check drops the
+  finding (FR-114). Those results count as evidence for what the
+  step claimed, never as an excuse for breaking the goal or a
+  directive; severe findings still interrupt at once, without a
+  re-check; and a step citing a call that never ran is still
+  flagged.
 - The auditor can no longer stop a session with a rule it made up.
   A `/uf.unleash` run stopped after a finding claimed "Spec substeps
   5/6 require 'emit envelope error and STOP' on failure/timeout";

@@ -247,7 +247,13 @@ flowchart TD
    the rule it applies, word for word. The plugin looks the quote
    up in the goal and directive text; a rule that isn't there drops
    the finding, and a found one is delivered with the critique as
-   `Rule cited: "..."` (FR-113). Audit traffic never enters the
+   `Rule cited: "..."` (FR-113).
+   The 8 newest calls show the start and end of their
+   output, where tools often put their verdict. When a minor peer
+   finding fails a step and the agent made more tool calls while the audit
+   ran, the step is audited once more with those calls' results
+   before anything is delivered. A step that planned a call is
+   judged with that call's result (FR-114). Audit traffic never enters the
    supervised conversation; auditor errors fail open. Steps join the
    **verified trace** as outcome-carrying entries: passed steps
    record normally, and a step that failed a minor invariant
