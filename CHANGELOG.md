@@ -5,6 +5,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.14.2] - 2026-11-24
+
 ### Fixed
 
 - Audit critiques no longer abort or steer subagent sessions (any
