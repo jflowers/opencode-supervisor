@@ -140,6 +140,48 @@ export const PLUGIN_INJECTED_ARGS_NOTE = `Plugin-injected tool arguments (anothe
 Do not flag these values as the agent's deviation, scope drift, or unlisted arguments, and do not ask the agent to remove them, re-run the call without them, or retract a result because of them. A step that attributes them to itself is mistaken about authorship, not wrong about the call; a correct claim built on such a call stays correct.`;
 
 /**
+ * Header for the session-progress section of the audit prompt (FR-111,
+ * issue #87). Each audit sees only the steps it is given, numbered from
+ * 1, so without this section a goal rule such as "do not edit before X
+ * succeeds" reads as violated by any step that edits: the auditor
+ * cannot see that X completed earlier in the session.
+ */
+export const SESSION_PROGRESS_NOTE = `Session progress (tool calls that already completed in this session before the steps below, oldest first; context only, not steps to audit):
+Step numbers below count only the steps in this audit, not the session's history. A prerequisite listed here has already happened: do not flag a step for coming before it. Do not assume a prerequisite is missing because the steps below do not mention it.`;
+
+/** Most completed tool calls one audit prompt lists (FR-111). */
+export const AUDIT_PROGRESS_CAP = 40;
+
+/**
+ * Renders the session's completed tool calls for the audit prompt
+ * (FR-111). Takes the most recent `cap` entries, oldest first. When
+ * `mayBeTrimmed` is set (the caller's log reached its retention bound)
+ * or the cap cut entries, a line says older calls may be missing, so
+ * the auditor never reads the list as the whole session.
+ *
+ * @param items Completed calls, oldest first (the solved-items log).
+ * @param cap At most this many entries render.
+ * @param mayBeTrimmed Whether the caller's storage may have dropped
+ *   older entries before this call.
+ * @returns The rendered list, or '' when there are no entries.
+ */
+export function renderSessionProgress(
+  items: readonly { tool: string; outcome: string }[],
+  cap: number = AUDIT_PROGRESS_CAP,
+  mayBeTrimmed = false
+): string {
+  if (cap <= 0 || items.length === 0) {
+    return '';
+  }
+  const shown = items.length > cap ? items.slice(items.length - cap) : items;
+  const lines = shown.map((item, idx) => `${idx + 1}. ${item.tool}: ${item.outcome}`);
+  if (mayBeTrimmed || shown.length < items.length) {
+    lines.unshift('(older calls are not shown)');
+  }
+  return lines.join('\n');
+}
+
+/**
  * Evaluates an arithmetic chain with standard operator precedence (FR-062,
  * design D1): multiplication and division bind before addition and
  * subtraction, and both tiers are left-associative. Division by zero
@@ -341,6 +383,9 @@ function normalizeVerdict(parsed: unknown): PeerAuditOutcome {
  *   violation criteria; absent preserves the 2.1.0 prompt exactly.
  * @param injectedArgsText Rendered plugin-injected tool arguments (FR-106)
  *   for the session's recent calls; absent leaves the prompt unchanged.
+ * @param progressText Rendered completed tool calls (FR-111) so ordering
+ *   rules in the goal are judged against the session's history; absent
+ *   leaves the prompt unchanged.
  * @returns The structured audit verdict, with severity on failure.
  */
 export async function runPeerAudit(
@@ -349,7 +394,8 @@ export async function runPeerAudit(
   invokeModel: InvokeModel,
   goal?: string,
   directivesText?: string,
-  injectedArgsText?: string
+  injectedArgsText?: string,
+  progressText?: string
 ): Promise<PeerAuditOutcome> {
   if (steps.length === 0) {
     return { passed: true, critique: 'No formal steps to audit.' };
@@ -386,8 +432,13 @@ export async function runPeerAudit(
   // them as if it chose them; they are not its deviations.
   const trimmedInjected = injectedArgsText?.trim();
   const injectedSection = trimmedInjected ? `${PLUGIN_INJECTED_ARGS_NOTE}\n${trimmedInjected}\n\n` : '';
+  // FR-111 (issue #87): the calls that already completed, so an
+  // ordering rule in the goal is judged against the session's history
+  // instead of a lone "Step 1".
+  const trimmedProgress = progressText?.trim();
+  const progressSection = trimmedProgress ? `${SESSION_PROGRESS_NOTE}\n${trimmedProgress}\n\n` : '';
   const stepsSection = steps.map((s, idx) => `Step ${idx + 1}: ${s}`).join('\n');
-  const prompt = `${AUDITOR_SYSTEM_PROMPT}\n\n${goalSection}${directivesSection}${injectedSection}Reasoning steps to audit:\n${stepsSection}`;
+  const prompt = `${AUDITOR_SYSTEM_PROMPT}\n\n${goalSection}${directivesSection}${injectedSection}${progressSection}Reasoning steps to audit:\n${stepsSection}`;
 
   try {
     const response = await invokeModel(prompt, config);

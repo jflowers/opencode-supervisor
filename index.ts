@@ -45,6 +45,7 @@ import {
 } from './src/arg-repair.ts';
 import {
   outcomeRecordsStep,
+  renderSessionProgress,
   resolveAuditorConfig,
   runPeerAudit,
   type AuditConfig,
@@ -964,6 +965,17 @@ function solvedOutcome(output: unknown): string {
     return collapsed;
   }
   return `${collapsed.slice(0, SOLVED_OUTCOME_MAX_LENGTH - 3)}...`;
+}
+
+/**
+ * The session's completed tool calls as the audit prompt's progress
+ * section (FR-111, issue #87): the solved-items log at audit time, so
+ * a goal rule such as "do not edit before X succeeds" is judged
+ * against calls that already happened. A log at its retention bound
+ * may have dropped older calls, and the section says so.
+ */
+function auditProgress(solvedItems: readonly SolvedItem[]): string {
+  return renderSessionProgress(solvedItems, undefined, solvedItems.length >= SOLVED_RETENTION_CAP);
 }
 
 /**
@@ -3018,7 +3030,9 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
             state.goal,
             directivesAdvisory ?? undefined,
             // FR-106: args other plugins injected on this session's calls.
-            renderInjectedArgs(injectedArgsForSession(part.sessionID))
+            renderInjectedArgs(injectedArgsForSession(part.sessionID)),
+            // FR-111: the calls that completed before this part.
+            auditProgress(state.solvedItems)
           );
           // FR-006/FR-063: the step joins the verified trace whenever the
           // outcome records — passed steps and minor deterministic-invariant
@@ -3802,7 +3816,8 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
               invokeModel,
               state.goal,
               directivesAdvisory ?? undefined,
-              renderInjectedArgs(injectedArgsForSession(context.sessionID))
+              renderInjectedArgs(injectedArgsForSession(context.sessionID)),
+              auditProgress(state.solvedItems)
             );
             if (outcome.passed) {
               // Passed focus joins the verified trace in stripped form —

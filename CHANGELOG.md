@@ -5,6 +5,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The auditor no longer reports an ordering violation for a step
+  whose prerequisite already succeeded earlier in the session. Each
+  reasoning part was audited alone, as "Step 1", with only the
+  session goal, so a goal rule such as "Do not edit any code before
+  debug_open succeeds" read as broken by any step that edits. A live
+  `/debug` run got "Step 1 edits src/duration.ts before debug_open
+  succeeds" five tool calls after `debug_open` succeeded (#87). The
+  audit prompt now lists the session's completed tool calls (the most
+  recent 40, oldest first) as context, and tells the auditor that a
+  listed prerequisite already happened and that step numbers count
+  only the audited steps (FR-111).
+
 ## [2.14.2] - 2026-11-24
 
 ### Fixed

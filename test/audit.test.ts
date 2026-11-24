@@ -19,9 +19,12 @@ import plugin, {
 import { completedReasoningPart, recordingPluginInput, silentClientSurface, silentPluginInput, withCleanSupervisorEnv } from './mocks.ts';
 import { stripNarrative } from '../src/stripper.ts';
 import {
+  AUDIT_PROGRESS_CAP,
   checkDeterministicInvariants,
+  renderSessionProgress,
   resolveAuditorConfig,
   runPeerAudit,
+  SESSION_PROGRESS_NOTE,
   type AuditConfig,
   type InvokeModel,
 } from '../src/auditor.ts';
@@ -1495,6 +1498,105 @@ test('event hook tells the auditor which args another plugin injected (FR-106)',
       if (previous === undefined) delete store[key];
       else store[key] = previous;
     }
+  });
+});
+
+test('renderSessionProgress lists completed calls oldest first and marks cuts (FR-111)', () => {
+  assert.equal(renderSessionProgress([]), '');
+  assert.equal(renderSessionProgress([{ tool: 'read', outcome: 'ok' }], 0), '');
+  assert.equal(
+    renderSessionProgress([
+      { tool: 'debug_open', outcome: 'Opened d1' },
+      { tool: 'edit', outcome: 'Edit applied' },
+    ]),
+    '1. debug_open: Opened d1\n2. edit: Edit applied'
+  );
+  const many = Array.from({ length: AUDIT_PROGRESS_CAP + 5 }, (_, i) => ({ tool: `t${i}`, outcome: 'ok' }));
+  const rendered = renderSessionProgress(many).split('\n');
+  assert.equal(rendered[0], '(older calls are not shown)');
+  assert.equal(rendered.length, AUDIT_PROGRESS_CAP + 1);
+  assert.equal(rendered[1], '1. t5: ok');
+  // A log at its retention bound may have dropped calls already.
+  assert.equal(
+    renderSessionProgress([{ tool: 'read', outcome: 'ok' }], AUDIT_PROGRESS_CAP, true),
+    '(older calls are not shown)\n1. read: ok'
+  );
+});
+
+test('runPeerAudit puts session progress before the steps, and only when given (FR-111)', async () => {
+  const prompts: string[] = [];
+  const invoke: InvokeModel = async (prompt) => {
+    prompts.push(prompt);
+    return '{"passed":true}';
+  };
+  const config: AuditConfig = {
+    auditorModel: 'test/model',
+    stripMode: 'balanced',
+    maxRegenerations: 3,
+    blockRewardHacking: true,
+    requireStepReferenceInTools: true,
+  };
+  await runPeerAudit(['edit src/a.ts'], config, invoke, 'goal');
+  await runPeerAudit(['edit src/a.ts'], config, invoke, 'goal', undefined, undefined, '   ');
+  await runPeerAudit(['edit src/a.ts'], config, invoke, 'goal', undefined, undefined, '1. debug_open: Opened d1');
+  assert.ok(!prompts[0].includes('Session progress'));
+  assert.equal(prompts[1], prompts[0]);
+  const withProgress = prompts[2];
+  const noteAt = withProgress.indexOf(SESSION_PROGRESS_NOTE);
+  assert.ok(noteAt > -1, withProgress);
+  assert.ok(withProgress.indexOf('1. debug_open: Opened d1') > noteAt);
+  assert.ok(withProgress.indexOf('Reasoning steps to audit:') > withProgress.indexOf('1. debug_open'));
+});
+
+test('an edit after the goal\'s required step succeeded earlier gets no ordering finding (issue #87, FR-111)', async () => {
+  await withCleanSupervisorEnv(async () => {
+    const { input, calls } = auditHarness([]);
+    // A stand-in auditor that judges the goal's ordering rule from what
+    // its prompt shows, the way the live audit model did: an edit with
+    // no sign that debug_open succeeded fails as "edited before
+    // debug_open". Before FR-111 the prompt held only the goal and the
+    // lone step, and this auditor failed it.
+    const session = (input as unknown as { client: { session: Record<string, unknown> } }).client.session;
+    session.prompt = async (options: { body: { parts: { text: string }[] } }) => {
+      calls.prompt.push(options);
+      const text = options.body.parts[0].text;
+      const steps = text.slice(text.indexOf('Reasoning steps to audit:'));
+      const context = text.slice(0, text.indexOf('Reasoning steps to audit:'));
+      const opened = /debug_open: Opened/.test(context);
+      const verdict =
+        /edit/.test(steps) && !opened
+          ? '{"passed":false,"failedStep":1,"severity":"minor","critique":"Step 1 edits src/duration.ts before debug_open succeeds, violating session goal ordering."}'
+          : '{"passed":true,"failedStep":null,"severity":null,"critique":"ok"}';
+      return { data: { info: {}, parts: [{ type: 'text', text: verdict }] } };
+    };
+    const hooks = await plugin.server(input);
+    const sessionID = 'audit-session-issue-87';
+    sessionState.get(sessionID).goal =
+      'Start a debugging investigation. Do not edit any code before debug_open succeeds.';
+
+    // Read-only exploration, then debug_open succeeds, then the
+    // hypothesis and experiment calls: several steps before the edit.
+    await dispatchToolAfter(hooks, sessionID, 'read', { output: 'export function parse() {}' });
+    await dispatchToolAfter(hooks, sessionID, 'debug_open', { output: 'Opened d1. Baseline is RED on 3/3 runs.' });
+    await dispatchToolAfter(hooks, sessionID, 'debug_hypothesize', { output: 'Recorded h1.' });
+    await dispatchToolAfter(hooks, sessionID, 'debug_experiment_start', { output: 'Experiment e1 open, scope src/duration.ts' });
+
+    await dispatchPart(
+      hooks,
+      completedReasoningPart({
+        sessionID,
+        id: 'part-edit',
+        text: 'Experiment e1 is open. Now edit `src/duration.ts`: `const VALID = /^(\\d+[hms])+$/`',
+      })
+    );
+
+    assert.equal(calls.prompt.length, 1);
+    const promptText = (calls.prompt[0] as { body: { parts: { text: string }[] } }).body.parts[0].text;
+    assert.ok(promptText.includes('2. debug_open: Opened d1. Baseline is RED on 3/3 runs.'), promptText);
+    // No failing finding: nothing steered, nothing logged as a critique.
+    assert.equal(calls.promptAsync.length, 0);
+    assert.deepEqual(sessionState.get(sessionID).critiqueLog, []);
+    assert.equal(sessionState.get(sessionID).verifiedSteps[0]?.passed, true);
   });
 });
 

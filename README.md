@@ -238,7 +238,12 @@ flowchart TD
    side session — created per audit through the OpenCode client
    (`auditorModel` / `auditorVariant`), with the session goal and
    engineer directives in the prompt, so scope drift and directive
-   violations are also findings. Audit traffic never enters the
+   violations are also findings. Each audit covers one step, so the
+   prompt also lists the session's completed tool calls so far (the
+   most recent 40, oldest first) as context. A goal rule such as
+   *"do not edit before `debug_open` succeeds"* is then judged
+   against the calls that already ran, not against a lone step
+   (FR-111). Audit traffic never enters the
    supervised conversation; auditor errors fail open. Steps join the
    **verified trace** as outcome-carrying entries: passed steps
    record normally, and a step that failed a minor invariant
