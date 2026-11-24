@@ -9,20 +9,20 @@
 
 ## 2. Implementation
 
-- [ ] 2.1 skip critique delivery for parented sessions (D1)
-- [ ] 2.2 steer-target resolver from the latest user message (D2)
-- [ ] 2.3 pass agent and model on critique and text tool-call steers
+- [x] 2.1 skip critique delivery for parented sessions (D1)
+- [x] 2.2 steer-target resolver from the latest user message (D2)
+- [x] 2.3 pass agent and model on critique and text tool-call steers
 
 ## 3. Tests
 
-- [ ] 3.1 severe and minor findings in a parented session: no
+- [x] 3.1 severe and minor findings in a parented session: no
   abort, no steer, withheld
-- [ ] 3.2 critique steer carries agent and model from chat.message
-- [ ] 3.3 critique steer falls back to the session's messages
-- [ ] 3.4 text tool-call correction carries agent and model
+- [x] 3.2 critique steer carries agent and model from chat.message
+- [x] 3.3 critique steer falls back to the session's messages
+- [x] 3.4 text tool-call correction carries agent and model
 
 ## 4. Integration
 
-- [ ] 4.1 typecheck, `bun test`, `npm run test:node`,
+- [x] 4.1 typecheck, `bun test`, `npm run test:node`,
   `npm run verify:package`
-- [ ] 4.2 CHANGELOG Unreleased entry
+- [x] 4.2 CHANGELOG Unreleased entry

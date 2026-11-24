@@ -193,7 +193,7 @@ interface HarnessOptions {
 function harness(options: HarnessOptions = {}) {
   const state = {
     messages: [] as unknown[],
-    steers: [] as Array<{ sessionID: string; text: string; synthetic: unknown }>,
+    steers: [] as Array<{ sessionID: string; text: string; synthetic: unknown; agent?: unknown; model?: unknown }>,
     logs: [] as Array<{ level: string; message: string }>,
     messageFetches: 0,
     messageQueries: [] as Array<unknown>,
@@ -223,7 +223,7 @@ function harness(options: HarnessOptions = {}) {
         promptAsync: async (request: unknown) => {
           const { path, body } = request as {
             path: { id: string };
-            body: { parts: Array<{ text: string; synthetic?: unknown }> };
+            body: { parts: Array<{ text: string; synthetic?: unknown }>; agent?: unknown; model?: unknown };
           };
           if (options.resetDuringDelivery !== undefined) {
             await options.resetDuringDelivery(
@@ -234,7 +234,13 @@ function harness(options: HarnessOptions = {}) {
           if (options.promptAsyncFails === true) {
             return { error: { name: 'Unavailable' } };
           }
-          state.steers.push({ sessionID: path.id, text: body.parts[0]!.text, synthetic: body.parts[0]!.synthetic });
+          state.steers.push({
+            sessionID: path.id,
+            text: body.parts[0]!.text,
+            synthetic: body.parts[0]!.synthetic,
+            agent: body.agent,
+            model: body.model,
+          });
           return {};
         },
         abort: async () => ({}),
@@ -429,6 +435,35 @@ test('a failed delivery fails open and does not spend the bound', () =>
     endTurn(failing.state, INVOKE_TEXT);
     await idle(hooks, 'ttc-fail');
     assert.equal(failing.state.steers.length, 1, 'the failed attempt left the one slot free');
+  }));
+
+test('the correction runs under the agent and model of the latest user message (FR-112)', () =>
+  withCleanSupervisorEnv(async () => {
+    const { input, state } = harness();
+    const hooks = await load(input);
+    const chat = hooks['chat.message'] as unknown as (input: unknown, output: unknown) => Promise<void>;
+    await chat(
+      { sessionID: 'ttc-target', agent: 'reviewer', model: { providerID: 'acme', modelID: 'model-x' } },
+      { message: { id: 'u1', role: 'user' }, parts: [{ type: 'text', text: 'Address the feedback.' }] }
+    );
+    endTurn(state, INVOKE_TEXT);
+    await idle(hooks, 'ttc-target');
+    assert.equal(state.steers.length, 1);
+    assert.equal(state.steers[0]!.agent, 'reviewer');
+    assert.deepEqual(state.steers[0]!.model, { providerID: 'acme', modelID: 'model-x' });
+  }));
+
+test('without chat.message state the correction takes the turn\'s own agent and model (FR-112)', () =>
+  withCleanSupervisorEnv(async () => {
+    const { input, state } = harness();
+    const hooks = await load(input);
+    endTurn(state, INVOKE_TEXT);
+    (state.messages[1] as { info: Record<string, unknown> }).info.agent = 'cobalt-crush-dev';
+    await idle(hooks, 'ttc-target-fallback');
+    assert.equal(state.steers.length, 1);
+    assert.equal(state.steers[0]!.agent, 'cobalt-crush-dev');
+    assert.deepEqual(state.steers[0]!.model, { providerID: 'enmaas', modelID: 'glm-5.3' });
+    assert.deepEqual(state.messageQueries, [{ limit: 1 }], 'no second fetch for the steer target');
   }));
 
 test('the idle check fetches only the last message (bounded query)', () =>

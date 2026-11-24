@@ -1341,6 +1341,56 @@ export function createRepairInvoker(
   };
 }
 
+// ── Steer target (FR-112) ─────────────────────────────────────────
+
+/**
+ * The agent and model a steering prompt runs under (FR-112): those of
+ * the session's latest user message. Either may be absent when
+ * unknown; `promptAsync` then falls back to OpenCode's defaults.
+ */
+interface SteerTarget {
+  agent?: string;
+  model?: { providerID: string; modelID: string };
+}
+
+/**
+ * Picks the agent and model of the newest user message in a message
+ * list (FR-112, design D2). Pure; odd entries are skipped.
+ *
+ * @param messages Session messages in chronological order.
+ * @returns The newest user message's agent and model, or an empty target.
+ */
+export function steerTargetFromMessages(messages: unknown): SteerTarget {
+  if (!Array.isArray(messages)) {
+    return {};
+  }
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const info = (messages[index] as { info?: unknown } | null)?.info as
+      | { role?: unknown; agent?: unknown; model?: { providerID?: unknown; modelID?: unknown } }
+      | undefined;
+    if (info === undefined || info === null || info.role !== 'user') {
+      continue;
+    }
+    const target: SteerTarget = {};
+    if (typeof info.agent === 'string' && info.agent !== '') {
+      target.agent = info.agent;
+    }
+    const model = info.model;
+    if (
+      model !== undefined &&
+      model !== null &&
+      typeof model.providerID === 'string' &&
+      model.providerID !== '' &&
+      typeof model.modelID === 'string' &&
+      model.modelID !== ''
+    ) {
+      target.model = { providerID: model.providerID, modelID: model.modelID };
+    }
+    return target;
+  }
+  return {};
+}
+
 // ── Critique delivery (task 3.3; FR-007/FR-008, spike 1.2) ────────
 
 /** One failed-audit critique bound for the supervised session. */
@@ -1419,8 +1469,32 @@ function critiqueMessage(critique: string): string {
  * @param logger The plugin logger (server log, FR-052).
  * @returns The delivery function the event hook awaits per failed audit.
  */
-function createCritiqueDelivery(client: PluginInput['client'], logger: PluginLogger): (request: CritiqueDeliveryRequest) => Promise<void> {
+function createCritiqueDelivery(
+  client: PluginInput['client'],
+  logger: PluginLogger,
+  sessions: {
+    /** The session's parent ID, or null for a root session (FR-072). */
+    resolveParent: (sessionID: string) => Promise<string | null>;
+    /** The agent and model the steer runs under (FR-112). */
+    resolveSteerTarget: (sessionID: string, state: SessionState) => Promise<SteerTarget>;
+  }
+): (request: CritiqueDeliveryRequest) => Promise<void> {
   return async ({ sessionID, critique, severity, config, state }) => {
+    // FR-111 (design D1): a subagent session is not steered or aborted.
+    // Its parent is usually blocked on a sync `session.prompt` (OpenCode
+    // `task`, or another plugin's `session.create({ parentID })` child):
+    // an abort resolves that prompt with MessageAbortedError, and a steer
+    // replaces the reply the parent reads. The critique is kept as
+    // withheld so the memo still shows it, and spends no bound slot. The
+    // tool guard still blocks severe findings at execution. Checked
+    // before the bound so check-and-reserve below stays await-free.
+    if ((await sessions.resolveParent(sessionID)) !== null) {
+      appendBounded(state.critiqueLog, { text: critique, severity, delivered: false }, CRITIQUE_RETENTION_CAP);
+      logger.info(
+        `session ${sessionID} is a subagent session; ${severity} critique recorded without abort or steer`
+      );
+      return;
+    }
     // FR-007: at most maxRegenerations interventions per session — the
     // bound governs the whole intervention (abort AND steer). Decision
     // amendment (review findings #2/#8, smoke-test FR-008 side finding):
@@ -1465,9 +1539,11 @@ function createCritiqueDelivery(client: PluginInput['client'], logger: PluginLog
       }
     }
     try {
+      // FR-112: run the steer under the session's own agent and model.
+      const target = await sessions.resolveSteerTarget(sessionID, state);
       const delivered = await client.session.promptAsync({
         path: { id: sessionID },
-        body: { parts: [{ type: 'text', text: critiqueMessage(critique), synthetic: true }] },
+        body: { ...target, parts: [{ type: 'text', text: critiqueMessage(critique), synthetic: true }] },
       });
       if (delivered.error !== undefined && delivered.error !== null) {
         throw new Error(responseFailure('critique delivery failed', delivered));
@@ -1986,6 +2062,65 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
     }
     return state.parentID ?? null;
   };
+  // FR-112 (design D2): the agent and model a steer runs under — the
+  // session's latest user message, as recorded by `chat.message`; when
+  // either is unknown, read from the session's recent messages
+  // (bounded). Never throws: a failed lookup returns what is known.
+  const STEER_TARGET_MESSAGE_LIMIT = 20;
+  // A caller that already holds the session's last turn passes its
+  // agent and model as `fallback`, so no second fetch is made.
+  const resolveSteerTarget = async (
+    sessionID: string,
+    state: SessionState,
+    fallback?: SteerTarget
+  ): Promise<SteerTarget> => {
+    const known: SteerTarget = {};
+    if (state.agent !== undefined) {
+      known.agent = state.agent;
+    }
+    if (state.modelIdentity !== undefined) {
+      known.model = { ...state.modelIdentity };
+    }
+    if (known.agent !== undefined && known.model !== undefined) {
+      return known;
+    }
+    if (fallback !== undefined) {
+      const target: SteerTarget = { ...known };
+      if (target.agent === undefined && fallback.agent !== undefined) {
+        target.agent = fallback.agent;
+      }
+      if (target.model === undefined && fallback.model !== undefined) {
+        target.model = { ...fallback.model };
+      }
+      return target;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const response = await Promise.race([
+        input.client.session.messages({ path: { id: sessionID }, query: { limit: STEER_TARGET_MESSAGE_LIMIT } }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('session.messages timed out')), PARENT_LOOKUP_TIMEOUT_MS);
+          timer.unref?.();
+        }),
+      ]);
+      const found = steerTargetFromMessages((response as { data?: unknown } | undefined)?.data);
+      const target: SteerTarget = { ...known };
+      if (target.agent === undefined && found.agent !== undefined) {
+        target.agent = found.agent;
+      }
+      if (target.model === undefined && found.model !== undefined) {
+        target.model = found.model;
+      }
+      return target;
+    } catch (error) {
+      logger.warn(`steer agent/model lookup failed open for session ${sessionID}: ${errorText(error)}`);
+      return known;
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+    }
+  };
   const sessionLineage = async (sessionID: string): Promise<SessionContext[]> => {
     const lineage: SessionContext[] = [];
     const seen = new Set<string>();
@@ -2214,7 +2349,7 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
   // session through the transports spike 1.2 confirmed. It enforces the
   // maxRegenerations bound, records every critique (FR-015), and never
   // rejects (FR-005).
-  const deliverCritique = createCritiqueDelivery(input.client, logger);
+  const deliverCritique = createCritiqueDelivery(input.client, logger, { resolveParent, resolveSteerTarget });
 
   // ── Tool-arg repair (arg-repair feature) ──────────────────────────
 
@@ -2590,9 +2725,23 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
       // delivery fails, so only delivered corrections count (FR-095).
       state.textToolCallStreak += 1;
       try {
+        // FR-112: the correction runs under the session's own agent and model.
+        // The turn's own assistant message stands in when chat.message
+        // recorded nothing, keeping the idle check to one bounded fetch.
+        const lastInfo = last.info as { agent?: unknown; mode?: unknown };
+        const turnAgent =
+          typeof lastInfo.agent === 'string' && lastInfo.agent !== ''
+            ? lastInfo.agent
+            : typeof lastInfo.mode === 'string' && lastInfo.mode !== ''
+              ? lastInfo.mode
+              : undefined;
+        const target = await resolveSteerTarget(sessionID, state, {
+          ...(turnAgent !== undefined ? { agent: turnAgent } : {}),
+          model: identity,
+        });
         const delivered = await input.client.session.promptAsync({
           path: { id: sessionID },
-          body: { parts: [{ type: 'text', text: textToolCallMessage(call), synthetic: true }] },
+          body: { ...target, parts: [{ type: 'text', text: textToolCallMessage(call), synthetic: true }] },
         });
         if (delivered.error !== undefined && delivered.error !== null) {
           throw new Error(responseFailure('text tool-call correction failed', delivered));

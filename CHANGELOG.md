@@ -5,6 +5,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Audit critiques no longer abort or steer subagent sessions (any
+  session with a parent, including children another plugin makes
+  with `session.create({ parentID })`). The abort made the parent's
+  blocking `session.prompt` fail with `MessageAbortedError`, and the
+  steer replaced the child's reply with one from the default agent
+  (unbound-force/unbound-force#1199). The critique is recorded as
+  withheld, still shows in the child's memo, and spends no
+  `maxRegenerations` slot; the tool guard still blocks severe
+  findings at execution (FR-111).
+- Critique steers and text tool-call corrections now run under the
+  agent and model of the session's latest user message instead of
+  OpenCode's default agent and model (FR-112).
+
 ## [2.14.1] - 2026-11-23
 
 ### Fixed
