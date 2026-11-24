@@ -44,6 +44,9 @@ import {
   type SupervisorMode,
 } from './src/arg-repair.ts';
 import {
+  AUDIT_DETAIL_COUNT,
+  AUDIT_PROGRESS_CAP,
+  excerptToolOutput,
   outcomeRecordsStep,
   renderSessionProgress,
   resolveAuditorConfig,
@@ -965,6 +968,35 @@ function solvedOutcome(output: unknown): string {
     return collapsed;
   }
   return `${collapsed.slice(0, SOLVED_OUTCOME_MAX_LENGTH - 3)}...`;
+}
+
+/**
+ * One solved-items entry for a completed call: the memo's one-line
+ * outcome (FR-014) plus, when the output says more than that line, the longer
+ * head-and-tail excerpt the audit prompt shows for recent calls
+ * (FR-114, issue #91).
+ */
+function solvedEntry(tool: string, output: unknown): SolvedItem {
+  const raw =
+    typeof output === 'object' && output !== null && typeof (output as { output?: unknown }).output === 'string'
+      ? (output as { output: string }).output
+      : '';
+  const outcome = solvedOutcome(output);
+  const detail = excerptToolOutput(raw);
+  // Store the excerpt only when it says more than the outcome line.
+  return detail === '' || detail === outcome ? { tool, outcome } : { tool, outcome, detail };
+}
+
+/**
+ * The calls appended to the solved-items log after `lastBefore` (FR-114):
+ * the log is trimmed in place at its retention bound, so a length
+ * comparison cannot tell what is new. Entries are unique objects, so
+ * the snapshot's last entry marks the boundary. With no snapshot entry,
+ * or one already trimmed away, every entry counts as later.
+ */
+function solvedItemsAfter(items: readonly SolvedItem[], lastBefore: SolvedItem | undefined): SolvedItem[] {
+  const at = lastBefore === undefined ? -1 : items.lastIndexOf(lastBefore);
+  return items.slice(at + 1);
 }
 
 /**
@@ -3023,17 +3055,54 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
           // captured by `chat.message`) scopes drift findings whenever
           // present, and the engineer directives (FR-031) add violation
           // criteria whenever configured.
-          const outcome = await runPeerAudit(
+          // FR-114: the calls that completed before this part, kept as
+          // a snapshot so a re-check can tell which calls came later.
+          const before = [...state.solvedItems];
+          const injectedText = renderInjectedArgs(injectedArgsForSession(part.sessionID));
+          let outcome = await runPeerAudit(
             [stepText],
             config,
             invokeModel,
             state.goal,
             directivesAdvisory ?? undefined,
             // FR-106: args other plugins injected on this session's calls.
-            renderInjectedArgs(injectedArgsForSession(part.sessionID)),
+            injectedText,
             // FR-111: the calls that completed before this part.
-            auditProgress(state.solvedItems)
+            auditProgress(before)
           );
+          // FR-114 (issue #91): a peer finding about a step the session
+          // has since moved past is checked once more with the calls that
+          // completed while the audit ran — usually the calls the step
+          // planned, whose results settle what the step claimed. A
+          // re-check that passes drops the finding; one that fails
+          // replaces it with the fresher critique; one that fails open
+          // keeps the original finding. Severe findings are never
+          // re-checked: their interrupt must not wait on a second model
+          // call while the agent keeps working, and a later call that
+          // "worked" cannot excuse a severe violation.
+          if (!outcome.passed && outcome.source === 'peer' && outcome.severity !== 'severe') {
+            const later = solvedItemsAfter(state.solvedItems, before[before.length - 1]);
+            if (later.length > 0) {
+              const recheck = await runPeerAudit(
+                [stepText],
+                config,
+                invokeModel,
+                state.goal,
+                directivesAdvisory ?? undefined,
+                injectedText,
+                auditProgress(before),
+                renderSessionProgress(later, AUDIT_PROGRESS_CAP, false, AUDIT_DETAIL_COUNT)
+              );
+              if (recheck.error === undefined && (recheck.passed || recheck.source === 'peer')) {
+                logger.info(
+                  recheck.passed
+                    ? `audit finding dropped: the re-check with ${later.length} later call(s) passed`
+                    : `audit finding re-checked with ${later.length} later call(s) and still failed`
+                );
+                outcome = recheck;
+              }
+            }
+          }
           // FR-006/FR-063: the step joins the verified trace whenever the
           // outcome records — passed steps and minor deterministic-invariant
           // failures alike (the latter marked `passed: false`, since the
@@ -3572,7 +3641,7 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         const state = sessionState.get(hookInput.sessionID);
         appendBounded(
           state.solvedItems,
-          { tool: hookInput.tool, outcome: solvedOutcome(output) },
+          solvedEntry(hookInput.tool, output),
           SOLVED_RETENTION_CAP
         );
         // FR-085 (external-access design D7): the engineer's answer to a

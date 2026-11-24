@@ -16,6 +16,13 @@ export interface SolvedItem {
   tool: string;
   /** Short outcome summary recorded when the call completed (FR-014). */
   outcome: string;
+  /**
+   * Longer head-and-tail excerpt of the call's output for the audit
+   * prompt (FR-114): the memo's one-line `outcome` drops the later
+   * lines where tools often put their verdicts. Absent when the
+   * output was empty or the entry is not a tool result.
+   */
+  detail?: string;
 }
 
 /** One critique in the critique log, delivered or withheld (FR-015). */
