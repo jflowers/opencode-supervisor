@@ -13,6 +13,7 @@ import plugin, {
   resolveHookConfig,
   sessionState,
   sharedSupervisorState,
+  steerTargetFromMessages,
   traceAwaitState,
 } from '../index.ts';
 import { completedReasoningPart, recordingPluginInput, silentClientSurface, silentPluginInput, withCleanSupervisorEnv } from './mocks.ts';
@@ -1338,7 +1339,8 @@ function dispatchPart(hooks: DispatchHooks, part: unknown): Promise<void> {
  */
 function auditHarness(
   responses: string[],
-  failures: { promptAsync?: Error; abort?: Error } = {}
+  failures: { promptAsync?: Error; abort?: Error } = {},
+  sessionExtras: Record<string, (options: unknown) => Promise<unknown>> = {}
 ): {
   input: PluginInput;
   calls: {
@@ -1392,6 +1394,7 @@ function auditHarness(
           calls.delete.push(options);
           return {};
         },
+        ...sessionExtras,
       },
       ...silentClientSurface,
     },
@@ -1843,6 +1846,183 @@ test('event hook aborts the session before delivering a severe critique', async 
       { text: 'Step 1 proposes weakening the test gates.', severity: 'severe', delivered: true },
     ]);
   });
+});
+
+/** Records a session.created event so the session's parent is known (FR-072). */
+function dispatchSessionCreated(hooks: DispatchHooks, id: string, parentID?: string): Promise<void> {
+  return hooks.event!({
+    event: { type: 'session.created', properties: { info: { id, title: 'child', parentID } } },
+  } as unknown as EventHookInput);
+}
+
+test('a severe critique in a subagent session neither aborts nor steers (FR-111)', async () => {
+  await withCleanSupervisorEnv(async () => {
+    const { input, calls } = auditHarness([
+      '{"passed":false,"failedStep":1,"severity":"severe","critique":"Step 1 proposes weakening the test gates."}',
+    ]);
+    const hooks = await plugin.server(input);
+    await dispatchSessionCreated(hooks, 'audit-child-severe', 'parent-session');
+
+    await dispatchPart(hooks, completedReasoningPart({ sessionID: 'audit-child-severe' }));
+
+    assert.equal(calls.abort.length, 0, 'the parent\'s blocking prompt must not be aborted');
+    assert.equal(calls.promptAsync.length, 0, 'no steer replaces the reply the parent reads');
+    const state = sessionState.get('audit-child-severe');
+    assert.equal(state.critiqueCount, 0, 'a skipped critique spends no bound slot');
+    assert.deepEqual(state.critiqueLog, [
+      { text: 'Step 1 proposes weakening the test gates.', severity: 'severe', delivered: false },
+    ]);
+  });
+});
+
+test('a minor critique in a subagent session is withheld (FR-111)', async () => {
+  await withCleanSupervisorEnv(async () => {
+    const { input, calls } = auditHarness([]);
+    const hooks = await plugin.server(input);
+    await dispatchSessionCreated(hooks, 'audit-child-minor', 'parent-session');
+
+    await dispatchPart(
+      hooks,
+      completedReasoningPart({ sessionID: 'audit-child-minor', text: 'capacity = 24 * 15 = 340' })
+    );
+
+    assert.equal(calls.promptAsync.length, 0);
+    assert.equal(calls.abort.length, 0);
+    const state = sessionState.get('audit-child-minor');
+    assert.deepEqual(
+      state.critiqueLog.map((entry) => entry.delivered),
+      [false]
+    );
+  });
+});
+
+test('a critique in a root session is still delivered after session.created (FR-111)', async () => {
+  await withCleanSupervisorEnv(async () => {
+    const { input, calls } = auditHarness([]);
+    const hooks = await plugin.server(input);
+    await dispatchSessionCreated(hooks, 'audit-root-created');
+
+    await dispatchPart(
+      hooks,
+      completedReasoningPart({ sessionID: 'audit-root-created', text: 'capacity = 24 * 15 = 340' })
+    );
+
+    assert.equal(calls.promptAsync.length, 1);
+    assert.equal(sessionState.get('audit-root-created').critiqueCount, 1);
+  });
+});
+
+test('a parent found through session.get also skips the critique (FR-111)', async () => {
+  await withCleanSupervisorEnv(async () => {
+    const { input, calls } = auditHarness([], {}, {
+      get: async (options: unknown) => {
+        const id = (options as { path: { id: string } }).path.id;
+        return { data: { id, parentID: 'parent-from-get' } };
+      },
+    });
+    const hooks = await plugin.server(input);
+
+    await dispatchPart(
+      hooks,
+      completedReasoningPart({ sessionID: 'audit-child-get', text: 'capacity = 24 * 15 = 340' })
+    );
+
+    assert.equal(calls.promptAsync.length, 0);
+    assert.equal(sessionState.get('audit-child-get').critiqueLog[0]?.delivered, false);
+  });
+});
+
+test('a critique steer runs under the latest user message\'s agent and model (FR-112)', async () => {
+  await withCleanSupervisorEnv(async () => {
+    const { input, calls } = auditHarness([]);
+    const hooks = await plugin.server(input);
+    await hooks['chat.message']!(
+      { sessionID: 'audit-target', agent: 'reviewer', model: { providerID: 'acme', modelID: 'model-x' } } as never,
+      { message: { id: 'u1', role: 'user' }, parts: [{ type: 'text', text: 'Review it.' }] } as never
+    );
+
+    await dispatchPart(
+      hooks,
+      completedReasoningPart({ sessionID: 'audit-target', text: 'capacity = 24 * 15 = 340' })
+    );
+
+    assert.equal(calls.promptAsync.length, 1);
+    const body = calls.promptAsync[0].body;
+    assert.equal(body.agent, 'reviewer');
+    assert.deepEqual(body.model, { providerID: 'acme', modelID: 'model-x' });
+  });
+});
+
+test('a critique steer reads agent and model from the session\'s messages when unrecorded (FR-112)', async () => {
+  await withCleanSupervisorEnv(async () => {
+    const queries: unknown[] = [];
+    const { input, calls } = auditHarness([], {}, {
+      messages: async (options: unknown) => {
+        queries.push((options as { query?: unknown }).query);
+        return {
+          data: [
+            { info: { id: 'u0', role: 'user', agent: 'old', model: { providerID: 'p', modelID: 'old' } } },
+            { info: { id: 'u1', role: 'user', agent: 'cobalt-crush-dev', model: { providerID: 'acme', modelID: 'muse' } } },
+            { info: { id: 'a1', role: 'assistant', providerID: 'acme', modelID: 'muse' } },
+          ],
+        };
+      },
+    });
+    const hooks = await plugin.server(input);
+
+    await dispatchPart(
+      hooks,
+      completedReasoningPart({ sessionID: 'audit-target-lookup', text: 'capacity = 24 * 15 = 340' })
+    );
+
+    assert.equal(calls.promptAsync.length, 1);
+    const body = calls.promptAsync[0].body;
+    assert.equal(body.agent, 'cobalt-crush-dev');
+    assert.deepEqual(body.model, { providerID: 'acme', modelID: 'muse' });
+    assert.deepEqual(queries, [{ limit: 20 }], 'the lookup is bounded');
+  });
+});
+
+test('a failed agent/model lookup still delivers the critique (FR-112)', async () => {
+  await withCleanSupervisorEnv(async () => {
+    const { input, calls } = auditHarness([], {}, {
+      messages: async () => {
+        throw new Error('messages unavailable');
+      },
+    });
+    const hooks = await plugin.server(input);
+
+    await dispatchPart(
+      hooks,
+      completedReasoningPart({ sessionID: 'audit-target-fail', text: 'capacity = 24 * 15 = 340' })
+    );
+
+    assert.equal(calls.promptAsync.length, 1);
+    assert.equal(calls.promptAsync[0].body.agent, undefined);
+    assert.equal(calls.promptAsync[0].body.model, undefined);
+    assert.equal(sessionState.get('audit-target-fail').critiqueLog[0]?.delivered, true);
+  });
+});
+
+test('steerTargetFromMessages takes the newest user message and skips odd entries', () => {
+  assert.deepEqual(steerTargetFromMessages(undefined), {});
+  assert.deepEqual(steerTargetFromMessages([{ info: { role: 'assistant', agent: 'x' } }]), {});
+  assert.deepEqual(
+    steerTargetFromMessages([
+      { info: { role: 'user', agent: 'first', model: { providerID: 'p', modelID: 'm1' } } },
+      null,
+      { info: { role: 'user', agent: '', model: { providerID: 'p', modelID: '' } } },
+      { info: { role: 'assistant', agent: 'ignored' } },
+    ]),
+    {}
+  );
+  assert.deepEqual(
+    steerTargetFromMessages([
+      { info: { role: 'user', agent: 'a', model: { providerID: 'p', modelID: 'm' } } },
+      { info: { role: 'assistant' } },
+    ]),
+    { agent: 'a', model: { providerID: 'p', modelID: 'm' } }
+  );
 });
 
 test('event hook bounds severe aborts once maxRegenerations is reached', async () => {
