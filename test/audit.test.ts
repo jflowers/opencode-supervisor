@@ -20,11 +20,14 @@ import { completedReasoningPart, recordingPluginInput, silentClientSurface, sile
 import { stripNarrative } from '../src/stripper.ts';
 import {
   AUDIT_PROGRESS_CAP,
+  AUDITOR_SYSTEM_PROMPT,
   checkDeterministicInvariants,
+  MIN_CITED_RULE_WORDS,
   renderSessionProgress,
   resolveAuditorConfig,
   runPeerAudit,
   SESSION_PROGRESS_NOTE,
+  verifyCitedRule,
   type AuditConfig,
   type InvokeModel,
 } from '../src/auditor.ts';
@@ -3910,5 +3913,122 @@ test('a side session is registered before its first event reaches a later plugin
     // Deleted side sessions leave the registry.
     assert.equal(foreignRegistry()?.has('contract-audit-1'), false);
     assert.equal(foreignRegistry()?.has('contract-repair-1'), false);
+  });
+});
+
+// FR-113: goal- and directive-based findings quote a rule that exists.
+// The regression text is from the /uf.unleash session that stopped on
+// a STOP rule the command does not have (ses_df0b08645ffelKBy3yKlHxWjVz).
+const UNLEASH_GOAL = [
+  '5. **Start the routed workflow**:',
+  '   - **openspec**: delegate via `uf_delegate_command` with',
+  '     `command_path: ".opencode/commands/opsx-propose.md"`.',
+  '6. **Verify the entry command\'s work**: re-run',
+  '   `uf_unleash_branch_gate`. On failure, emit the envelope\'s message and',
+  '   **STOP** — the entry command did not produce the required',
+  '   artifacts.',
+].join('\n');
+
+const RETRY_STEP = 'uf_delegate_command opsx-propose timeout: 1800000 after the 600000 ms wall clock expired';
+
+const INVENTED_RULE_VERDICT = JSON.stringify({
+  passed: false,
+  failedStep: 1,
+  severity: 'minor',
+  rule: "Spec substeps 5/6 require 'emit envelope error and STOP' on failure/timeout",
+  critique: 'Step 1 plans to bypass fail-closed handling by retrying a timed-out opsx-propose delegation.',
+});
+
+test('verifyCitedRule finds a rule across line breaks, case, quotes, and emphasis (FR-113)', () => {
+  assert.equal(
+    verifyCitedRule('on failure, emit the envelope\u2019s message and STOP', [UNLEASH_GOAL]),
+    true
+  );
+  assert.equal(verifyCitedRule('"Verify the entry command\'s work."', [undefined, UNLEASH_GOAL]), true);
+  assert.equal(verifyCitedRule('...emit the envelope\'s message and STOP\u2026', [UNLEASH_GOAL]), true);
+});
+
+test('verifyCitedRule rejects paraphrased, absent, and too-short rules (FR-113)', () => {
+  assert.equal(verifyCitedRule('emit envelope error and STOP on failure or timeout', [UNLEASH_GOAL]), false);
+  assert.equal(verifyCitedRule('emit the envelope\'s message', [undefined]), false);
+  assert.equal(MIN_CITED_RULE_WORDS, 4);
+  assert.equal(verifyCitedRule('and STOP', [UNLEASH_GOAL]), false);
+  assert.equal(verifyCitedRule('emit the envelope\'s message', [UNLEASH_GOAL]), true);
+});
+
+test('auditor prompt asks for a verbatim, scoped rule (FR-113)', () => {
+  assert.match(AUDITOR_SYSTEM_PROMPT, /"rule": string \| null/);
+  assert.match(AUDITOR_SYSTEM_PROMPT, /word for word/);
+  assert.match(AUDITOR_SYSTEM_PROMPT, /only within the scope its own text gives it/);
+  assert.match(AUDITOR_SYSTEM_PROMPT, /not address is not a violation/);
+});
+
+test('runPeerAudit drops a finding whose rule is not in the goal (FR-113)', async () => {
+  const outcome = await runPeerAudit([RETRY_STEP], baseAuditConfig, async () => INVENTED_RULE_VERDICT, UNLEASH_GOAL);
+  assert.equal(outcome.passed, true);
+  assert.match(outcome.error ?? '', /rule not found in the goal or directives: "Spec substeps 5\/6/);
+  assert.equal(outcome.rule, undefined);
+});
+
+test('runPeerAudit keeps a verbatim goal rule and delivers it with the critique (FR-113)', async () => {
+  const verdict = JSON.stringify({
+    passed: false,
+    failedStep: 1,
+    severity: 'minor',
+    rule: 'do not edit any code before debug_open succeeds',
+    critique: 'Step 1 edits src/duration.ts before debug_open.',
+  });
+  const outcome = await runPeerAudit(
+    ['edit src/duration.ts'],
+    baseAuditConfig,
+    async () => verdict,
+    'Start a debugging investigation. Do not edit any code before `debug_open` succeeds.'
+  );
+  assert.equal(outcome.passed, false);
+  assert.equal(outcome.rule, 'do not edit any code before debug_open succeeds');
+  assert.equal(
+    outcome.critique,
+    'Step 1 edits src/duration.ts before debug_open.\nRule cited: "do not edit any code before debug_open succeeds"'
+  );
+});
+
+test('runPeerAudit verifies a rule against the engineer directives (FR-113)', async () => {
+  const verdict = JSON.stringify({
+    passed: false,
+    failedStep: 1,
+    severity: 'minor',
+    rule: 'Never edit generated files under dist/',
+    critique: 'Step 1 edits dist/index.js.',
+  });
+  const outcome = await runPeerAudit(
+    ['edit dist/index.js'],
+    baseAuditConfig,
+    async () => verdict,
+    'Fix the build',
+    '- no-dist: Never edit generated files under dist/.'
+  );
+  assert.equal(outcome.passed, false);
+  assert.match(outcome.critique, /Rule cited: "Never edit generated files under dist\/"$/);
+});
+
+test('runPeerAudit leaves a finding without a rule unchanged (FR-113)', async () => {
+  const verdict = '{"passed":false,"failedStep":1,"severity":"minor","rule":null,"critique":"Off by one: the loop stops at length - 2."}';
+  const outcome = await runPeerAudit(['for (i = 0; i < n - 1; i++)'], baseAuditConfig, async () => verdict, 'Sum the array');
+  assert.equal(outcome.passed, false);
+  assert.equal(outcome.critique, 'Off by one: the loop stops at length - 2.');
+  assert.equal(outcome.rule, undefined);
+});
+
+test('an invented goal rule never steers the session (FR-113, /uf.unleash regression)', async () => {
+  await withCleanSupervisorEnv(async () => {
+    const { input, calls } = auditHarness([INVENTED_RULE_VERDICT]);
+    const hooks = await plugin.server(input);
+    const sessionID = 'audit-session-invented-rule';
+    sessionState.get(sessionID).goal = UNLEASH_GOAL;
+    await dispatchPart(hooks, completedReasoningPart({ sessionID, id: 'part-retry', text: `Re-delegate: \`${RETRY_STEP}\`` }));
+    assert.equal(calls.prompt.length, 1);
+    assert.equal(calls.promptAsync.length, 0);
+    assert.deepEqual(sessionState.get(sessionID).critiqueLog, []);
+    assert.equal(sessionState.get(sessionID).verifiedSteps[0]?.passed, true);
   });
 });

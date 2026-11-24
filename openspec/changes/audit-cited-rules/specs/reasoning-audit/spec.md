@@ -32,7 +32,7 @@ handled as before.
 - **GIVEN** the goal says "Do not edit any code before debug_open
   succeeds"
 - **WHEN** the auditor fails a step citing "do not edit any code
-  before `debug_open` succeeds"
+  before debug_open succeeds"
 - **THEN** the audit fails and the critique ends with
   `Rule cited: "do not edit any code before debug_open succeeds"`
 

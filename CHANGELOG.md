@@ -5,6 +5,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The auditor can no longer stop a session with a rule it made up.
+  A `/uf.unleash` run stopped after a finding claimed "Spec substeps
+  5/6 require 'emit envelope error and STOP' on failure/timeout";
+  substep 5 has no such rule, and the agent noticed but deferred to
+  the audit. A finding based on the session goal or engineer
+  directives must now quote its rule verbatim in the verdict's
+  `rule` field. A quote that isn't in the goal or directive text
+  (or is under four words) drops the finding and logs a warning; a
+  found quote is appended to the critique as `Rule cited: "..."`.
+  The prompt also says a rule applies only within the scope its own
+  text gives it (FR-113).
+
 ## [2.15.0] - 2026-11-24
 
 ### Fixed
