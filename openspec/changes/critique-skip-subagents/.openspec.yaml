@@ -1,0 +1,8 @@
+schema: spec-driven
+created: 2026-11-24
+goal: Stop audit critiques from aborting or steering subagent sessions, and run every steer under the session's own agent and model
+affected_areas:
+  - index.ts
+  - test/audit.test.ts
+  - test/text-tool-call.test.ts
+  - CHANGELOG.md
