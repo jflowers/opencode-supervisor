@@ -247,7 +247,10 @@ flowchart TD
    the rule it applies, word for word. The plugin looks the quote
    up in the goal and directive text; a rule that isn't there drops
    the finding, and a found one is delivered with the critique as
-   `Rule cited: "..."` (FR-113).
+   `Rule cited: "..."` (FR-113). The goal is the first message, so
+   the prompt also lists the last five messages you typed after it
+   (FR-116). They amend the goal: a step that follows *"please
+   proceed and retry"* is following you, not inventing permission.
    The 8 newest calls show the start and end of their
    output, where tools often put their verdict. When a minor peer
    finding fails a step and the agent made more tool calls while the audit

@@ -5,6 +5,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The auditor now sees what you type after the first message. The
+  goal is only the session's first user message, and nothing later
+  reached the audit. In a `/uf.unleash` run, after the engineer typed
+  "the auditor is incorrect. please proceed and retry", the step
+  that retried was failed as "prompt injection" that "fabricates
+  authorization". Every audit now lists the last five human-typed
+  messages after the goal (oldest first, each cut to 1,500
+  characters) and tells the auditor they amend the goal and that
+  following them is not an injection. The plugin's own steers never
+  count. FR-113's rule lookup searches them too (FR-116).
+
 ## [2.16.1] - 2026-11-25
 
 ### Changed

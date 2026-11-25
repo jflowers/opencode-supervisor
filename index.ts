@@ -46,8 +46,10 @@ import {
 import {
   AUDIT_DETAIL_COUNT,
   AUDIT_PROGRESS_CAP,
+  AUDIT_USER_MESSAGES_CAP,
   excerptToolOutput,
   outcomeRecordsStep,
+  renderLaterUserMessages,
   renderSessionProgress,
   resolveAuditorConfig,
   runPeerAudit,
@@ -568,6 +570,12 @@ export interface SessionState {
   /** Session goal — the first user message (FR-013; captured by `chat.message`). */
   goal: string | undefined;
   /**
+   * Human-typed user messages after the goal, oldest first, the most
+   * recent `AUDIT_USER_MESSAGES_CAP` kept (FR-116): they amend the
+   * goal, so every audit lists them.
+   */
+  laterUserMessages: string[];
+  /**
    * Verified trace (FR-006, FR-063): recorded step text plus its audit
    * outcome. Passed steps join (recorded in 3.2); a step that failed a
    * minor deterministic invariant stays too, marked `passed: false` —
@@ -690,6 +698,7 @@ const sessions = new Map<string, SessionState>();
 function emptySessionState(): SessionState {
   return {
     goal: undefined,
+    laterUserMessages: [],
     verifiedSteps: [],
     critiqueCount: 0,
     solvedItems: [],
@@ -3072,7 +3081,10 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
             // FR-106: args other plugins injected on this session's calls.
             injectedText,
             // FR-115: the calls that completed before this part.
-            auditProgress(before)
+            auditProgress(before),
+            undefined,
+            // FR-116: what the engineer typed after the goal.
+            renderLaterUserMessages(state.laterUserMessages)
           );
           // FR-114 (issue #91): a peer finding about a step the session
           // has since moved past is checked once more with the calls that
@@ -3095,7 +3107,8 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
                 directivesAdvisory ?? undefined,
                 injectedText,
                 auditProgress(before),
-                renderSessionProgress(later, AUDIT_PROGRESS_CAP, false, AUDIT_DETAIL_COUNT)
+                renderSessionProgress(later, AUDIT_PROGRESS_CAP, false, AUDIT_DETAIL_COUNT),
+                renderLaterUserMessages(state.laterUserMessages)
               );
               if (recheck.error === undefined && (recheck.passed || recheck.source === 'peer')) {
                 logger.info(
@@ -3208,12 +3221,19 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
         if (repairOnly) {
           return; // goal capture is audit-pipeline state; repair-only skips it
         }
-        if (state.goal !== undefined) {
-          return; // FR-013: the first user message wins, permanently
-        }
         const text = userMessageText(output?.parts);
         if (text === '') {
           return; // whitespace-only or absent text is no goal
+        }
+        if (state.goal !== undefined) {
+          // FR-013: the first user message stays the goal. FR-116: later
+          // human-typed messages amend it, so audits list them; the
+          // plugin's synthetic steers never count (no user text).
+          state.laterUserMessages.push(text);
+          if (state.laterUserMessages.length > AUDIT_USER_MESSAGES_CAP) {
+            state.laterUserMessages.splice(0, state.laterUserMessages.length - AUDIT_USER_MESSAGES_CAP);
+          }
+          return;
         }
         state.goal = text;
       } catch (error) {
@@ -3890,7 +3910,9 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
               state.goal,
               directivesAdvisory ?? undefined,
               renderInjectedArgs(injectedArgsForSession(context.sessionID)),
-              auditProgress(state.solvedItems)
+              auditProgress(state.solvedItems),
+              undefined,
+              renderLaterUserMessages(state.laterUserMessages)
             );
             if (outcome.passed) {
               // Passed focus joins the verified trace in stripped form —
