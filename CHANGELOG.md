@@ -5,6 +5,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.16.1] - 2026-11-25
+
 ### Changed
 
 - Docs and specs: the 2.15.0 requirement that audits see the
