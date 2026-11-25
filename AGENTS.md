@@ -34,15 +34,15 @@ opencode plugin "$(pwd)"
 
 - No build step: OpenCode executes the TypeScript directly, and the npm
   package ships the `.ts` sources (`exports["./server"]` is `./index.ts`).
-- Published to npm as `opencode-agent-supervisor`. Release: in a PR, move
-  the CHANGELOG's Unreleased entries under the new version (there's no
-  version bump: `package.json` holds `0.0.0-development`, the release sets
-  the version from the tag, and `PLUGIN_VERSION` reads it), and update
-  the pinned version in the README's install commands. After it merges,
-  run `.github/workflows/publish.yml` from `main` with the tag
+- Published to npm as `opencode-agent-supervisor`. Release: one
+  dispatch from `main` with the tag
   (`gh workflow run publish.yml -f tag=v<version>`); it creates the tag,
-  publishes to npm and creates the GitHub release. Don't push the tag
-  yourself. It
+  publishes to npm and creates the GitHub release. There's no version
+  bump and no release PR: `package.json` holds `0.0.0-development`, the
+  release sets the version from the tag, and `PLUGIN_VERSION` reads it.
+  Don't push the tag yourself. Once the version is on npm, a docs PR
+  moves the CHANGELOG's Unreleased entries under it and updates the
+  pinned version in the README's install commands. The workflow
   authenticates through npm trusted publishing (OIDC: the package settings
   on npmjs.com trust `jflowers/opencode-supervisor` + `publish.yml`), so no
   npm token exists. Renaming `publish.yml` breaks publishing until the

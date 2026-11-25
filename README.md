@@ -77,7 +77,7 @@ Requires OpenCode **1.19.0** or later.
 ### 3.1 Install for yourself
 
 ```bash
-opencode plugin opencode-agent-supervisor@2.16.1 --global
+opencode plugin opencode-agent-supervisor@2.16.2 --global
 ```
 
 OpenCode downloads the package and adds it to the `plugin` array of
@@ -93,7 +93,7 @@ the repository runs the same supervisor version:
 
 ```json
 {
-  "plugin": ["opencode-agent-supervisor@2.16.1"]
+  "plugin": ["opencode-agent-supervisor@2.16.2"]
 }
 ```
 
@@ -142,16 +142,16 @@ Prefer no middleware? See [Section 8](#8-middleware-or-skill).
 
 ### 3.5 Releasing
 
-A release takes three steps:
+A release is one dispatch. Run the Publish workflow from `main` with
+the tag: Actions → Publish → Run workflow, or
+`gh workflow run publish.yml -f tag=v<version>`. Don't push the tag
+yourself; the workflow creates it. There's no version bump and no
+release PR: `package.json` holds `0.0.0-development`, the release sets
+the version from the tag, and `PLUGIN_VERSION` reads it.
 
-1. In a PR, move the CHANGELOG's Unreleased entries under the new
-   version and update the version in the install commands above. There's
-   no version bump: `package.json` holds `0.0.0-development`, the release
-   sets the version from the tag, and `PLUGIN_VERSION` reads it.
-2. Merge it.
-3. Run the Publish workflow from `main` with the tag: Actions → Publish →
-   Run workflow, or `gh workflow run publish.yml -f tag=v<version>`.
-   Don't push the tag yourself; the workflow creates it.
+Once the version is on npm, a docs PR moves the CHANGELOG's Unreleased
+entries under it and updates the version in the install commands
+above.
 
 The Publish workflow (`.github/workflows/publish.yml`) calls the shared
 npm pipeline in [`jflowers/ship`](https://github.com/jflowers/ship). It
@@ -193,7 +193,7 @@ The new trusted publisher shows **Pending validation** until the
 workflow publishes once, and npm sets a deadline of about two days for
 that. The hand-published version doesn't count (the workflow skips a
 version already on npm), so release the next patch version through the
-three steps above right away.
+Publish workflow right away.
 
 ---
 
