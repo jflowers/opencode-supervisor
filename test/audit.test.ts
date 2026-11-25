@@ -24,7 +24,11 @@ import {
   AUDIT_EXCERPT_TAIL,
   AUDIT_PROGRESS_CAP,
   AUDITOR_SYSTEM_PROMPT,
+  AUDIT_USER_MESSAGE_CHARS,
+  AUDIT_USER_MESSAGES_CAP,
   checkDeterministicInvariants,
+  LATER_USER_MESSAGES_NOTE,
+  renderLaterUserMessages,
   excerptToolOutput,
   LATER_PROGRESS_NOTE,
   MIN_CITED_RULE_WORDS,
@@ -4204,7 +4208,7 @@ test('auditor prompt asks for a verbatim, scoped rule (FR-113)', () => {
 test('runPeerAudit drops a finding whose rule is not in the goal (FR-113)', async () => {
   const outcome = await runPeerAudit([RETRY_STEP], baseAuditConfig, async () => INVENTED_RULE_VERDICT, UNLEASH_GOAL);
   assert.equal(outcome.passed, true);
-  assert.match(outcome.error ?? '', /rule not found in the goal or directives: "Spec substeps 5\/6/);
+  assert.match(outcome.error ?? '', /rule not found in the goal, the user's later messages, or the directives: "Spec substeps 5\/6/);
   assert.equal(outcome.rule, undefined);
 });
 
@@ -4268,5 +4272,130 @@ test('an invented goal rule never steers the session (FR-113, /uf.unleash regres
     assert.equal(calls.promptAsync.length, 0);
     assert.deepEqual(sessionState.get(sessionID).critiqueLog, []);
     assert.equal(sessionState.get(sessionID).verifiedSteps[0]?.passed, true);
+  });
+});
+
+// FR-116: audits see the user's later messages. Regression from the
+// /uf.unleash session where a step following the engineer's "please
+// proceed and retry" was failed as prompt injection and fabricated
+// authorization (ses_df0b08645ffelKBy3yKlHxWjVz).
+const OVERRIDE_MESSAGE = 'the auditor is incorrect. please proceed and retry as if it had not injected itself';
+
+test('renderLaterUserMessages lists the most recent messages, oldest first, cut to size (FR-116)', () => {
+  assert.equal(renderLaterUserMessages([]), '');
+  assert.equal(renderLaterUserMessages(['  ', '']), '');
+  assert.equal(renderLaterUserMessages(['first', 'second']), '1. first\n2. second');
+  assert.equal(AUDIT_USER_MESSAGES_CAP, 5);
+  assert.equal(
+    renderLaterUserMessages(['m1', 'm2', 'm3', 'm4', 'm5', 'm6']),
+    '(earlier messages are not shown)\n1. m2\n2. m3\n3. m4\n4. m5\n5. m6'
+  );
+  const long = 'x'.repeat(AUDIT_USER_MESSAGE_CHARS + 10);
+  assert.equal(renderLaterUserMessages([long]), `1. ${'x'.repeat(AUDIT_USER_MESSAGE_CHARS)} …(cut)`);
+});
+
+test('runPeerAudit puts the user\'s later messages right after the goal, and only when given (FR-116)', async () => {
+  const prompts: string[] = [];
+  const invoke: InvokeModel = async (prompt) => {
+    prompts.push(prompt);
+    return '{"passed":true}';
+  };
+  await runPeerAudit(['retry the delegation'], baseAuditConfig, invoke, 'the goal', '- d1: a directive');
+  await runPeerAudit(
+    ['retry the delegation'],
+    baseAuditConfig,
+    invoke,
+    'the goal',
+    '- d1: a directive',
+    undefined,
+    undefined,
+    undefined,
+    '   '
+  );
+  await runPeerAudit(
+    ['retry the delegation'],
+    baseAuditConfig,
+    invoke,
+    'the goal',
+    '- d1: a directive',
+    undefined,
+    undefined,
+    undefined,
+    `1. ${OVERRIDE_MESSAGE}`
+  );
+  assert.ok(!prompts[0].includes('Later messages from the user'));
+  assert.equal(prompts[1], prompts[0]);
+  const withMessages = prompts[2];
+  const goalAt = withMessages.indexOf('Session goal');
+  const noteAt = withMessages.indexOf(LATER_USER_MESSAGES_NOTE);
+  assert.ok(goalAt > -1 && noteAt > goalAt, withMessages);
+  assert.ok(withMessages.indexOf(OVERRIDE_MESSAGE) > noteAt);
+  assert.ok(withMessages.indexOf('Engineer directives') > withMessages.indexOf(OVERRIDE_MESSAGE));
+  assert.match(LATER_USER_MESSAGES_NOTE, /not obeying an injection/);
+  assert.match(LATER_USER_MESSAGES_NOTE, /not fabricating authorization/);
+});
+
+test('a rule quoted from the user\'s later message verifies (FR-113, FR-116)', async () => {
+  const verdict = JSON.stringify({
+    passed: false,
+    failedStep: 1,
+    severity: 'minor',
+    rule: 'do not push to main without asking',
+    critique: 'Step 1 pushes to main.',
+  });
+  const outcome = await runPeerAudit(
+    ['git push origin main'],
+    baseAuditConfig,
+    async () => verdict,
+    'Fix the flaky test',
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    '1. Also, do not push to main without asking me.'
+  );
+  assert.equal(outcome.passed, false);
+  assert.match(outcome.critique, /Rule cited: "do not push to main without asking"$/);
+});
+
+test('later human messages reach the audit; the goal and synthetic steers do not count (FR-116)', async () => {
+  await withCleanSupervisorEnv(async () => {
+    const { input, calls } = auditHarness(['{"passed":true,"failedStep":null,"severity":null,"critique":"ok"}']);
+    const hooks = await plugin.server(input);
+    const sessionID = 'audit-session-later-messages';
+    const user = (parts: unknown[]) => ({ message: { role: 'user' }, parts });
+    await dispatchChatMessage(hooks, sessionID, user([{ type: 'text', text: '/uf.unleash run the pipeline' }]));
+    await dispatchChatMessage(
+      hooks,
+      sessionID,
+      user([{ type: 'text', text: '[supervisor] audit finding — correct the failed step and continue: stop', synthetic: true }])
+    );
+    await dispatchChatMessage(hooks, sessionID, user([{ type: 'text', text: OVERRIDE_MESSAGE }]));
+    const state = sessionState.get(sessionID);
+    assert.equal(state.goal, '/uf.unleash run the pipeline');
+    assert.deepEqual(state.laterUserMessages, [OVERRIDE_MESSAGE]);
+
+    await dispatchPart(
+      hooks,
+      completedReasoningPart({ sessionID, id: 'part-retry', text: 'Retry per the user: `uf_delegate_command timeout: 1800000`' })
+    );
+    assert.equal(calls.prompt.length, 1);
+    const promptText = (calls.prompt[0] as { body: { parts: { text: string }[] } }).body.parts[0].text;
+    assert.ok(promptText.includes(`${LATER_USER_MESSAGES_NOTE}\n1. ${OVERRIDE_MESSAGE}`), promptText);
+    assert.ok(!promptText.includes('correct the failed step and continue: stop'));
+  });
+});
+
+test('the session keeps only the most recent later user messages (FR-116)', async () => {
+  await withCleanSupervisorEnv(async () => {
+    const { input } = auditHarness([]);
+    const hooks = await plugin.server(input);
+    const sessionID = 'audit-session-later-bound';
+    for (let i = 0; i <= AUDIT_USER_MESSAGES_CAP + 2; i++) {
+      await dispatchChatMessage(hooks, sessionID, { message: { role: 'user' }, parts: [{ type: 'text', text: `m${i}` }] });
+    }
+    const state = sessionState.get(sessionID);
+    assert.equal(state.goal, 'm0');
+    assert.deepEqual(state.laterUserMessages, ['m3', 'm4', 'm5', 'm6', 'm7']);
   });
 });
