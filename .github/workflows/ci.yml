@@ -15,7 +15,7 @@ jobs:
       # Keep tests from reading a global supervisor config.
       XDG_CONFIG_HOME: ${{ github.workspace }}/.ci-xdg
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
       - uses: actions/setup-node@v7
         with:
