@@ -249,12 +249,16 @@ export const pluginConfig: HookConfig = {
 };
 
 /**
- * Plugin version for the module-identity log line (review finding #20) —
- * kept in sync with `package.json` so runtime logs identify the loaded
- * build. `package.json` cannot be imported from here without a build
- * step, so the constant is the source of truth for the log prefix.
+ * Plugin version for the module-identity log line (review finding #20), so
+ * runtime logs identify the loaded build. Read from the package.json next to
+ * this file: the release sets its version from the tag (main holds
+ * 0.0.0-development), so a constant here would go stale.
  */
-export const PLUGIN_VERSION = '2.15.0';
+export const PLUGIN_VERSION: string = (
+  JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as {
+    version: string;
+  }
+).version;
 
 /**
  * Log-identity state (FR-055): the module-identity line is emitted

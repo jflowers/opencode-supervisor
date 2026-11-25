@@ -1013,7 +1013,7 @@ test('plugin module imports cleanly and exports the PluginModule entry', async (
   assert.equal(typeof hooks.tool?.forget_reminder?.execute, 'function');
 });
 
-test('PLUGIN_VERSION stays in lockstep with package.json (release integrity)', () => {
+test('PLUGIN_VERSION is the version in package.json (the release sets it from the tag)', () => {
   const pkg = JSON.parse(
     fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')
   ) as { version: string };

@@ -34,14 +34,15 @@ opencode plugin "$(pwd)"
 
 - No build step: OpenCode executes the TypeScript directly, and the npm
   package ships the `.ts` sources (`exports["./server"]` is `./index.ts`).
-- Published to npm as `opencode-agent-supervisor`. Release: in a PR, bump
-  `version` in `package.json` and `PLUGIN_VERSION` in `index.ts` (a test
-  keeps them in lockstep), move the CHANGELOG's Unreleased entries under the
-  new version, and update the pinned version in the README's install
-  commands. After it merges, run `.github/workflows/publish.yml` from
-  `main` with the tag (`gh workflow run publish.yml -f tag=v<version>`); it
-  creates the tag, publishes to npm and creates the GitHub release. Don't
-  push the tag yourself. It
+- Published to npm as `opencode-agent-supervisor`. Release: in a PR, move
+  the CHANGELOG's Unreleased entries under the new version (there's no
+  version bump: `package.json` holds `0.0.0-development`, the release sets
+  the version from the tag, and `PLUGIN_VERSION` reads it), and update
+  the pinned version in the README's install commands. After it merges,
+  run `.github/workflows/publish.yml` from `main` with the tag
+  (`gh workflow run publish.yml -f tag=v<version>`); it creates the tag,
+  publishes to npm and creates the GitHub release. Don't push the tag
+  yourself. It
   authenticates through npm trusted publishing (OIDC: the package settings
   on npmjs.com trust `jflowers/opencode-supervisor` + `publish.yml`), so no
   npm token exists. Renaming `publish.yml` breaks publishing until the
@@ -49,7 +50,7 @@ opencode plugin "$(pwd)"
 - `publish.yml` only calls the shared pipeline in
   [`jflowers/ship`](https://github.com/jflowers/ship)
   (`.github/workflows/npm-release.yml`), pinned by commit SHA: org-infra's
-  preflight creates the tag, then ship checks `package.json` against it,
+  preflight creates the tag, then ship sets `package.json`'s version from it,
   installs, runs the checks listed in `publish.yml`, publishes with
   provenance and creates the GitHub release. Releasing through ship is deliberate; fix the pipeline there
   and bump the pin, rather than moving it back into this repo. Keep the
