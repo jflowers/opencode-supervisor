@@ -2,7 +2,7 @@
 
 ## ADDED Requirements
 
-### Requirement: FR-111 audits see the session's completed tool calls
+### Requirement: FR-115 audits see the session's completed tool calls
 
 Every peer audit of a session (reasoning parts and `request_audit`)
 MUST include the session's completed tool calls recorded before the

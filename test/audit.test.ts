@@ -1509,7 +1509,7 @@ test('event hook tells the auditor which args another plugin injected (FR-106)',
   });
 });
 
-test('renderSessionProgress lists completed calls oldest first and marks cuts (FR-111)', () => {
+test('renderSessionProgress lists completed calls oldest first and marks cuts (FR-115)', () => {
   assert.equal(renderSessionProgress([]), '');
   assert.equal(renderSessionProgress([{ tool: 'read', outcome: 'ok' }], 0), '');
   assert.equal(
@@ -1531,7 +1531,7 @@ test('renderSessionProgress lists completed calls oldest first and marks cuts (F
   );
 });
 
-test('runPeerAudit puts session progress before the steps, and only when given (FR-111)', async () => {
+test('runPeerAudit puts session progress before the steps, and only when given (FR-115)', async () => {
   const prompts: string[] = [];
   const invoke: InvokeModel = async (prompt) => {
     prompts.push(prompt);
@@ -1556,13 +1556,13 @@ test('runPeerAudit puts session progress before the steps, and only when given (
   assert.ok(withProgress.indexOf('Reasoning steps to audit:') > withProgress.indexOf('1. debug_open'));
 });
 
-test('an edit after the goal\'s required step succeeded earlier gets no ordering finding (issue #87, FR-111)', async () => {
+test('an edit after the goal\'s required step succeeded earlier gets no ordering finding (issue #87, FR-115)', async () => {
   await withCleanSupervisorEnv(async () => {
     const { input, calls } = auditHarness([]);
     // A stand-in auditor that judges the goal's ordering rule from what
     // its prompt shows, the way the live audit model did: an edit with
     // no sign that debug_open succeeded fails as "edited before
-    // debug_open". Before FR-111 the prompt held only the goal and the
+    // debug_open". Before FR-115 the prompt held only the goal and the
     // lone step, and this auditor failed it.
     const session = (input as unknown as { client: { session: Record<string, unknown> } }).client.session;
     session.prompt = async (options: { body: { parts: { text: string }[] } }) => {

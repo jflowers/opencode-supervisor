@@ -1,9 +1,9 @@
 # Tasks
 
-## 1. Spec artifacts (FR-111)
+## 1. Spec artifacts (FR-115)
 
 - [x] 1.1 proposal.md
-- [x] 1.2 specs/reasoning-audit/spec.md (ADDED FR-111)
+- [x] 1.2 specs/reasoning-audit/spec.md (ADDED FR-115)
 - [x] 1.3 tasks.md
 
 ## 2. Implementation

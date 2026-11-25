@@ -5,6 +5,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Docs and specs: the 2.15.0 requirement that audits see the
+  session's completed tool calls is renumbered FR-115. It had
+  reused FR-111, already taken by the 2.14.2 subagent critique
+  skip. No behavior change.
+
 ## [2.16.0] - 2026-11-25
 
 ### Fixed
@@ -52,7 +59,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   audit prompt now lists the session's completed tool calls (the most
   recent 40, oldest first) as context, and tells the auditor that a
   listed prerequisite already happened and that step numbers count
-  only the audited steps (FR-111).
+  only the audited steps (FR-115).
 
 ## [2.14.2] - 2026-11-24
 
