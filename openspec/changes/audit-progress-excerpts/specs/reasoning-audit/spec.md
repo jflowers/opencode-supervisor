@@ -7,7 +7,7 @@
 Each completed tool call MUST keep, besides its one-line memo
 outcome, a head-and-tail excerpt of its output (at most 300 leading
 and 500 trailing characters, whitespace collapsed, the cut marked
-`[...]`). The audit prompt's progress list (FR-111) MUST show that
+`[...]`). The audit prompt's progress list (FR-115) MUST show that
 excerpt for the 8 most recent calls. The progress note MUST say
 that outputs are excerpts, that a step may quote text cut from a
 listed call (flagged only when the shown text contradicts it),

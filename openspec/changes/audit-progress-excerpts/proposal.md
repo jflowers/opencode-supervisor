@@ -3,7 +3,7 @@
 ## Why
 
 Issue #91, a follow-up to #87. A re-run of the `/debug` dogfood
-with supervisor 2.15.0 (FR-111) got a false finding after
+with supervisor 2.15.0 (FR-115) got a false finding after
 `debug_conclude` had already returned `FIXED` with its toggle
 proof: "Step hallucinates verification not in session history:
 claims 'reset verification already showed... r3, fingerprint
@@ -12,7 +12,7 @@ matches' but session progress ends at debug_experiment_end".
 Two causes, both confirmed from session
 `ses_df0d76920fferpM7azcvmid63J`:
 
-- FR-111's progress list reuses the memo's solved-items line: the
+- FR-115's progress list reuses the memo's solved-items line: the
   first 80 characters of each output. `debug_experiment_end`'s
   output is 743 characters and its last line is `Reset verified:
   ... (r3, fingerprint matches)`, so the evidence never reached the
@@ -50,7 +50,7 @@ Two causes, both confirmed from session
 
 ### Modified Capabilities
 
-- `reasoning-audit`: FR-114 (extends FR-111).
+- `reasoning-audit`: FR-114 (extends FR-115).
 
 ## Impact
 

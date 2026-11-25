@@ -1005,7 +1005,7 @@ function solvedItemsAfter(items: readonly SolvedItem[], lastBefore: SolvedItem |
 
 /**
  * The session's completed tool calls as the audit prompt's progress
- * section (FR-111, issue #87): the solved-items log at audit time, so
+ * section (FR-115, issue #87): the solved-items log at audit time, so
  * a goal rule such as "do not edit before X succeeds" is judged
  * against calls that already happened. A log at its retention bound
  * may have dropped older calls, and the section says so.
@@ -3071,7 +3071,7 @@ const server = async (input: PluginInput, options?: PluginOptions): Promise<Hook
             directivesAdvisory ?? undefined,
             // FR-106: args other plugins injected on this session's calls.
             injectedText,
-            // FR-111: the calls that completed before this part.
+            // FR-115: the calls that completed before this part.
             auditProgress(before)
           );
           // FR-114 (issue #91): a peer finding about a step the session

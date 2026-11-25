@@ -20,7 +20,7 @@ that part finished; the verdict came 16 s later, after the edit.
 
 ## What Changes
 
-- FR-111 (new): every peer audit of a session (reasoning parts and
+- FR-115 (new): every peer audit of a session (reasoning parts and
   `request_audit`) includes the session's completed tool calls so
   far (tool name and short outcome, oldest first, at most 40) under
   a session-progress note. The note says the calls are context, not
@@ -39,7 +39,7 @@ where it starts.
 
 ### Modified Capabilities
 
-- `reasoning-audit`: FR-111.
+- `reasoning-audit`: FR-115.
 
 ## Impact
 

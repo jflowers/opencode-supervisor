@@ -243,7 +243,7 @@ flowchart TD
    most recent 40, oldest first) as context. A goal rule such as
    *"do not edit before `debug_open` succeeds"* is then judged
    against the calls that already ran, not against a lone step
-   (FR-111). A finding based on the goal or directives must quote
+   (FR-115). A finding based on the goal or directives must quote
    the rule it applies, word for word. The plugin looks the quote
    up in the goal and directive text; a rule that isn't there drops
    the finding, and a found one is delivered with the critique as
