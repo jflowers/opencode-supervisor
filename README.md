@@ -144,10 +144,10 @@ Prefer no middleware? See [Section 8](#8-middleware-or-skill).
 
 A release takes three steps:
 
-1. In a PR, bump `version` in `package.json` and `PLUGIN_VERSION` in
-   `index.ts` (a test keeps them in lockstep), move the CHANGELOG's
-   Unreleased entries under the new version, and update the version in
-   the install commands above.
+1. In a PR, move the CHANGELOG's Unreleased entries under the new
+   version and update the version in the install commands above. There's
+   no version bump: `package.json` holds `0.0.0-development`, the release
+   sets the version from the tag, and `PLUGIN_VERSION` reads it.
 2. Merge it.
 3. Run the Publish workflow from `main` with the tag: Actions → Publish →
    Run workflow, or `gh workflow run publish.yml -f tag=v<version>`.
@@ -156,7 +156,7 @@ A release takes three steps:
 The Publish workflow (`.github/workflows/publish.yml`) calls the shared
 npm pipeline in [`jflowers/ship`](https://github.com/jflowers/ship). It
 checks the tag (semver, new, CI green on `main`, unreleased commits) and
-creates it, checks that `package.json`'s version matches, runs the
+creates it, sets `package.json`'s version from the tag, runs the
 typecheck, both test suites and the package check, publishes with
 provenance, and creates the GitHub release with generated notes. A version
 already on npm is skipped, so re-running a release is safe. It authenticates through npm trusted
